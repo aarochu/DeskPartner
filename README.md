@@ -5,7 +5,7 @@ Overhead camera + VLM planner + reBot B601-DM arm that tidies a desk zone into t
 **Ground truth / SOW:** [`GROUND_TRUTH.md`](./GROUND_TRUTH.md)  
 **GitHub:** https://github.com/aarochu/DeskPartner  
 **Hardware deck:** [ReBot Arm Workshop](https://docs.google.com/presentation/d/1LXgehBvwPy5EhWO7aaYQffvmlN4eS1zFmJWYoDcTm-c/edit)  
-**Config:** single-arm follower+leader · Track B = **MolmoAct 2** fine-tune (overhead + 45° cams locked)
+**Config:** single-arm follower+leader · Track B = **MolmoAct 2** fine-tune (Logitech overhead + Innomaker wrist cams locked)
 
 ---
 
@@ -22,7 +22,8 @@ DeskPartner/
 ├── p2_vision_calibration/   # Track A — ArUco, CV, pixel→arm
 ├── p3_vlm_orchestrator/     # Track A — VLM + closed-loop state machine
 ├── p4_data_collection/      # Track B — teleop demos (LeRobot, single-arm only)
-└── p5_training/             # Track B — MolmoAct 2 LoRA + bake-off
+├── p5_training/             # Track B — MolmoAct 2 LoRA + bake-off
+└── rebot_operator_kit/      # macOS GUI: teleop, two-camera collection, review, validation
 ```
 
 ---
@@ -35,7 +36,7 @@ DeskPartner/
 | Python | 3.10+ |
 | Follower | reBot B601-DM on `/dev/ttyACM0` (`can_adapter=damiao`) |
 | Leader | reBot 102 on `/dev/ttyUSB0` |
-| Camera | Color innomaker overhead (OV2719 / 1080p wide). **Not** OV9281. Direct USB, no hub. |
+| Cameras | Logitech BRIO overhead at index 0 + Innomaker wrist/claw at index 1. Built-in Mac webcam is not recorded. |
 | Package managers | `uv` (SDK) + `pip` (LeRobot path) |
 
 ---
@@ -174,9 +175,14 @@ See [`p2_vision_calibration/RECALIBRATION.md`](./p2_vision_calibration/RECALIBRA
 
 ## Track B — data & training (bonus)
 
+For the tested macOS workflow, start with
+[`rebot_operator_kit/README.md`](./rebot_operator_kit/README.md), run
+`rebot_setup/setup.sh` on a new machine, then double-click
+`rebot_operator_kit/07_teleop_gui.command`.
+
 **MolmoAct 2 · single-arm:** fine-tune a foundation VLA (LoRA or action-expert-only — not full FT). Station is normally bimanual; we record **one arm only**.
 
-**Cameras:** overhead + 45° side. Lock both before episode 1 — MolmoAct 2 trains on whatever views are in the dataset. Prefer angles where the gripper does not occlude the object at grasp.
+**Cameras:** Logitech overhead (`front`, index 0) + Innomaker wrist/claw (`side`, index 1). Lock both before episode 1 — MolmoAct 2 trains on whatever views are in the dataset. Keep the wrist lens and gripper contact point unobstructed.
 
 Teleop preview (dual cam):
 

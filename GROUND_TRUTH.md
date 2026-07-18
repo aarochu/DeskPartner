@@ -77,8 +77,8 @@ If a contract is late, downstream works against faked inputs. Nobody blocks.
 
 | Item | Spec |
 |------|------|
-| Camera | Overhead color innomaker (1080p wide or OV2719). **Not** OV9281 (mono). Mount 60–75 cm straight down. Direct USB, no hubs. Lock exposure + WB. |
-| Track B cams | **Overhead + 45° side** (both color). MolmoAct 2 fine-tunes on whatever views the dataset defines — **lock camera setup before episode 1 and never move again.** Prefer views where the gripper does not block the object at grasp (known MolmoAct 2 weak spot). |
+| Camera | Logitech BRIO overhead at index 0. Mount 60–75 cm straight down. Direct USB when possible. Lock exposure + WB. |
+| Track B cams | **Logitech overhead + Innomaker wrist/claw** (dataset keys `front` + `side`). MolmoAct 2 fine-tunes on whatever views the dataset defines — **lock both mounts before episode 1 and never move them within a dataset version.** Keep the wrist lens and grasp contact point unobstructed. |
 | Zone | ~40×30 cm, sized to **actual** B601 reach after jog-check. |
 | Markers | Four 50 mm ArUco, ids 0–3. |
 | Destinations | Trash bin, wide-mouth pen cup/jar, tray — outside zone. |
@@ -102,7 +102,7 @@ If a contract is late, downstream works against faked inputs. Nobody blocks.
 
 **Arm schedule:** A owns Friday night + Saturday morning. B gets Saturday midday data block. Training on Modal (no arm). B eval Saturday night + Sunday morning.
 
-**Track B notes:** Lock overhead + 45° before episode 1 (`check_camera_lock --save-ref`). P4 verifies after every episode (`verify_episode_format` / alias `verify_single_arm_dataset.py`), especially Friday's throwaway. P5 confirms newt vs Ai2 MolmoAct 2 scripts + single-arm checkpoint with organizers Friday night; Saturday trains LoRA / action-expert-only only (`modal_finetune` wall-clock timeout). Sunday `bakeoff.py` prints `VERDICT: WINNER=...`.
+**Track B notes:** Lock the Logitech overhead and Innomaker claw mount before episode 1 (`check_camera_lock --save-ref`). P4 verifies after every episode (`verify_episode_format` / alias `verify_single_arm_dataset.py`), especially Friday's throwaway. P5 confirms newt vs Ai2 MolmoAct 2 scripts + single-arm checkpoint with organizers Friday night; Saturday trains LoRA / action-expert-only only (`modal_finetune` wall-clock timeout). Sunday `bakeoff.py` prints `VERDICT: WINNER=...`.
 
 ---
 
@@ -211,6 +211,6 @@ full VLM autonomy → CV-only autonomy → pre-staged canned run → backup vide
 4. `keep` is never touched.  
 5. Closed loop is the safety net; failures self-heal.  
 6. Skill B = **MolmoAct 2 single-arm fine-tune** (LoRA / action-expert-only). Not full FT. Not bimanual YAM as deployed.  
-7. Track B camera keys locked before episode 1 (overhead + 45°). Dataset has **no phantom second-arm channels**.  
+7. Track B camera keys locked before episode 1 (`front` Logitech overhead + `side` Innomaker wrist). Dataset has **no phantom second-arm channels**.
 8. Destinations taught once; zone sized to reach, not the reverse.  
 9. Code freeze after Sunday AM rehearsal.  

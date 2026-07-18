@@ -68,12 +68,13 @@ leader live the instant teleop starts.
 
 ## C) Recording demos (adds cameras)
 
-Recording needs **both arms + both cameras on at once** (overhead + 45°, locked, MJPG
-640×480). With only 2 USB-C ports you need a **powered** hub. Add to the teleop command:
+Recording needs **both arms + both training cameras on at once** (Logitech overhead
+at index 0 + Innomaker wrist/claw at index 1, both locked, MJPG). With only 2
+USB-C ports you need a **powered** hub. Add to the teleop command:
 
 ```
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, \
-                     side:  {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}}" \
+                     side:  {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30, fourcc: \"MJPG\"}}" \
   --display_data=true
 ```
 …and swap `lerobot-teleoperate` → `lerobot-record` with `--dataset.*` args (see the workshop deck).

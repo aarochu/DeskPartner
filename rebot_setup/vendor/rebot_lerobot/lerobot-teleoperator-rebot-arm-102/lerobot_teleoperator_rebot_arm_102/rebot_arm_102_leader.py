@@ -188,9 +188,8 @@ class RebotArm102Leader(Teleoperator):
             self._last_raw_positions = raw_positions
         except Exception as e:
             logger.error(f"Failed to read raw positions: {e}")
-            logger.warning("[EMERGENCY STOP] Please hold the follower arm and cut off the main power to the arms.")
-            logger.warning("[EMERGENCY STOP] Break the teleoperation session and check the USB connection or power of the leader arm.")
-            raw_positions = self._last_raw_positions
+            logger.error("[EMERGENCY STOP] Stopping teleoperation instead of reusing a stale leader target.")
+            raise RuntimeError("Leader position read failed; teleoperation stopped.") from e
             
         action_dict: dict[str, Any] = {}
         for motor_name in self.motor_names:

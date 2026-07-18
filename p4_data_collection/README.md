@@ -11,9 +11,9 @@ Quality of demos is the single biggest determinant of whether Track B works.
 ## Constraints (GT §3 / §10)
 
 - Single arm: `seeed_b601_dm_follower` + `rebot_arm_102_leader`  
-- Cams locked before episode 1: LeRobot keys **`front`** (overhead) + **`side`** (45°)  
+- Cams locked before episode 1: LeRobot keys **`front`** (Logitech overhead, index 0) + **`side`** (Innomaker wrist/claw, index 1)
 - Prefer views where gripper does not block the object at grasp (MolmoAct 2 weak spot)  
-- Record resolution in `config/recording.yaml` is **640×480** for both (training views). Physical overhead mount is shared with Track A VLM (which may grab higher res separately).
+- Record resolution in `config/recording.yaml` is **640×480 overhead** and **1280×720 wrist**, both at 30 FPS. Physical overhead mount is shared with Track A VLM (which may grab higher res separately).
 
 ## Quick start
 

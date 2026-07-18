@@ -1,6 +1,7 @@
 # DeskPartner cameras
-# Track A perception: overhead color.
-# Track B (MolmoAct 2): overhead + 45° — lock BEFORE episode 1, never move again.
+# Track A perception: fixed Logitech overhead color.
+# Track B (MolmoAct 2): Logitech overhead + Innomaker wrist/claw.
+# Lock both mounts BEFORE episode 1 and never move them within a dataset version.
 
 overhead:
   # Primary — Track A VLM/CV + Track B view #1
@@ -15,32 +16,33 @@ overhead:
     height_cm: 65           # 60–75 cm straight down over zone center
     orientation: top_down
   notes: |
-    Color innomaker (1080p wide or OV2719). NOT ov9281 (monochrome).
+    Logitech BRIO fixed overhead task view.
     Direct USB port — no hubs.
     Lock exposure and white balance once lighting is final.
 
-side_45:
+wrist_claw:
   # Required for Track B recording (MolmoAct 2 multi-view dataset)
-  # Pick a view where gripper does not block the object at grasp time.
+  # Physical role is a moving wrist view; LeRobot dataset key remains "side".
   enabled: true
   name: side
   type: opencv
   index_or_path: 1
-  width: 640
-  height: 480
+  width: 1280
+  height: 720
   fps: 30
   fourcc: MJPG
   mount:
-    angle_deg: 45
+    location: rebot_claw
+    orientation: forward_gripper_view
   notes: |
-    Lock position before episode 1. Same keys must appear in every episode.
+    Innomaker U20CAM mounted rigidly on the ReBot claw.
+    Add cable strain relief and a service loop for the complete arm range.
+    Lock its orientation before episode 1. Same keys must appear in every episode.
     LeRobot camera keys used in record scripts: front (=overhead), side.
 
 # Track B policy observation — MolmoAct 2 fine-tune views
 molmoact2_training:
-  views: [front, side]      # must match lerobot-record --robot.cameras keys
-  width: 640
-  height: 480
+  views: [front, side]      # Logitech overhead + Innomaker wrist; dataset keys stay stable
   fps: 30
   locked_before_episode_1: true
 

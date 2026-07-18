@@ -253,20 +253,19 @@ class SeeedB601FollowerBase(Robot):
             motor.request_feedback()
         try:
             self.bus.poll_feedback_once()
-        except:
-            logger.warning(f"can bus poll feedback failed.")
+        except Exception as exc:
+            raise RuntimeError("Follower feedback poll failed; teleoperation stopped.") from exc
 
         for motor_name, motor in self.motors.items():
             state = motor.get_state()
-            if state is not None:
-                # motorbridge works natively in radians. Convert to degrees.
-                obs_dict[f"{motor_name}.pos"] = math.degrees(state.pos)
-                obs_dict[f"{motor_name}.vel"] = math.degrees(state.vel)
-                obs_dict[f"{motor_name}.torque"] = state.torq
-            else:
-                obs_dict[f"{motor_name}.pos"] = 0.0
-                obs_dict[f"{motor_name}.vel"] = 0.0
-                obs_dict[f"{motor_name}.torque"] = 0.0
+            if state is None:
+                raise RuntimeError(
+                    f"Follower motor {motor_name!r} has no feedback; teleoperation stopped."
+                )
+            # motorbridge works natively in radians. Convert to degrees.
+            obs_dict[f"{motor_name}.pos"] = math.degrees(state.pos)
+            obs_dict[f"{motor_name}.vel"] = math.degrees(state.vel)
+            obs_dict[f"{motor_name}.torque"] = state.torq
 
         # Capture images
         for cam_key, cam in self.cameras.items():
@@ -312,10 +311,11 @@ class SeeedB601FollowerBase(Robot):
             present_pos = {}
             for motor_name, motor in self.motors.items():
                 state = motor.get_state()
-                if state is not None:
-                    present_pos[motor_name] = math.degrees(state.pos)
-                else:
-                    present_pos[motor_name] = 0.0
+                if state is None:
+                    raise RuntimeError(
+                        f"Follower motor {motor_name!r} has no feedback; refusing to send an action."
+                    )
+                present_pos[motor_name] = math.degrees(state.pos)
             
             goal_present_pos = {key: (g_pos, present_pos.get(key, g_pos)) for key, g_pos in goal_pos.items()}
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
@@ -361,7 +361,10 @@ class SeeedB601FollowerBase(Robot):
                             f"pos={position_degrees:.2f}°, kp={kp}, kd={kd}"
                         )
                     else:
-                        motor.send_pos_vel(pos_rad, 32)
+                        # Honor the configured velocity (declared in degrees/s) instead of
+                        # bypassing it with a hard-coded 32 rad/s command. This keeps the
+                        # CLI safety setting effective during first-run teleoperation.
+                        motor.send_pos_vel(pos_rad, vel_rad)
                         logger.debug(f"Sent POS_VEL command to {motor_name}: target={pos_rad:.2f},pos={position_degrees:.2f}°, vel={vel_deg_s:.2f}°/s")
 
         # motorbridge sends packets mostly synchronously here over loop, 
@@ -374,17 +377,49 @@ class SeeedB601FollowerBase(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        cleanup_errors: list[Exception] = []
+        try:
+            self.bus.disable_all()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+            logger.exception("Failed to broadcast follower torque disable during disconnect.")
+
         for motor in self.motors.values():
-            if self.config.disable_torque_on_disconnect:
-                motor.disable()
-            if self.motor_type != "rs":
-                motor.clear_error()
-            motor.close()
-        
-        self.bus.close()
-        self.bus = None
+            try:
+                if self.config.disable_torque_on_disconnect:
+                    motor.disable()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.exception("Failed to disable a follower motor during disconnect.")
+            try:
+                if self.motor_type != "rs":
+                    motor.clear_error()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.exception("Failed to clear a follower motor error during disconnect.")
+            try:
+                motor.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.exception("Failed to close a follower motor during disconnect.")
+
+        try:
+            self.bus.close()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+            logger.exception("Failed to close the follower bus during disconnect.")
+        finally:
+            self.bus = None
 
         for cam in self.cameras.values():
-            cam.disconnect()
+            try:
+                cam.disconnect()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.exception("Failed to disconnect a follower camera.")
 
         logger.info(f"{self} disconnected.")
+        if cleanup_errors:
+            raise RuntimeError(
+                f"Follower disconnect completed with {len(cleanup_errors)} cleanup error(s)."
+            ) from cleanup_errors[0]

@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "profile_id": "rebot-b601-dm-follower1-native7d-v4",
+  "profile_version": 4,
+  "description": "Verified high-response collection and native seven-action MolmoAct2 training contract for this ReBot leader/follower pair with Logitech overhead and Innomaker wrist views.",
+  "calibration": {
+    "semantics": "The JSON files preserve each arm's motor-zero reference. Runtime soft limits and leader-to-follower sign/scale mapping are locked separately below.",
+    "follower": {
+      "type": "seeed_b601_dm_follower",
+      "id": "follower1",
+      "runtime_relative_path": "lerobot-home/calibration/robots/seeed_b601_dm_follower/follower1.json",
+      "sha256": "6bab8616912509982199d68b7d5b66f0fec03f183fe6eccf9cac6fb04d1635a5"
+    },
+    "leader": {
+      "type": "rebot_arm_102_leader",
+      "id": "rebot_arm_102_leader",
+      "runtime_relative_path": "lerobot-home/calibration/teleoperators/rebot_arm_102_leader/rebot_arm_102_leader.json",
+      "sha256": "15674aa5d17a6e170e4d2d60aafccf69aedda7d213bc7a1c1130de8ac162542f"
+    },
+    "follower_driver_contract": {
+      "runtime_relative_path": "lerobot-robot-seeed-b601/lerobot_robot_seeed_b601/config_seeed_b601_dm_follower.py",
+      "sha256": "3876854a1e169afb6e24be7b979f1c4691036e1e99c0727c6f066a1089bef014"
+    },
+    "follower_base_implementation": {
+      "runtime_relative_path": "lerobot-robot-seeed-b601/lerobot_robot_seeed_b601/seeed_b601_follower.py",
+      "sha256": "a75050c79e60323ba5ca739fc1ffb7634888bcffba3ec54ebfea5941cd5b2773"
+    },
+    "follower_dm_implementation": {
+      "runtime_relative_path": "lerobot-robot-seeed-b601/lerobot_robot_seeed_b601/seeed_b601_dm_follower.py",
+      "sha256": "f480b8fbfaf2f9f4fcfb7053c57b031d33f50bbe17b861269de7c4b29cdf5c6d"
+    },
+    "leader_driver_contract": {
+      "runtime_relative_path": "lerobot-teleoperator-rebot-arm-102/lerobot_teleoperator_rebot_arm_102/config_rebot_arm_102_leader.py",
+      "sha256": "80e449141a6adbffa9d0edfb034f74e993589b39f85aebb66b0ad698a889efc6"
+    },
+    "leader_implementation": {
+      "runtime_relative_path": "lerobot-teleoperator-rebot-arm-102/lerobot_teleoperator_rebot_arm_102/rebot_arm_102_leader.py",
+      "sha256": "d21650495b0de931ef601813ed07c2529876e583053417480d5ea487ae600175"
+    }
+  },
+  "hardware_identity": {
+    "follower_usb": {
+      "vid": 11912,
+      "pid": 17923
+    },
+    "leader_usb": {
+      "vid": 6790,
+      "pid": 29987
+    },
+    "serial_port_policy": "Discover exactly one matching device by USB VID/PID; never persist a /dev path."
+  },
+  "coordinate_contract": {
+    "frame": "follower_degrees_after_direction_limits_and_step_cap",
+    "control_mode": "absolute joint pose",
+    "action_dimension": 7,
+    "joints": [
+      {
+        "name": "shoulder_pan",
+        "feature": "shoulder_pan.pos",
+        "leader_to_follower_scale": -1.0,
+        "soft_limit_degrees": [-145.0, 145.0]
+      },
+      {
+        "name": "shoulder_lift",
+        "feature": "shoulder_lift.pos",
+        "leader_to_follower_scale": -1.0,
+        "soft_limit_degrees": [-170.0, 0.0]
+      },
+      {
+        "name": "elbow_flex",
+        "feature": "elbow_flex.pos",
+        "leader_to_follower_scale": 1.0,
+        "soft_limit_degrees": [-200.0, 0.0]
+      },
+      {
+        "name": "wrist_flex",
+        "feature": "wrist_flex.pos",
+        "leader_to_follower_scale": 1.0,
+        "soft_limit_degrees": [-80.0, 90.0]
+      },
+      {
+        "name": "wrist_yaw",
+        "feature": "wrist_yaw.pos",
+        "leader_to_follower_scale": 1.0,
+        "soft_limit_degrees": [-90.0, 90.0]
+      },
+      {
+        "name": "wrist_roll",
+        "feature": "wrist_roll.pos",
+        "leader_to_follower_scale": -1.0,
+        "soft_limit_degrees": [-90.0, 90.0]
+      },
+      {
+        "name": "gripper",
+        "feature": "gripper.pos",
+        "leader_to_follower_scale": -6.0,
+        "soft_limit_degrees": [-270.0, 0.0]
+      }
+    ]
+  },
+  "collection_defaults": {
+    "task": "Pick up the crumpled paper ball and place it in the trash bin",
+    "dataset": "rebot-paper-trash-v1-smoke",
+    "episodes": 5,
+    "episode_time_s": 30,
+    "reset_time_s": 20,
+    "control_hz": 240,
+    "fps": 30,
+    "motor_velocity": 2000.0,
+    "max_step": 8.4,
+    "gripper_force": 0.05,
+    "resume": false
+  },
+  "camera_defaults": {
+    "front": {
+      "recording_key": "observation.images.front",
+      "display_name": "Logitech overhead",
+      "mount_role": "fixed_overhead_task_view",
+      "index": 0,
+      "width": 640,
+      "height": 480,
+      "fps": 30
+    },
+    "side": {
+      "recording_key": "observation.images.side",
+      "display_name": "Innomaker wrist",
+      "mount_role": "rebot_claw_camera",
+      "index": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 30
+    },
+    "excluded_screen_index": 3,
+    "excluded_screen_name": "MacBook camera",
+    "minimum_measured_fps": 27
+  },
+  "training_defaults": {
+    "route": "official_molmoact2_lerobot",
+    "policy_type": "molmoact2",
+    "checkpoint": "allenai/MolmoAct2",
+    "device": "cuda",
+    "model_dtype": "bfloat16",
+    "action_mode": "continuous",
+    "action_dimension": 7,
+    "chunk_size": 10,
+    "n_action_steps": 10,
+    "expected_max_action_dim": 32,
+    "num_flow_timesteps": 8,
+    "train_action_expert_only": true,
+    "normalize_gripper": true,
+    "state_normalization": "quantile",
+    "action_normalization": "quantile",
+    "image_order": [
+      "observation.images.front",
+      "observation.images.side"
+    ],
+    "steps": 5000,
+    "batch_size": 16,
+    "eval_split": 0.1,
+    "eval_steps": 500,
+    "save_freq": 1000,
+    "scheduler_warmup_steps": 100,
+    "scheduler_decay_steps": 5000
+  }
+}

@@ -498,8 +498,9 @@ export CAM_FRONT=0
 export CAM_SIDE=1
 ```
 
-`front` is the locked overhead camera and `side` is the locked 45-degree
-camera. Before recording, confirm those names have not been swapped.
+`front` is the locked Logitech overhead camera and `side` is the Innomaker
+wrist camera mounted on the ReBot claw. Before recording, confirm those
+products/views have not been swapped. Ignore the built-in Mac webcam.
 LeRobot reads the latest frame from each camera asynchronously; this is not
 hardware stereo synchronization. Reject stale or visibly mismatched feeds
 before collecting a production dataset.
@@ -518,7 +519,7 @@ lerobot-teleoperate \
   --robot.max_relative_target=1.0 \
   --robot.pos_vel_velocity='[15,15,15,15,15,15,15]' \
   --robot.force_pos_torque_ration=0.05 \
-  --robot.cameras="{front: {type: opencv, index_or_path: ${CAM_FRONT}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, side: {type: opencv, index_or_path: ${CAM_SIDE}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}}" \
+  --robot.cameras="{front: {type: opencv, index_or_path: ${CAM_FRONT}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, side: {type: opencv, index_or_path: ${CAM_SIDE}, width: 1280, height: 720, fps: 30, fourcc: \"MJPG\"}}" \
   --teleop.type=rebot_arm_102_leader \
   --teleop.port="$LEADER_PORT" \
   --teleop.id=rebot_arm_102_leader \
@@ -540,7 +541,7 @@ lerobot-record \
   --robot.max_relative_target=5.0 \
   --robot.pos_vel_velocity='[150,150,150,150,150,150,150]' \
   --robot.force_pos_torque_ration=0.05 \
-  --robot.cameras="{front: {type: opencv, index_or_path: ${CAM_FRONT}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, side: {type: opencv, index_or_path: ${CAM_SIDE}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}}" \
+  --robot.cameras="{front: {type: opencv, index_or_path: ${CAM_FRONT}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, side: {type: opencv, index_or_path: ${CAM_SIDE}, width: 1280, height: 720, fps: 30, fourcc: \"MJPG\"}}" \
   --teleop.type=rebot_arm_102_leader \
   --teleop.port="$LEADER_PORT" \
   --teleop.id=rebot_arm_102_leader \

@@ -2,7 +2,7 @@
 
 **Target:** ≥50 clean episodes before handoff.  
 **Task (ground truth):** `Pick crumpled paper and drop in trash`  
-**Cams:** `front` (overhead) + `side` (45°) — locked before episode 1, never moved.  
+**Cams:** `front` (Logitech overhead) + `side` (Innomaker wrist/claw) — locked before episode 1, never moved within the dataset version.
 **Arm:** single follower only. No bimanual / second-arm channels.
 
 ---

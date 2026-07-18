@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-arm teleop with overhead + 45° preview (MolmoAct 2 dataset views).
+# Single-arm teleop with Logitech overhead + Innomaker wrist preview.
 set -euo pipefail
 
 FOLLOWER_PORT="${FOLLOWER_PORT:-/dev/ttyACM0}"
@@ -12,7 +12,7 @@ lerobot-teleoperate \
   --robot.port="${FOLLOWER_PORT}" \
   --robot.id=follower1 \
   --robot.can_adapter=damiao \
-  --robot.cameras="{ front: {type: opencv, index_or_path: ${CAM_OVERHEAD}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, side: {type: opencv, index_or_path: ${CAM_SIDE}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}}" \
+  --robot.cameras="{ front: {type: opencv, index_or_path: ${CAM_OVERHEAD}, width: 640, height: 480, fps: 30, fourcc: \"MJPG\"}, side: {type: opencv, index_or_path: ${CAM_SIDE}, width: 1280, height: 720, fps: 30, fourcc: \"MJPG\"}}" \
   --teleop.type=rebot_arm_102_leader \
   --teleop.port="${LEADER_PORT}" \
   --teleop.id=rebot_arm_102_leader \
