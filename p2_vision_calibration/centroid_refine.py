@@ -9,8 +9,12 @@ import numpy as np
 def refine_centroid(
     frame: np.ndarray,
     bbox_xyxy: tuple[int, int, int, int],
+    method: str = "otsu",
 ) -> tuple[float, float]:
-    """Return (u, v) pixel centroid; falls back to box center if empty."""
+    """Return (u, v) pixel centroid; falls back to box center if empty.
+
+    method: 'otsu' (default) or 'canny'
+    """
     x1, y1, x2, y2 = bbox_xyxy
     h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
@@ -21,13 +25,25 @@ def refine_centroid(
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Prefer the foreground blob; invert if needed so object is white
-    if np.mean(th) > 127:
-        th = 255 - th
-    moments = cv2.moments(th)
+
+    if method == "canny":
+        edges = cv2.Canny(blur, 50, 150)
+        mask = edges
+    else:
+        _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if np.mean(th) > 127:
+            th = 255 - th
+        mask = th
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) >= 10:
+            m = cv2.moments(largest)
+            if m["m00"] > 1e-3:
+                return float(m["m10"] / m["m00"] + x1), float(m["m01"] / m["m00"] + y1)
+
+    moments = cv2.moments(mask)
     if moments["m00"] < 1e-3:
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    cu = moments["m10"] / moments["m00"] + x1
-    cv_ = moments["m01"] / moments["m00"] + y1
-    return float(cu), float(cv_)
+    return float(moments["m10"] / moments["m00"] + x1), float(moments["m01"] / moments["m00"] + y1)

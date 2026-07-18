@@ -4,25 +4,31 @@
 p1_arm_motion/
 ├── README.md
 ├── STRUCTURE.md
-├── __init__.py
-├── arm_client.py          # thin wrapper over reBot SDK / serial
-├── home.py                # go_home / is_at_home
-├── pick_drop.py           # top-down pick + drop primitive (Skill A)
-├── teach_destinations.py  # jog & save destinations.yaml
-├── teach_replay.py        # record joint traj while gravity-comp, replay
-├── gravity_comp.py        # launcher / notes around SDK example 9
-└── tests/
-    └── test_pick_drop_dry.py
+├── arm_client.py              # DryRun + RebotArmEndPose wrapper (meters)
+├── pick_and_drop.py           # named steps + StepError
+├── teach_home.py
+├── teach_destination.py
+├── reach_check.py             # Friday exit: zone corners reachable
+├── verify_click_to_reach.py   # P2 exit helper: move to (x,y) mm
+├── home.py
+├── gravity_comp.py
+└── teach_replay.py
 ```
 
-## Primitive contract (P3 → P1)
+## SDK calls (do not reimplement)
 
-```python
-pick_and_drop(
-    target_xy_mm=(x, y),
-    grasp_height_mm=15,
-    destination="trash",  # resolves via destinations.yaml
-)
+| Need | API |
+|------|-----|
+| Connect | `RebotArm` + `RebotArmEndPose.start()` |
+| Cartesian | `move_to_ik` / `move_to_traj(..., duration=)` |
+| Gripper | `open_gripper` / `close_gripper` |
+| FK tip | `joint_to_pose(q)` |
+| Shutdown | `ctrl.end()` |
+
+## Live vs dry-run
+
+Default is dry-run (`DESKPARTNER_DRY_RUN=1`). Hardware:
+
+```bash
+DESKPARTNER_DRY_RUN=0 python -m p1_arm_motion.pick_and_drop --live ...
 ```
-
-Sequence: hover → slow descend → close → lift → transit height → move above dest → open → retreat → caller returns home for photo.

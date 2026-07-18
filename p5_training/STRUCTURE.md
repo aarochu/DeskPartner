@@ -2,11 +2,14 @@
 
 ```
 p5_training/
+├── GO_NO_GO.md
 ├── README.md
-├── STRUCTURE.md
 ├── BAKEOFF.md
-├── modal_train.py                 # Modal LoRA / action-expert fine-tune stub
-├── eval_policy.py                 # load ckpt, run N trials on arm
+├── build_dataset_mixture.py   # from verified LeRobot ds → mixture yaml
+├── modal_finetune.py          # Modal LoRA job + wall-clock timeout
+├── eval_checkpoint.py         # N trials → CSV
+├── bakeoff.py                 # scripted vs policy → VERDICT line
 └── configs/
-    └── molmoact2_single_arm.yaml  # single-arm MolmoAct 2 fine-tune knobs
+    ├── molmoact2_single_arm.yaml
+    └── mixture_deskpartner.yaml   # generated
 ```

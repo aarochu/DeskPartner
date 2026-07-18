@@ -56,7 +56,8 @@ sudo chmod 666 /dev/ttyACM* /dev/ttyUSB*
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/vectorBH6/reBotArm_control_py ~/reBotArm_control_py
 cd ~/reBotArm_control_py && uv sync
-# set port in config/arm.yaml (also mirrored in this repo's config/arm.yaml)
+# SDK ports: reBotArm_control_py/config/rebotarm_dm.yaml (channel)
+# DeskPartner ports: config/arm.yaml + config/recording.yaml (keep in sync)
 ```
 
 Critical first script — **always before anything else after physical reconfig:**
@@ -185,18 +186,20 @@ Teleop preview (dual cam):
 
 If joint directions feel inverted, apply the deck's `joint_directions` tuning (see `p4_data_collection/README.md`).
 
-**Friday night trap:** after the throwaway episode, verify the dataset has **no phantom second-arm** state/action channels (see `p4_data_collection/CHECKLIST.md`). Do not wait until Saturday.
-
-Record (≥50 crumpled-paper episodes):
+**Friday night trap:** after the throwaway episode, run `python -m p4_data_collection.verify_episode_format` (must PASS — no phantom second-arm channels). Do not wait until Saturday.
 
 ```bash
-# see p4_data_collection/scripts/record_episodes.sh
+python -m p4_data_collection.check_camera_lock --save-ref   # once cams locked
+python -m p4_data_collection.record_episode --num 1
+python -m p4_data_collection.verify_episode_format
+python -m p4_data_collection.batch_record --num 50          # Saturday midday
 ```
 
-Fine-tune on Modal (P5) — confirm newt vs Ai2 MolmoAct 2 scripts with organizers tonight:
+Fine-tune on Modal (P5) — confirm newt vs Ai2 MolmoAct 2 scripts with organizers:
 
 ```bash
-# see p5_training/README.md and configs/molmoact2_single_arm.yaml
+# see p5_training/README.md, GO_NO_GO.md, configs/molmoact2_single_arm.yaml
+python -m p5_training.bakeoff --trials 10 --checkpoint PATH   # Sunday: VERDICT line
 ```
 
 Bake-off Sunday AM: 10 scripted vs 10 MolmoAct 2, same objects. Winner ships.
