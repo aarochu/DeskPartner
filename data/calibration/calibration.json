@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "updated_at": "2026-07-18T16:41:18.035256+00:00",
+  "camera": {
+    "index": 0,
+    "exposure": null,
+    "white_balance": null,
+    "width": null,
+    "height": null
+  },
+  "aruco": {
+    "dictionary": "DICT_4X4_50",
+    "marker_size_mm": 50,
+    "ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "pixel_centers": {},
+    "plane_mm": {
+      "0": [
+        0.0,
+        0.0
+      ],
+      "1": [
+        400.0,
+        0.0
+      ],
+      "2": [
+        400.0,
+        300.0
+      ],
+      "3": [
+        0.0,
+        300.0
+      ]
+    }
+  },
+  "homography": null,
+  "plane_to_arm": {
+    "A": null,
+    "b": null,
+    "pairs": []
+  },
+  "empty_desk_image": "data/calibration/empty_desk.png",
+  "click_verify_tolerance_mm": 5.0
+}

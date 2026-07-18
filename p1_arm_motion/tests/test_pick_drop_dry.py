@@ -1,49 +1,41 @@
-"""Dry-run smoke: pick_drop loads and runs without hardware."""
+"""Dry-run smoke: pick_and_drop runs without hardware."""
+
+from pathlib import Path
 
 from p1_arm_motion.arm_client import ArmConfig, DryRunArmClient
-from p1_arm_motion.pick_drop import pick_and_drop
-from shared.fixtures import fake_destination_pose
+from p1_arm_motion.pick_and_drop import pick_and_drop
 
 
-def test_dry_pick_trash(tmp_path, monkeypatch):
-    # destinations.yaml may have null poses — stub load via monkeypatch path
+def test_dry_pick_trash(tmp_path: Path) -> None:
     dest_yaml = tmp_path / "destinations.yaml"
     dest_yaml.write_text(
         """
 destinations:
   trash:
     label: trash
-    xyz_mm: [280, -180, 80]
-    rpy_deg: [0, 0, 0]
+    xyz_m: [0.28, -0.18, 0.08]
+    rpy_rad: [0, 0, 0]
   pen_cup:
     label: pen_cup
-    xyz_mm: [300, 160, 90]
-    rpy_deg: [0, 0, 0]
+    xyz_m: [0.30, 0.16, 0.09]
+    rpy_rad: [0, 0, 0]
   tray:
     label: tray
-    xyz_mm: [320, 0, 70]
-    rpy_deg: [0, 0, 0]
-  keep:
-    label: keep
-    action: never_touch
+    xyz_m: [0.32, 0.0, 0.07]
+    rpy_rad: [0, 0, 0]
 """
     )
-    cfg = ArmConfig(
-        follower_port="/dev/null",
-        home_joints_deg=[0, 0, 0, 0, 0, 0],
-        transit_height_mm=120,
-        approach_height_mm=40,
-        max_speed=0.15,
-    )
+    cfg = ArmConfig.from_yaml("config/arm.yaml")
+    # dry home needs something set
+    cfg.home_xyz_m = [0.15, 0.25, 0.35]
     arm = DryRunArmClient(cfg)
     arm.connect()
     pick_and_drop(
         arm,
         cfg,
         target_xy_mm=(180.0, 40.0),
-        grasp_height_mm=15.0,
-        destination="trash",
+        item_type="paper",
+        destination_name="trash",
         destinations_path=dest_yaml,
     )
     arm.disconnect()
-    assert fake_destination_pose("trash").x_mm == 280

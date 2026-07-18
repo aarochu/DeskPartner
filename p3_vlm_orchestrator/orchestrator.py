@@ -10,7 +10,7 @@ import yaml
 
 from p1_arm_motion.arm_client import ArmConfig, DryRunArmClient
 from p1_arm_motion.home import ensure_home_before_photo
-from p1_arm_motion.pick_drop import pick_and_drop
+from p1_arm_motion.pick_and_drop import pick_and_drop
 from p3_vlm_orchestrator.logging_ui import RunLogger
 from p3_vlm_orchestrator.policy import actionable_items
 from p3_vlm_orchestrator.vlm_client import plan_from_image
@@ -63,13 +63,13 @@ class Orchestrator:
         if self.use_fixtures:
             return
         from p2_vision_calibration.centroid_refine import refine_centroid
-        from p2_vision_calibration.plane_to_arm import Calibration
+        from p2_vision_calibration.pixel_to_arm import CalibrationChain
 
-        cal = Calibration.load("data/calibration")
+        cal = CalibrationChain()
         for item in plan.items:
             u, v = refine_centroid(frame, item.bbox_xyxy)
             item.centroid_uv = (u, v)
-            item.arm_xy_mm = cal.pixel_to_arm(u, v)
+            item.arm_xy_mm = cal.pixel_to_arm_coords(u, v)
 
     def run(self, max_cycles: int = 20) -> None:
         self.arm.connect()
@@ -102,8 +102,8 @@ class Orchestrator:
                         self.arm,
                         self.arm_cfg,
                         target_xy_mm=item.arm_xy_mm,
-                        grasp_height_mm=item.grasp_height_mm,
-                        destination=item.destination,
+                        item_type=item.label,
+                        destination_name=item.destination,
                     )
                 except Exception as exc:  # noqa: BLE001 — demo harness: log and retry
                     print(f"[orch] pick failed: {exc}")
