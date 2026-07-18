@@ -29,11 +29,14 @@ def main() -> None:
     if args.perception:
         os.environ["DESKPARTNER_PERCEPTION"] = args.perception
 
-    from p1_arm_motion.arm_client import ArmConfig, DryRunArmClient
+    from p1_arm_motion.arm_client import ArmConfig, make_arm_client
     from p3_vlm_orchestrator.orchestrator import Orchestrator
 
     arm_cfg = ArmConfig.from_yaml(args.arm_config)
-    arm = DryRunArmClient(arm_cfg)
+    # Dry-run unless explicitly told to drive the real arm (DESKPARTNER_DRY_RUN=0),
+    # matching the p3 README. Fixtures always imply dry-run.
+    dry_run = args.fixtures or os.environ.get("DESKPARTNER_DRY_RUN", "1") != "0"
+    arm = make_arm_client(arm_cfg, dry_run=dry_run)
     orch = Orchestrator(
         arm=arm,
         arm_cfg=arm_cfg,
