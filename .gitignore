@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Secrets
+config/.env
+.env
+
+# Runtime / calibration artifacts
+runs/
+data/calibration/*.npy
+data/calibration/*.json
+data/calibration/*.png
+data/teach_replay/
+!data/calibration/.gitkeep
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

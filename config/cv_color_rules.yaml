@@ -1,0 +1,27 @@
+# Crude CV-only category rules (fallback when VLM unavailable).
+# Tune Saturday with real booth lighting + locked exposure.
+
+rules:
+  - name: paper_like
+    destination: trash
+    hsv_lower: [0, 0, 180]
+    hsv_upper: [180, 40, 255]
+    notes: "Bright / low-saturation blobs → trash (crumpled paper)"
+
+  - name: marker_like
+    destination: pen_cup
+    hsv_lower: [90, 80, 40]
+    hsv_upper: [140, 255, 255]
+    notes: "Blue/cyan-ish → pen cup; retune on venue markers"
+
+  - name: default_other
+    destination: tray
+    hsv_lower: null
+    hsv_upper: null
+    notes: "Anything else with enough area → tray"
+
+keep_heuristic:
+  # Optional: large dark rectangle ≈ phone → keep (tune carefully)
+  enabled: false
+  min_area: 8000
+  aspect_ratio_range: [0.4, 0.7]

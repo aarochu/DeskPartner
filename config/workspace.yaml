@@ -1,0 +1,50 @@
+# Work zone, markers, perception mode, closed-loop policy
+
+zone:
+  # Sized to ACTUAL B601 reach after Friday jog-check — not the reverse
+  width_mm: 400
+  depth_mm: 300
+  description: "Taped rectangle under overhead camera"
+
+aruco:
+  dictionary: DICT_4X4_50
+  marker_size_mm: 50
+  ids: [0, 1, 2, 3]
+  # Order: front-left, front-right, back-right, back-left (desk plane)
+  corners:
+    0: null   # fill after tape-down: {u, v} pixel or plane mm after cal
+    1: null
+    2: null
+    3: null
+
+calibration:
+  # Exit criterion: click pixel → tip within this tolerance
+  click_to_tip_max_error_mm: 5
+  homography_path: data/calibration/homography.npy
+  plane_to_arm_path: data/calibration/plane_to_arm.json
+  empty_desk_reference: data/calibration/empty_desk.png
+
+perception:
+  mode: vlm                 # vlm | cv  (override with DESKPARTNER_PERCEPTION)
+  vlm:
+    provider: anthropic     # anthropic | google
+    model: claude-sonnet-4-20250514
+    destinations: [trash, pen_cup, tray, keep]
+  cv_fallback:
+    enabled: true
+    min_contour_area: 400
+    # crude color rules — tune Saturday
+    rules_path: config/cv_color_rules.yaml
+
+closed_loop:
+  max_retries_per_object: 2
+  skip_after_retries: true
+  photo_only_from_home: true
+  log_dir: runs
+
+objects_curated:
+  - crumpled_paper
+  - marker
+  - pen
+  - foam_block
+  - light_cup

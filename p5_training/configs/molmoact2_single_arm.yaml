@@ -1,0 +1,31 @@
+# MolmoAct 2 — single-arm fine-tune (hackathon scope)
+# Confirm checkpoint + train entrypoint with organizers (newt vs Ai2 scripts).
+
+policy: molmoact2
+embodiment: single_arm          # NOT bimanual YAM as deployed at station
+# Starting checkpoint — pick with organizers. Examples from Ai2 releases:
+#   allenai/MolmoAct2                 (generic base)
+#   allenai/MolmoAct2-DROID           (single-arm-ish prior)
+#   allenai/MolmoAct2-BimanualYAM     (only if they insist + we strip to one arm — prefer single-arm start)
+base_checkpoint: null             # FILL Friday night after organizer confirm
+
+dataset_repo_id: deskpartner/crumpled_paper_molmoact2
+camera_keys: [front, side]        # must match P4 record scripts / config/cameras.yaml
+locked_cameras: true
+
+# Hackathon fine-tune mode — NOT full FT
+finetune:
+  mode: lora                      # lora | action_expert_only
+  enable_lora_vlm: true
+  train_action_expert_only: false # set true as alternate small-data recipe
+  enable_lora_action_expert: false  # keep action expert fully trainable (Ai2 recommendation)
+  # full_finetune: false          # do not enable at hackathon
+
+inference:
+  serve_on: modal
+  action_chunks: true             # per-call network latency is survivable
+
+notes: |
+  Build mixture from P4 LeRobot data with single-arm setup descriptor.
+  Actions must match our control mode (joint / whatever B601 LeRobot emits).
+  If Saturday night eval is bad: one retry with fixed data, then cut Track B.

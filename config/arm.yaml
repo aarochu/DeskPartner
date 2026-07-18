@@ -1,0 +1,56 @@
+# DeskPartner — single-arm reBot B601-DM + reBot 102 leader
+# Source of truth for ports / ids. Update after lerobot-find-port.
+# Deck: https://docs.google.com/presentation/d/1LXgehBvwPy5EhWO7aaYQffvmlN4eS1zFmJWYoDcTm-c
+# Station is often bimanual / YAM-style; we run ONE follower. Track B datasets must match.
+
+mode: single_arm   # not bimanual — required for MolmoAct 2 single-arm fine-tune
+
+follower:
+  type: seeed_b601_dm_follower   # LeRobot robot.type
+  port: /dev/ttyACM0
+  id: follower1
+  can_adapter: damiao            # Damiao USB2CAN serial bridge
+  sdk_repo: ~/reBotArm_control_py
+  # Mirror into reBotArm_control_py/config/arm.yaml after find-port
+
+leader:
+  type: rebot_arm_102_leader     # LeRobot teleop.type (Seeed package naming)
+  port: /dev/ttyUSB0
+  id: rebot_arm_102_leader
+
+# If teleop axes feel inverted, tune here (from workshop deck)
+joint_directions:
+  shoulder_pan: -1
+  shoulder_lift: -1
+  elbow_flex: 1
+  wrist_flex: 1
+  wrist_yaw: 1
+  wrist_roll: -1
+  gripper: -4
+
+home:
+  # Out-of-camera-frame joint pose (degrees). Fill Friday night after reach check.
+  # Photos are ONLY taken from home.
+  joints_deg: null   # e.g. [0, -30, 45, 0, 20, 0]
+  description: "Fully clear of overhead camera FOV"
+
+safety:
+  max_speed: 0.15          # m/s Cartesian tip (tune down for demos)
+  max_accel: 0.30
+  e_stop_habit: "hand on e-stop during early runs"
+  transit_height_mm: 120   # clear height above desk during moves
+  approach_height_mm: 40   # hover above object before descend
+
+gripper:
+  close_force: null        # tune on crumpled paper first
+  open_position: null
+  foam_tape: true
+
+grasp_heights_mm:
+  # Per-item-type tip height above desk plane at grasp
+  crumpled_paper: 15
+  marker: 20
+  pen: 18
+  foam_block: 25
+  light_cup: 30
+  default: 20

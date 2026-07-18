@@ -1,0 +1,50 @@
+# DeskPartner cameras
+# Track A perception: overhead color.
+# Track B (MolmoAct 2): overhead + 45° — lock BEFORE episode 1, never move again.
+
+overhead:
+  # Primary — Track A VLM/CV + Track B view #1
+  name: overhead
+  type: opencv
+  index_or_path: 0          # from lerobot-find-cameras opencv
+  width: 1920
+  height: 1080
+  fps: 30
+  fourcc: MJPG
+  mount:
+    height_cm: 65           # 60–75 cm straight down over zone center
+    orientation: top_down
+  notes: |
+    Color innomaker (1080p wide or OV2719). NOT ov9281 (monochrome).
+    Direct USB port — no hubs.
+    Lock exposure and white balance once lighting is final.
+
+side_45:
+  # Required for Track B recording (MolmoAct 2 multi-view dataset)
+  # Pick a view where gripper does not block the object at grasp time.
+  enabled: true
+  name: side
+  type: opencv
+  index_or_path: 1
+  width: 640
+  height: 480
+  fps: 30
+  fourcc: MJPG
+  mount:
+    angle_deg: 45
+  notes: |
+    Lock position before episode 1. Same keys must appear in every episode.
+    LeRobot camera keys used in record scripts: front (=overhead), side.
+
+# Track B policy observation — MolmoAct 2 fine-tune views
+molmoact2_training:
+  views: [front, side]      # must match lerobot-record --robot.cameras keys
+  width: 640
+  height: 480
+  fps: 30
+  locked_before_episode_1: true
+
+exposure:
+  auto: false
+  locked: true
+  procedure: "Lock the moment booth lighting is final; re-lock if booth lights change"
