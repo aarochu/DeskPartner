@@ -1,0 +1,16 @@
+# Fake "taught" destinations for OFFLINE DEMO / DRY-RUN ONLY.
+# Used by `run_clean --fixtures` and by `pick_and_drop` dry-runs so the full
+# hover→descend→grasp→lift→transit→release→home sequence can run with no arm.
+# Real venue runs teach the live poses into config/destinations.yaml, e.g.:
+#   DESKPARTNER_DRY_RUN=0 python -m p1_arm_motion.teach_destination trash --live
+# Poses mirror shared.fixtures.fake_destination_pose (mm -> m).
+destinations:
+  trash:
+    xyz_m: [0.280, -0.180, 0.080]
+    rpy_rad: [0.0, 0.0, 0.0]
+  pen_cup:
+    xyz_m: [0.300, 0.160, 0.090]
+    rpy_rad: [0.0, 0.0, 0.0]
+  tray:
+    xyz_m: [0.320, 0.000, 0.070]
+    rpy_rad: [0.0, 0.0, 0.0]

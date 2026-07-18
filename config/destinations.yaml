@@ -1,27 +1,30 @@
-# Taught drop poses — outside camera zone. Jog once (P1), never guess.
+# Taught drop poses — outside camera zone. Fill via:
+#   DESKPARTNER_DRY_RUN=0 python -m p1_arm_motion.teach_destination trash --live
 
 destinations:
   trash:
     label: trash
-    # Arm tip position at release (mm in arm base frame). Fill by jogging.
-    xyz_mm: null            # e.g. [280, -180, 80]
-    rpy_deg: null           # top-down release orientation
+    xyz_m: null
+    rpy_rad: null
+    joints_rad: null
     container: "trash bin"
   pen_cup:
     label: pen_cup
-    xyz_mm: null
-    rpy_deg: null
-    container: "wide-mouth jar (not a narrow cup — forgives ~3 cm)"
+    xyz_m: null
+    rpy_rad: null
+    joints_rad: null
+    container: "wide-mouth jar"
   tray:
     label: tray
-    xyz_mm: null
-    rpy_deg: null
+    xyz_m: null
+    rpy_rad: null
+    joints_rad: null
     container: "tray for everything else"
   keep:
     label: keep
     action: never_touch
-    note: "Judge phone / personal items — leave in place"
+    note: "Never pick - judge phone / personal items"
 
 release:
-  open_gripper_hold_s: 0.4
+  open_hold_s: 0.4
   retreat_up_mm: 40

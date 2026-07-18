@@ -1,35 +1,53 @@
 # P4 — Data Collection (Track B, bonus)
 
-**Owns:** teleop practice until smooth, 50+ crumpled-paper pick episodes, consistent staging/resets, LeRobot dataset hygiene for P5.
+**Owns (per GROUND_TRUTH):** teleop practice, 50+ crumpled-paper episodes, locked dual-cam hygiene, **single-arm-only** LeRobot state/actions (no phantom second arm).
 
-**Quality of demos is the single biggest determinant of whether Track B works.**
+**Never blocks Track A.** Arm block: Saturday midday. Friday night: one throwaway + format verify.
 
-## Constraints
+Quality of demos is the single biggest determinant of whether Track B works.
 
-- **Single arm** (B601 follower + 102 leader). Station is normally bimanual — recordings must contain **ONLY** the active arm's state and actions. No phantom second-arm channels, or the single-arm MolmoAct 2 fine-tune config chokes.
-- **Cameras:** overhead (`front`) + 45° (`side`). Lock both before episode 1; MolmoAct 2 trains on whatever views are in the dataset. Prefer views where the gripper does not block the object at grasp.
-- Arm block: **Saturday midday**. Get one throwaway episode Friday night and **verify schema** that night.
+---
 
-## Friday night
+## Constraints (GT §3 / §10)
 
-1. Calibrate leader (`lerobot-calibrate` — see root README).
-2. `scripts/teleop.sh` until motions feel smooth.
-3. Record **one** throwaway episode with `scripts/record_episodes.sh` (`NUM_EPISODES=1`).
-4. Run `scripts/verify_single_arm_dataset.py` on that episode — must pass before Saturday.
+- Single arm: `seeed_b601_dm_follower` + `rebot_arm_102_leader`  
+- Cams locked before episode 1: LeRobot keys **`front`** (overhead) + **`side`** (45°)  
+- Prefer views where gripper does not block the object at grasp (MolmoAct 2 weak spot)  
+- Record resolution in `config/recording.yaml` is **640×480** for both (training views). Physical overhead mount is shared with Track A VLM (which may grab higher res separately).
 
-## Saturday midday block
+## Quick start
 
-- ≥50 episodes, same task: crumpled paper → trash (one task string, keep it).
-- Identical camera keys, lighting, staging, grasp style every episode.
-- Clean resets between episodes.
-- Hand organized dataset path + `repo_id` to P5 by end of block.
+```bash
+# once cams are physically locked for the dataset
+python -m p4_data_collection.check_camera_lock --save-ref
 
-## Don'ts (from deck + MolmoAct 2)
+# Friday night gate: throwaway + fail-loud verify
+python -m p4_data_collection.record_episode --num 1
+python -m p4_data_collection.verify_episode_format
+# alias: python p4_data_collection/scripts/verify_single_arm_dataset.py
 
-- Don't move cameras mid-dataset.
-- Don't mix inconsistent behaviors.
-- Don't use USB hubs for cameras.
-- Don't record bimanual / dual-follower schemas "just in case."
-- Don't keep episodes where the gripper fully occludes the object in both views at grasp.
+# every later session
+python -m p4_data_collection.check_camera_lock          # must PASS
+python -m p4_data_collection.batch_record --num 50      # Enter between resets
+```
 
-Rule of thumb: you should be able to do the task by only watching the camera feeds.
+Teleop practice: `./p4_data_collection/scripts/teleop.sh`
+
+## Config / docs
+
+| Path | Role |
+|------|------|
+| [`config/recording.yaml`](../config/recording.yaml) | ports, cams, task, expect schema |
+| [`DATA_COLLECTION.md`](./DATA_COLLECTION.md) | staging, reset, grasp technique, 50+ target |
+| [`CHECKLIST.md`](./CHECKLIST.md) | tick boxes + repo_id for P5 |
+
+**Default task (GT hero object):** `Pick crumpled paper and drop in trash`  
+Override: `--task "..."` (do not change mid-dataset).
+
+## Handoff to P5
+
+Clean LeRobot dataset by Saturday midday + `verify_episode_format` PASS + same camera keys forever.
+
+## Layout
+
+See [`STRUCTURE.md`](./STRUCTURE.md).

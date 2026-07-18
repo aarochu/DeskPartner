@@ -1,4 +1,9 @@
 .venv/
+.venv-zed/
+pyzed-*.whl
+PyOpenGL*.whl
+zed_preview.jpg
+camera_preview_*.jpg
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -16,6 +21,9 @@ data/calibration/*.json
 data/calibration/*.png
 data/teach_replay/
 !data/calibration/.gitkeep
+!data/calibration/calibration.json
+data/recording/
+p5_training/configs/mixture_deskpartner.yaml
 
 # OS / IDE
 .DS_Store

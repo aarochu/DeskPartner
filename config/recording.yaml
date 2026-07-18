@@ -1,0 +1,61 @@
+# Track B teleop/record — single source of truth for lerobot-record.
+# Ports mirror config/arm.yaml; camera keys must match MolmoAct2 mixture.
+
+robot:
+  type: seeed_b601_dm_follower
+  port: /dev/ttyACM0          # sync with config/arm.yaml follower.port
+  id: follower1
+  can_adapter: damiao
+
+teleop:
+  type: rebot_arm_102_leader
+  port: /dev/ttyUSB0          # sync with config/arm.yaml leader.port
+  id: rebot_arm_102_leader
+
+# LeRobot camera keys — MUST stay stable for the whole dataset
+cameras:
+  front:                      # overhead (shared with Track A perception mount)
+    type: opencv
+    index_or_path: 0          # from lerobot-find-cameras / config/cameras.yaml overhead
+    width: 640
+    height: 480
+    fps: 30
+    fourcc: MJPG
+  side:                       # 45° — Track B only
+    type: opencv
+    index_or_path: 1
+    width: 640
+    height: 480
+    fps: 30
+    fourcc: MJPG
+
+dataset:
+  repo_id: deskpartner/crumpled_paper_molmoact2
+  # Ground-truth hero task is trash; override via CLI --task if needed
+  single_task: "Pick crumpled paper and drop in trash"
+  num_episodes: 1             # record_episode default; batch_record overrides
+  episode_time_s: 30
+  reset_time_s: 20
+  push_to_hub: false
+  display_data: true
+
+# Expected schema for verify_episode_format (fail-loud)
+expect:
+  camera_keys: [front, side]
+  # Substrings that mean phantom bimanual / second arm — FAIL if seen
+  forbidden_channel_substrings:
+    - left_arm
+    - right_arm
+    - arm_left
+    - arm_right
+    - bimanual
+    - bi_
+    - left.
+    - right.
+  min_frames: 15
+  max_frames: 3000
+  # Control / robot metadata hints (soft warn if missing, hard fail if contradicts)
+  robot_type_contains: seeed_b601
+  single_arm: true
+
+camera_lock_reference: data/recording/camera_lock_ref.json

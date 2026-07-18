@@ -102,7 +102,7 @@ If a contract is late, downstream works against faked inputs. Nobody blocks.
 
 **Arm schedule:** A owns Friday night + Saturday morning. B gets Saturday midday data block. Training on Modal (no arm). B eval Saturday night + Sunday morning.
 
-**Track B notes:** Lock overhead + 45° before episode 1. P4 verifies single-arm schema on Friday's throwaway (`verify_single_arm_dataset.py`). P5 confirms newt vs Ai2 MolmoAct 2 scripts + single-arm checkpoint with organizers Friday night; Saturday trains LoRA / action-expert-only only.
+**Track B notes:** Lock overhead + 45° before episode 1 (`check_camera_lock --save-ref`). P4 verifies after every episode (`verify_episode_format` / alias `verify_single_arm_dataset.py`), especially Friday's throwaway. P5 confirms newt vs Ai2 MolmoAct 2 scripts + single-arm checkpoint with organizers Friday night; Saturday trains LoRA / action-expert-only only (`modal_finetune` wall-clock timeout). Sunday `bakeoff.py` prints `VERDICT: WINNER=...`.
 
 ---
 

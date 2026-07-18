@@ -2,15 +2,18 @@
 
 ```
 p4_data_collection/
+├── DATA_COLLECTION.md
 ├── README.md
-├── STRUCTURE.md
 ├── CHECKLIST.md
-├── scripts/
-│   ├── teleop.sh
-│   ├── record_episodes.sh
-│   └── verify_single_arm_dataset.py   # Friday throwaway gate
-└── notes/
-    └── staging.md
+├── config_loader.py
+├── record_episode.py          # lerobot-record from config/recording.yaml
+├── verify_episode_format.py   # fail-loud after EVERY episode
+├── batch_record.py            # N eps + manual ready + verify
+├── check_camera_lock.py       # preflight vs episode-1 ref
+└── scripts/
+    ├── record_episode.sh
+    ├── teleop.sh
+    └── verify_single_arm_dataset.py   # thin alias → verify_episode_format
 ```
 
-Dataset lands under `~/.cache/huggingface/lerobot/` (LeRobot default) or a path you set — tell P5 the `repo_id` and local path.
+Config: `config/recording.yaml` (ports, cams, task, expect schema).
