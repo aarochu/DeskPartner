@@ -22,6 +22,8 @@ from p1_arm_motion.arm_client import ArmConfig, DryRunArmClient, RebotArmClient,
 log = logging.getLogger("p1.pick")
 
 DEST_PATH = Path("config/destinations.yaml")
+# Fake taught poses for offline dry-runs (never used with --live).
+FIXTURE_DEST_PATH = Path("config/destinations.fixture.yaml")
 Arm = DryRunArmClient | RebotArmClient
 
 
@@ -75,11 +77,16 @@ def pick_and_drop(
     destination_name: str,
     desk_z_m: float = 0.0,
     destinations_path: Path = DEST_PATH,
+    grasp_height_mm: float | None = None,
 ) -> None:
-    """Execute one top-down pick. Raises StepError with .step name on failure."""
+    """Execute one top-down pick. Raises StepError with .step name on failure.
+
+    ``grasp_height_mm`` overrides the per-type table (``arm.yaml``) when the
+    caller (P2/P3) has refined a grasp height for this specific object.
+    """
     tx, ty = target_xy_mm
     hover_z_mm = cfg.transit_height_mm
-    grasp_z_mm = cfg.grasp_z_mm(item_type)
+    grasp_z_mm = grasp_height_mm if grasp_height_mm is not None else cfg.grasp_z_mm(item_type)
     # Arm Z: desk plane at desk_z_m; tip heights are above desk
     hover_z_m = desk_z_m + hover_z_mm / 1000.0
     grasp_z_m = desk_z_m + grasp_z_mm / 1000.0
@@ -150,6 +157,9 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = ArmConfig.from_yaml()
     arm = make_arm_client(cfg, dry_run=not args.live)
+    # Dry-runs use fake taught poses so all steps execute; --live reads the
+    # real (venue-taught) destinations.
+    dest_path = DEST_PATH if args.live else FIXTURE_DEST_PATH
     arm.connect()
     try:
         move_to_home(arm)
@@ -160,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             item_type=args.item,
             destination_name=args.dest,
             desk_z_m=args.desk_z_m,
+            destinations_path=dest_path,
         )
     except StepError as exc:
         log.error("pick_and_drop aborted at step=%s: %s", exc.step, exc)
