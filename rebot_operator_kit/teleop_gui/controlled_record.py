@@ -390,9 +390,9 @@ def consume_published_decision(
     if not isinstance(sequence, int) or sequence == last_sequence:
         return last_sequence
     action = payload.get("action")
-    if action == "finish":
+    if action in {"finish", "finish_and_stop"}:
         events["finish"] = True
-        print("GUI_EVENT finish_current_episode source=control_file", flush=True)
+        print(f"GUI_EVENT {action} source=control_file", flush=True)
     elif action == "rerecord":
         events["rerecord"] = True
         events["finish"] = True
@@ -414,7 +414,7 @@ def resolve_attempt_disposition(
 
     if events.get("rerecord") or published_action == "rerecord":
         return "failed"
-    if events.get("stop") and published_action != "finish":
+    if events.get("stop") and published_action not in {"finish", "finish_and_stop"}:
         return "aborted"
     return "kept"
 
@@ -675,6 +675,73 @@ def buffered_sample_count(dataset: LeRobotDataset) -> int:
     if not isinstance(buffer, dict):
         return 0
     return int(buffer.get("size", 0))
+
+
+def quarantine_stale_candidate_frames(
+    dataset: LeRobotDataset,
+    attempt_root: Path,
+    dataset_name: str,
+    candidate_episode_index: int,
+) -> dict[str, Any] | None:
+    """Move leftover PNGs away before reusing an unsaved episode index.
+
+    A failed encoder can leave one camera directory behind after the in-memory
+    episode buffer is released.  The next take would otherwise append to that
+    same ``episode-N`` directory and silently mix two physical attempts.  This
+    guard is deliberately recoverable: it moves every leftover camera
+    directory into an audit quarantine and never deletes recorded frames.
+    """
+
+    dataset._wait_image_writer()
+    stale_sources = {
+        camera_key: dataset._get_image_file_dir(candidate_episode_index, camera_key)
+        for camera_key in dataset.meta.camera_keys
+    }
+    stale_sources = {
+        camera_key: source
+        for camera_key, source in stale_sources.items()
+        if source.exists()
+    }
+    if not stale_sources:
+        return None
+    for source in stale_sources.values():
+        if not source.is_dir() or source.is_symlink():
+            raise RuntimeError(f"Unsafe stale camera-frame path: {source}")
+
+    quarantine_id = new_attempt_id()
+    quarantine = attempt_root / dataset_name / "_stale_frame_quarantine" / quarantine_id
+    quarantine.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "quarantine_id": quarantine_id,
+        "dataset": dataset_name,
+        "candidate_episode_index": candidate_episode_index,
+        "quarantined_at": utc_now(),
+        "reason": "stale camera frames existed before a new attempt",
+        "camera_directories": {},
+        "complete": False,
+    }
+    atomic_write_json(quarantine / "manifest.json", manifest)
+    try:
+        for camera_key, source in stale_sources.items():
+            destination = quarantine / camera_key.replace(".", "_")
+            if destination.exists():
+                raise RuntimeError(f"Stale-frame quarantine destination exists: {destination}")
+            source.replace(destination)
+            manifest["camera_directories"][camera_key] = {
+                "path": str(destination.relative_to(quarantine)),
+                "png_frames": len(list(destination.glob("*.png"))),
+            }
+            atomic_write_json(quarantine / "manifest.json", manifest)
+    except Exception as exc:
+        manifest["error"] = str(exc)
+        atomic_write_json(quarantine / "manifest.json", manifest)
+        raise RuntimeError(
+            "Could not isolate stale frames from the prior attempt; refusing to record"
+        ) from exc
+    manifest["complete"] = True
+    atomic_write_json(quarantine / "manifest.json", manifest)
+    return manifest
 
 
 def _camera_artifact_name(camera_key: str) -> str:
@@ -1844,6 +1911,19 @@ def main() -> int:
         with RecoverySafeVideoEncodingManager(dataset) as encoding_manager:
             while completed_this_run < args.episodes and not events["stop"]:
                 episode_index = dataset.num_episodes
+                quarantine = quarantine_stale_candidate_frames(
+                    dataset,
+                    args.attempt_root,
+                    args.dataset_root.name,
+                    episode_index,
+                )
+                if quarantine is not None:
+                    print(
+                        "RECOVERY stale_candidate_frames_quarantined "
+                        f"id={quarantine['quarantine_id']} episode={episode_index} "
+                        f"cameras={len(quarantine['camera_directories'])}",
+                        flush=True,
+                    )
                 attempt_number += 1
                 events["finish"] = False
                 events["rerecord"] = False
@@ -1987,7 +2067,11 @@ def main() -> int:
                             mark_attempt_home_return(directory, home_result)
                         continue
 
-                    read_control_decision(args, "finish")
+                    keep_decision = read_control_decision(
+                        args,
+                        "finish_and_stop" if published_action == "finish_and_stop" else "finish",
+                    )
+                    stop_after_save = keep_decision.get("action") == "finish_and_stop"
                     minimum_samples = max(2, int(args.dataset_fps * 1.0))
                     if samples < minimum_samples:
                         finalize_attempt_archive(
@@ -2051,6 +2135,9 @@ def main() -> int:
                         "training_included=true",
                         flush=True,
                     )
+                    if stop_after_save:
+                        print("SESSION finish_and_stop_after_durable_save", flush=True)
+                        break
                     if events["stop"]:
                         print("SESSION stop_after_kept_attempt", flush=True)
                         break

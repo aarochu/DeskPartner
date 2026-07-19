@@ -2460,6 +2460,7 @@ class TrainingManager:
         action = str(payload.get("action", ""))
         signals = {
             "finish": signal.SIGUSR1,
+            "finish_and_stop": signal.SIGUSR1,
             "rerecord": signal.SIGUSR2,
             "stop": signal.SIGHUP,
         }

@@ -145,7 +145,7 @@ h1 em { color: var(--mint); font-family: Georgia, serif; font-weight: 400; }
 .failure-controls select, .failure-controls input, .attempt-edit select, .attempt-edit input { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; outline: none; background: #06100d; color: var(--text); font-size: 10px; }
 .failure-controls select:focus, .failure-controls input:focus, .attempt-edit select:focus, .attempt-edit input:focus { border-color: rgba(255,116,121,.42); box-shadow: 0 0 0 2px rgba(255,116,121,.05); }
 .failure-controls p { grid-column: 1 / -1; margin: 0; color: var(--muted-2); font-size: 8px; line-height: 1.5; }
-.record-actions { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1fr; gap: 9px; margin-top: 13px; }
+.record-actions { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1fr 1fr; gap: 9px; margin-top: 13px; }
 .quality-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 15px; }
 .quality-grid article { padding: 14px; border: 1px solid var(--line); border-radius: 10px; }
 .quality-grid strong { color: var(--mint); font-size: 8px; letter-spacing: .14em; }

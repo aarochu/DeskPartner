@@ -207,7 +207,9 @@ the raw seventh joint during recording.
     The next attempt stays blocked until both arms are aligned and the reset
     timer has completed; reset frames are not saved. The collector waits without
     an alignment timeout, so taking longer to return the passive leader never
-    disconnects the session. Use **Stop & finalize** to end intentionally.
+    disconnects the session. To save the current good take and end intentionally,
+    use **Finish, keep & end session**. Use **Stop & discard current take** only
+    when the active take must be excluded.
 13. For a miss, collision, occlusion, dropped object, wrong destination, large
     correction, awkward hesitation, or any jerky-but-successful motion, choose
     a failure reason and click **Mark failed & re-record**. The take is excluded
@@ -227,10 +229,13 @@ the raw seventh joint during recording.
     previous validation report, and keeps a recoverable copy of the prior
     dataset revision. The attempt's MP4s, Rerun recording, and review history
     are never removed.
-16. After 10 clean saved episodes, click **Stop & finalize** only if a new
-    episode has already begun; the partial take is archived as `aborted` and
-    excluded while all saved episodes remain. Stop/abort disconnects without
-    initiating an automatic return; support the follower when stopping.
+16. After the final clean episode, click **Finish, keep & end session**. The
+    collector saves and fresh-load verifies that episode before disconnecting.
+    If a new unwanted episode has already begun, use the confirmed **Stop &
+    discard current take** action; that partial take is archived as `aborted`
+    and excluded while all earlier saved episodes remain. Discard/abort
+    disconnects without initiating an automatic return; support the follower
+    when stopping.
 17. Select the smoke dataset and click **Validate selected dataset** with a
     minimum of `10` episodes. Continue only after the log prints `PASS`, then
     hand this checkpoint to the conversion/training owner immediately.

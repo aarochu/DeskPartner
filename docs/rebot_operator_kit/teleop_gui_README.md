@@ -23,9 +23,12 @@ interactive recalibration disabled. Dataset resume, validation, and command
 generation require authenticated profile and collection-contract digests.
 
 During collection, the episode timer never auto-accepts a take. Use **Finish &
-keep episode** for a clean success, or select a reason and use **Mark failed &
-re-record**. Successes stay unlabeled and enter LeRobot; failures are labeled
-and excluded. Every attempt is independently archived with two MP4s, a
+keep episode** for a clean success and automatic continuation. Use **Finish,
+keep & end session** when the current take is good but collection should end
+after its durable save. **Stop & discard current take** requires confirmation,
+archives the active take, and excludes it from LeRobot. For a bad take, select a
+reason and use **Mark failed & re-record**. Successes stay unlabeled and enter
+LeRobot; failures are labeled and excluded. Every attempt is independently archived with two MP4s, a
 synchronized `.rrd`, and an editable JSON sidecar under
 `training-runs/attempts/<dataset>/<attempt-id>/`. The training page can replay
 the `.rrd` in Rerun and can review every finished attempt. If a take was kept
@@ -41,7 +44,8 @@ attempt—including the final kept attempt—the follower automatically returns 
 that session-home pose at a capped 120 deg/s. The operator returns the passive
 leader and task objects manually. Recording cannot resume until both arms stay
 within the captured pose tolerances and the configured reset timer completes.
-Stop or abort disconnects without initiating extra return motion.
+Finish-and-end disconnects only after the good take is durable. Stop/discard or
+abort disconnects without initiating extra return motion.
 
 ## Manual operation
 

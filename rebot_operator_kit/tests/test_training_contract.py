@@ -944,6 +944,55 @@ class AttemptArchiveTest(unittest.TestCase):
             for relative in recovery["camera_directories"].values():
                 self.assertEqual(len(list((directory / relative).glob("*.png"))), 3)
 
+    def test_next_attempt_quarantines_stale_camera_frames_without_deleting_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "frames"
+            self.write_source_frames(source_root)
+            dataset = self.FakeDataset(source_root)
+            # Model a partial recovery: only the side camera was left in the
+            # active episode directory when the same episode index is reused.
+            front = source_root / "observation.images.front"
+            recovered_front = root / "prior-attempt" / "front"
+            recovered_front.parent.mkdir()
+            front.replace(recovered_front)
+
+            result = controlled_record.quarantine_stale_candidate_frames(
+                dataset,
+                root / "attempts",
+                "stale-isolation-test",
+                0,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result["complete"])
+            self.assertEqual(
+                set(result["camera_directories"]), {"observation.images.side"}
+            )
+            self.assertFalse((source_root / "observation.images.side").exists())
+            quarantine_root = (
+                root
+                / "attempts"
+                / "stale-isolation-test"
+                / "_stale_frame_quarantine"
+                / result["quarantine_id"]
+            )
+            quarantined = quarantine_root / "observation_images_side"
+            self.assertEqual(len(list(quarantined.glob("*.png"))), 3)
+            manifest = json.loads((quarantine_root / "manifest.json").read_text())
+            self.assertTrue(manifest["complete"])
+            self.assertEqual(manifest["camera_directories"]["observation.images.side"]["png_frames"], 3)
+            self.assertEqual(len(list(recovered_front.glob("*.png"))), 3)
+            self.assertIsNone(
+                controlled_record.quarantine_stale_candidate_frames(
+                    dataset,
+                    root / "attempts",
+                    "stale-isolation-test",
+                    0,
+                )
+            )
+
     def test_background_rerun_writer_commits_every_submitted_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -1307,6 +1356,40 @@ class AttemptArchiveTest(unittest.TestCase):
             self.assertEqual(decision["action"], "stop")
             self.assertIsInstance(decision["sequence"], int)
             send_signal.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGHUP)
+
+    def test_finish_and_stop_is_a_durable_keep_decision(self) -> None:
+        class FakeProcess:
+            pid = 424244
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            manager = workspace.TrainingManager()
+            manager._kind = "record"
+            manager._process = FakeProcess()
+            manager._record_control_file = control_file
+            with patch.object(workspace.os, "kill") as send_signal:
+                manager.record_control({"action": "finish_and_stop"})
+            decision = json.loads(control_file.read_text())
+            self.assertEqual(decision["action"], "finish_and_stop")
+            send_signal.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGUSR1)
+            self.assertEqual(
+                controlled_record.resolve_attempt_disposition(
+                    {"stop": False, "rerecord": False}, "finish_and_stop"
+                ),
+                "kept",
+            )
+
+    def test_record_controls_make_keep_end_and_discard_unambiguous(self) -> None:
+        html = (GUI_ROOT / "static" / "training.html").read_text()
+        javascript = (GUI_ROOT / "static" / "training.js").read_text()
+        self.assertIn("Finish, keep & end session", html)
+        self.assertIn("Stop & discard current take", html)
+        self.assertIn('{ action: "finish_and_stop" }', javascript)
+        self.assertIn("window.confirm", javascript)
 
     def test_shutdown_waits_for_record_archive_and_escalates_recovery_safely(self) -> None:
         class FakeProcess:

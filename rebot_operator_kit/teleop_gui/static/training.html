@@ -136,8 +136,9 @@
         <div class="record-actions">
           <button class="button primary" id="start-record-button" type="button">Start collection</button>
           <button class="button secondary" id="finish-button" type="button" disabled>Finish & keep episode</button>
+          <button class="button secondary" id="finish-stop-button" type="button" disabled>Finish, keep & end session</button>
           <button class="button danger-outline" id="rerecord-button" type="button" disabled>Mark failed & re-record</button>
-          <button class="button danger" id="stop-record-button" type="button" disabled>Stop & finalize</button>
+          <button class="button danger" id="stop-record-button" type="button" disabled>Stop & discard current take</button>
         </div>
         <div class="quality-grid">
           <article><strong>KEEP</strong><p>Exactly one can, one smooth grasp-and-place action, no collision, no hand in either frame, no major hesitation or correction.</p></article>
@@ -211,7 +212,7 @@
           <li><b>Capture session home and start.</b><span>Put both arms in the exact start pose, then Start collection. Keep them still until the connection captures that pose; afterward move the teleop arm smoothly and naturally.</span></li>
           <li><b>Judge every take immediately.</b><span>Finish & keep only one smooth, clean success. Delete jerky-but-successful takes too; for any bad take, choose a failure reason and use Mark failed & re-record.</span></li>
           <li><b>Reset to a new can position.</b><span>The ReBot follower returns home automatically. Manually return the passive leader, then scatter the can to a new random reachable position across corners, edges, and center; the next recording waits for both arms and the reset timer.</span></li>
-          <li><b>Review and validate.</b><span>Replay any archived take in Rerun. Stop archives the partial take as aborted; validation must PASS all 7D follower-coordinate checks.</span></li>
+          <li><b>Review and validate.</b><span>Replay any archived take in Rerun. Finish, keep & end session saves the good take before disconnecting. Stop & discard archives the partial take as aborted; validation must PASS all 7D follower-coordinate checks.</span></li>
           <li><b>Hit the Stage-1 milestones.</b><span>Hand off the first 10 episodes for a throwaway train immediately; keep collecting and checkpoint at 50, 100, and 150 clean episodes. Only after 150 add random extra cans in frame while still picking exactly one.</span></li>
           <li><b>Train only the approved route.</b><span>Use native 7D MolmoAct2, or get explicit approval for a 6D fixed-wrist-yaw adapter before using Newt.</span></li>
         </ol>

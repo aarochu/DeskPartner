@@ -245,6 +245,7 @@ function updateButtons() {
   $("camera-check-button").disabled = running || actionPending;
   $("start-record-button").disabled = running || actionPending || !ready || !$("ready-checkbox").checked;
   $("finish-button").disabled = !recording || decisionPending || actionPending;
+  $("finish-stop-button").disabled = !recording || decisionPending || actionPending;
   const failureLabel = $("failure-label-input").value;
   const failureNote = $("failure-note-input").value.trim();
   const failureReady = Boolean(failureLabel && (failureLabel !== "other" || failureNote));
@@ -535,6 +536,15 @@ function bind() {
       0,
     );
   }));
+  $("finish-stop-button").addEventListener("click", () => runAction("Episode control failed", async () => {
+    await post("/api/training/record/control", { action: "finish_and_stop" });
+    clearFailureDraft();
+    showNotice(
+      "Save-and-end accepted. This episode is being written to Rerun and LeRobot; the arms disconnect only after the durable save completes.",
+      "info",
+      0,
+    );
+  }));
   $("rerecord-button").addEventListener("click", () => runAction("Episode control failed", async () => {
     const failureLabel = $("failure-label-input").value;
     const failureNote = $("failure-note-input").value.trim();
@@ -547,9 +557,10 @@ function bind() {
     showNotice("Failed take is archived and excluded. The follower now returns home automatically; return the passive leader and reset the task objects before the next attempt.", "info", 8500);
   }));
   $("stop-record-button").addEventListener("click", () => runAction("Stop failed", async () => {
+    if (!window.confirm("Discard the current take? It will be archived for review but will NOT be added to LeRobot.")) return;
     await post("/api/training/record/control", { action: "stop" });
     clearFailureDraft();
-    showNotice("Stop requested. The partial take is being archived as aborted and excluded from training; saved episodes are finalizing.", "info", 9000);
+    showNotice("Discard requested. The current take is being archived as aborted and excluded from training; earlier saved episodes remain unchanged.", "info", 9000);
   }));
   $("validate-button").addEventListener("click", () => runAction("Validation could not start", async () => {
     renderStatus(await post("/api/training/validate", { dataset: selectedDataset, minimum_episodes: number("minimum-episodes-input") }));
