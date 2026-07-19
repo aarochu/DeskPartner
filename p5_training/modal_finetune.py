@@ -222,6 +222,11 @@ def main() -> int:
     ap.add_argument("--dataset-repo-id", default=None)
     ap.add_argument("--dataset-root", default=None, help="default /data/<repo_id> on the Modal volume")
     ap.add_argument("--dry-print", action="store_true", help="print the command, don't launch")
+    ap.add_argument(
+        "--detach",
+        action="store_true",
+        help="run detached on Modal: keeps training after this process/laptop disconnects",
+    )
     args = ap.parse_args()
 
     cfg = _load_yaml(args.train_config) if args.train_config.exists() else {}
@@ -246,7 +251,9 @@ def main() -> int:
         return 0
 
     with modal.enable_output():  # stream the container's training logs locally
-        with app.run():
+        # detach=True: the Modal app keeps running even if this client disconnects
+        # (laptop sleeps), so training + checkpointing + wandb continue in the cloud.
+        with app.run(detach=args.detach):
             result = train.remote(argv, exp)
     print("Modal finished:", result)
     return 0
