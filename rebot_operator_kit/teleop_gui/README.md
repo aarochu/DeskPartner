@@ -77,17 +77,16 @@ step limit:
 
 `effective cap = min(motor velocity, command Hz × step limit)`
 
-The multiplier scales this effective cap linearly. The verified default is the
-hand-tracking ceiling shown in the last row below; the earlier rows explain how
-that setting was derived from the original Low-latency 500 baseline:
+The multiplier scales this effective cap linearly. The manual GUI now starts
+with 4x applied to the Hand-tracking 2000 baseline, matching the verified
+240 Hz / 2000 deg/s / 33.6 deg/cycle operator setting. The motor ceiling means
+the effective joint cap remains 2000 deg/s and the GUI correctly marks it
+`LIMITED`.
 
-| Multiplier | Command rate | Motor velocity | Step limit |
+| Hand-tracking setting | Command rate | Motor velocity | Step limit |
 | --- | ---: | ---: | ---: |
-| 0.5× | 60 Hz | 250 °/s | 4.2 °/cycle |
-| 1× | 120 Hz | 500 °/s | 4.2 °/cycle |
-| 2× | 240 Hz | 1000 °/s | 4.2 °/cycle |
-| 3× | 240 Hz | 1500 °/s | 6.3 °/cycle |
-| 4× | 240 Hz | 2000 °/s | 8.4 °/cycle |
+| 1× baseline | 240 Hz | 2000 °/s | 8.4 °/cycle |
+| 4× default | 240 Hz | 2000 °/s | 33.6 °/cycle |
 
 When a requested multiplier reaches the configured Hz, velocity, or step
 ceiling, the GUI clamps the generated draft and shows the actual achieved
@@ -107,11 +106,12 @@ ReBot setup.
 | Responsive | 30 Hz | 150 °/s | 5.0 °/cycle |
 | Fast 500 | 60 Hz | 500 °/s | 8.3 °/cycle |
 | Low-latency 500 | 120 Hz | 500 °/s | 4.2 °/cycle |
-| Hand-tracking 2000 | 240 Hz | 2000 °/s | 8.4 °/cycle |
+| Hand-tracking 2000 baseline | 240 Hz | 2000 °/s | 8.4 °/cycle |
 
-Hand-tracking 2000 is selected by default and matches the collection profile.
-Any edited number turns the draft into a Custom profile and is saved in this
-browser.
+Hand-tracking 2000 is the multiplier baseline; 4x is applied by default, so the
+actual starting step limit is 33.6 deg/cycle and matches the collection
+profile. Any edited number turns the draft into a Custom profile and is saved
+in this browser.
 
 ## Status and logs
 

@@ -54,8 +54,8 @@ optional duration, a non-compounding baseline multiplier, presets, device
 state, and streaming logs. Settings can be edited while a run is active and
 apply on the next Start.
 
-The default preset is the verified hand-tracking setup: 2000 deg/s on all seven
-joints, 240 Hz, and 8.4 deg/cycle. Choose any preset or type custom numbers;
+The default is the verified 4x hand-tracking result: 2000 deg/s on all seven
+joints, 240 Hz, and 33.6 deg/cycle. Choose any preset or type custom numbers;
 **Apply to all** copies
 the global motor velocity to all seven joints. The detailed control reference
 is in `teleop_gui/README.md`.

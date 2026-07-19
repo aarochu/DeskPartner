@@ -34,6 +34,7 @@ from pathlib import Path
 import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -92,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--leader-implementation", type=Path, required=True)
     parser.add_argument("--task", required=True)
     parser.add_argument("--episodes", type=int, required=True)
-    parser.add_argument("--episode-time-s", type=float, default=30.0)
+    parser.add_argument("--episode-time-s", type=float, default=1000.0)
     parser.add_argument("--reset-time-s", type=float, default=20.0)
     parser.add_argument("--control-hz", type=int, default=240)
     parser.add_argument("--dataset-fps", type=int, default=30)
@@ -103,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-width", type=int, default=1280)
     parser.add_argument("--side-height", type=int, default=720)
     parser.add_argument("--excluded-camera", type=int, required=True)
-    parser.add_argument("--max-step", type=float, default=8.4)
+    parser.add_argument("--max-step", type=float, default=33.6)
     parser.add_argument("--motor-velocity", type=float, default=2000.0)
     parser.add_argument("--gripper-force", type=float, default=0.05)
     parser.add_argument("--resume", action="store_true")
@@ -372,15 +373,41 @@ def resolve_attempt_disposition(
 def start_rerun_viewer(enabled: bool) -> bool:
     if not enabled:
         return False
+
+    def viewer_ready() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", RERUN_VIEWER_PORT), timeout=0.2):
+                return True
+        except OSError:
+            return False
+
+    if viewer_ready():
+        return True
     try:
         rr.init("rebot_training_collection")
-        rr.spawn(
-            connect=False,
-            port=RERUN_VIEWER_PORT,
-            memory_limit="10%",
-            detach_process=True,
+        # Do not use rr.spawn here. A detached viewer inherits the collector's
+        # stdout pipe, which prevents owned_process.py and the GUI from seeing
+        # EOF after the robot has already saved and disconnected.
+        subprocess.Popen(
+            [
+                str(RERUN_NATIVE_BIN),
+                f"--port={RERUN_VIEWER_PORT}",
+                "--memory-limit=10%",
+                "--server-memory-limit=0B",
+                "--expect-data-soon",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
-        return True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if viewer_ready():
+                return True
+            time.sleep(0.05)
+        raise RuntimeError("Rerun viewer did not open its local port")
     except Exception as exc:
         logging.warning("Rerun viewer could not start; attempt RRD files will still be saved: %s", exc)
         return False

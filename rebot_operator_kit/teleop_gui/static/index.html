@@ -84,27 +84,27 @@
                 <span class="field-title">Baseline speed multiplier</span>
                 <span class="field-help" id="baseline-summary">Hand-tracking 2000 · 240 Hz · 2000°/s · 8.4°/cycle</span>
               </div>
-              <span class="multiplier-status" id="multiplier-status">1× applied</span>
+              <span class="multiplier-status limited" id="multiplier-status">4× limited</span>
             </div>
             <div class="multiplier-controls">
               <div class="multiplier-chips" aria-label="Quick speed multipliers">
                 <button type="button" class="multiplier-chip" data-multiplier="0.5">0.5×</button>
-                <button type="button" class="multiplier-chip active" data-multiplier="1">1×</button>
+                <button type="button" class="multiplier-chip" data-multiplier="1">1×</button>
                 <button type="button" class="multiplier-chip" data-multiplier="1.5">1.5×</button>
                 <button type="button" class="multiplier-chip" data-multiplier="2">2×</button>
                 <button type="button" class="multiplier-chip" data-multiplier="3">3×</button>
-                <button type="button" class="multiplier-chip" data-multiplier="4">4×</button>
+                <button type="button" class="multiplier-chip active" data-multiplier="4">4×</button>
               </div>
               <div class="multiplier-custom">
                 <span class="input-shell compact multiplier-input-shell">
-                  <input id="multiplier-input" type="number" min="0.1" max="10" step="0.1" value="1" inputmode="decimal" aria-label="Custom speed multiplier">
+                  <input id="multiplier-input" type="number" min="0.1" max="10" step="0.1" value="4" inputmode="decimal" aria-label="Custom speed multiplier">
                   <span class="unit">×</span>
                 </span>
                 <button class="button-secondary multiplier-apply" id="apply-multiplier-button" type="button">Apply multiplier</button>
               </div>
             </div>
             <div class="multiplier-footer">
-              <span id="multiplier-preview">1× → 240 Hz · 2000°/s · 8.4°/cycle</span>
+              <span id="multiplier-preview">4× → 240 Hz · 2000°/s · 33.6°/cycle · achieved 1× LIMITED</span>
               <button type="button" id="set-baseline-button">Set current as baseline</button>
             </div>
           </div>
@@ -128,7 +128,7 @@
               <span class="field-title">Step limit</span>
               <span class="field-help">Maximum change each loop</span>
               <span class="input-shell">
-                <input id="step-input" name="max_step" type="number" min="0.01" max="45" step="0.1" value="8.4" inputmode="decimal">
+                <input id="step-input" name="max_step" type="number" min="0.01" max="45" step="0.1" value="33.6" inputmode="decimal">
                 <span class="unit">°/cycle</span>
               </span>
             </label>

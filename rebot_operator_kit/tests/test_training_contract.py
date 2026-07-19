@@ -11,7 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -34,7 +34,7 @@ from lerobot.datasets.utils import DEFAULT_FEATURES  # noqa: E402
 EXPECTED = {
     "control_hz": 240,
     "motor_velocity": 2000.0,
-    "max_step": 8.4,
+    "max_step": 33.6,
     "gripper_force": 0.05,
 }
 
@@ -46,8 +46,8 @@ def command_value(command: list[str], flag: str) -> str:
 class TrainingDefaultsTest(unittest.TestCase):
     def test_profile_api_form_and_command_share_exact_defaults(self) -> None:
         status = workspace.require_training_profile()
-        self.assertEqual(status["profile_id"], "rebot-b601-dm-follower1-native7d-v4")
-        self.assertEqual(status["profile_version"], 4)
+        self.assertEqual(status["profile_id"], "rebot-b601-dm-follower1-native7d-v5")
+        self.assertEqual(status["profile_version"], 5)
         for key, expected in EXPECTED.items():
             self.assertEqual(status["defaults"][key], expected)
 
@@ -58,7 +58,8 @@ class TrainingDefaultsTest(unittest.TestCase):
         )
         self.assertEqual(command_value(command, "--control-hz"), "240")
         self.assertEqual(command_value(command, "--motor-velocity"), "2000")
-        self.assertEqual(command_value(command, "--max-step"), "8.4")
+        self.assertEqual(command_value(command, "--episode-time-s"), "1000")
+        self.assertEqual(command_value(command, "--max-step"), "33.6")
         self.assertEqual(command_value(command, "--gripper-force"), "0.05")
         self.assertEqual(command_value(command, "--attempt-root"), str(workspace.ATTEMPT_ROOT))
         self.assertTrue(command_value(command, "--control-file").endswith("record-control.json"))
@@ -66,7 +67,8 @@ class TrainingDefaultsTest(unittest.TestCase):
         training_html = (GUI_ROOT / "static" / "training.html").read_text()
         self.assertIn('id="control-hz-input" type="number" value="240"', training_html)
         self.assertIn('id="velocity-input" type="number" value="2000"', training_html)
-        self.assertIn('id="max-step-input" type="number" value="8.4"', training_html)
+        self.assertIn('id="episode-time-input" type="number" value="1000"', training_html)
+        self.assertIn('id="max-step-input" type="number" value="33.6"', training_html)
 
     def test_stage_one_can_smoke_defaults_and_finish_notice_are_explicit(self) -> None:
         status = workspace.require_training_profile()
@@ -77,6 +79,7 @@ class TrainingDefaultsTest(unittest.TestCase):
         )
         self.assertEqual(defaults["dataset"], "rebot-can-sort-stage1-v1-smoke")
         self.assertEqual(defaults["episodes"], 10)
+        self.assertEqual(defaults["episode_time_s"], 1000)
 
         training_html = (GUI_ROOT / "static" / "training.html").read_text()
         self.assertIn(
@@ -94,24 +97,37 @@ class TrainingDefaultsTest(unittest.TestCase):
 
     def test_manual_gui_default_matches_collection_profile(self) -> None:
         preset = server.PRESETS["hand_tracking"]
-        self.assertEqual(
-            {
-                "control_hz": preset["hz"],
-                "motor_velocity": preset["velocity"],
-                "max_step": preset["max_step"],
-                "gripper_force": preset["gripper_force"],
-            },
-            EXPECTED,
-        )
+        self.assertEqual(preset["hz"], 240)
+        self.assertEqual(preset["velocity"], 2000)
+        self.assertEqual(preset["max_step"], 8.4)
+        self.assertEqual(preset["gripper_force"], 0.05)
         validated = server.validate_config({})
         self.assertEqual(validated["hz"], 240)
-        self.assertEqual(validated["max_step"], 8.4)
+        self.assertEqual(validated["max_step"], 33.6)
         self.assertEqual(validated["gripper_force"], 0.05)
         self.assertEqual(set(validated["velocities"].values()), {2000.0})
-        self.assertEqual(validated["tracking_cap"], 2016.0)
+        self.assertEqual(validated["tracking_cap"], 8064.0)
         app_js = (GUI_ROOT / "static" / "app.js").read_text()
-        self.assertIn('const STORAGE_KEY = "rebot.teleop.draft.v3";', app_js)
+        self.assertIn('const STORAGE_KEY = "rebot.teleop.draft.v4";', app_js)
         self.assertIn('const DEFAULT_PRESET = "hand_tracking";', app_js)
+        self.assertIn('const DEFAULT_SPEED_MULTIPLIER = 4;', app_js)
+
+    def test_rerun_viewer_cannot_inherit_collector_output_pipe(self) -> None:
+        fake_process = Mock()
+        with (
+            patch.object(controlled_record, "RERUN_NATIVE_BIN", Path("/tmp/rerun")),
+            patch.object(controlled_record.socket, "create_connection") as connect,
+            patch.object(controlled_record.subprocess, "Popen", return_value=fake_process) as popen,
+            patch.object(controlled_record.rr, "init"),
+        ):
+            connect.side_effect = [OSError("not listening"), MagicMock()]
+            self.assertTrue(controlled_record.start_rerun_viewer(True))
+        kwargs = popen.call_args.kwargs
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertTrue(kwargs["close_fds"])
 
     def test_follower_config_receives_2000_for_all_seven_joints(self) -> None:
         status = workspace.require_training_profile()
@@ -126,7 +142,7 @@ class TrainingDefaultsTest(unittest.TestCase):
             side_width=1280,
             side_height=720,
             dataset_fps=30,
-            max_step=8.4,
+            max_step=33.6,
             motor_velocity=2000.0,
             gripper_force=0.05,
             follower_calibration=Path(calibration["follower"]["path"]),
@@ -149,7 +165,7 @@ class TrainingDefaultsTest(unittest.TestCase):
         ):
             follower, _leader = controlled_record.make_hardware(args, status["profile"])
         self.assertEqual(follower.config.pos_vel_velocity, [2000.0] * 7)
-        self.assertEqual(follower.config.max_relative_target, 8.4)
+        self.assertEqual(follower.config.max_relative_target, 33.6)
 
 
 class CollectorSchemaTest(unittest.TestCase):

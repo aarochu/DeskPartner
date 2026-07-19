@@ -175,12 +175,12 @@ the raw seventh joint during recording.
 6. Use dataset name `rebot-can-sort-stage1-v1-smoke`.
 7. Use these initial settings:
    - Episodes: `10`
-   - Episode time: `30 s`
+   - Episode time: `1000 s` upper guard; finish each take manually
    - Reset time: `20 s`
    - Control: `240 Hz`
    - Dataset: `30 FPS`
    - Motor velocity: `2000 °/s` on all seven joints
-   - Step cap: `8.4 °/tick`
+   - Step cap: `33.6 °/tick`
    - Gripper force: `0.05`
 8. Put both arms in the exact stable pose you want to use as the home position
    for this session, and confirm the follower is clear to move. The collector
@@ -201,8 +201,9 @@ the raw seventh joint during recording.
     correction, awkward hesitation, or any jerky-but-successful motion, choose
     a failure reason and click **Mark failed & re-record**. The take is excluded
     from training, but its videos and Rerun recording are preserved.
-14. The 30-second episode time is a target, not automatic acceptance. Recording
-    pauses motion and recording at the configured limit, then waits until you
+14. The 1000-second episode time is only an upper guard. Finish each take
+    manually as soon as the task is complete. At the limit, recording
+    pauses motion and recording, then waits until you
     explicitly keep, mark failed, or stop the attempt. It never auto-keeps and
     cannot fill the disk while waiting for a browser decision.
 15. Use **Review and label every finished attempt** to open the separate

@@ -403,7 +403,7 @@ def validate_collection_config(payload: Any) -> dict[str, Any]:
         "repo_id": f"local/{slug}",
         "task": task,
         "episodes": _number(payload.get("episodes", defaults["episodes"]), "Episodes this run", 1, 500, whole=True),
-        "episode_time_s": _number(payload.get("episode_time_s", defaults["episode_time_s"]), "Episode time", 5, 300),
+        "episode_time_s": _number(payload.get("episode_time_s", defaults["episode_time_s"]), "Episode time", 5, 3600),
         "reset_time_s": _number(payload.get("reset_time_s", defaults["reset_time_s"]), "Reset time", 3, 180),
         "fps": _number(payload.get("fps", defaults["fps"]), "Dataset FPS", 5, 60, whole=True),
         "control_hz": _number(payload.get("control_hz", defaults["control_hz"]), "Control Hz", 30, 240, whole=True),

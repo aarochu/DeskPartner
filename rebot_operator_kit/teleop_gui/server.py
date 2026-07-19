@@ -145,7 +145,7 @@ def validate_config(payload: Any) -> dict[str, Any]:
     if not hz_value.is_integer():
         raise ConfigError("Hz must be a whole number")
     hz = int(hz_value)
-    max_step = _finite_number(payload.get("max_step", 8.4), "Max step", 0.01, 45)
+    max_step = _finite_number(payload.get("max_step", 33.6), "Max step", 0.01, 45)
     gripper_force = _finite_number(
         payload.get("gripper_force", 0.05), "Gripper force ratio", 0, 1
     )
