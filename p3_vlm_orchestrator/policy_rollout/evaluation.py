@@ -85,6 +85,14 @@ class ReportPaths:
     csv_path: Path
 
 
+@dataclass(frozen=True)
+class _TerminalAudit:
+    attempt: int
+    terminal_reason: str
+    clamps: int
+    elapsed_seconds: float
+
+
 def load_trial_manifest(path: Path | str) -> TrialManifest:
     """Read and strictly validate one checkpoint's final held-out trials."""
 
@@ -114,6 +122,13 @@ def load_trial_manifest(path: Path | str) -> TrialManifest:
     placement_ids = [trial.placement_id for trial in trials]
     if len(set(placement_ids)) != len(placement_ids):
         raise ValueError("Trials must use distinct placement IDs")
+    audit_sources = [
+        source
+        for trial in trials
+        for source in trial.source_jsonl_paths
+    ]
+    if len(set(audit_sources)) != len(audit_sources):
+        raise ValueError("source JSONL path is reused across placements")
     return TrialManifest(
         source_path=source,
         checkpoint=checkpoint,
@@ -147,9 +162,12 @@ def compare(manifests: Sequence[TrialManifest]) -> list[dict[str, object]]:
 
     if len(manifests) < 2:
         raise ValueError("Checkpoint comparison requires at least two manifests")
-    checkpoints = [(manifest.checkpoint, manifest.checkpoint_digest) for manifest in manifests]
-    if len(set(checkpoints)) != len(checkpoints):
+    checkpoint_paths = [manifest.checkpoint for manifest in manifests]
+    if len(set(checkpoint_paths)) != len(checkpoint_paths):
         raise ValueError("Checkpoint comparison requires distinct checkpoint identities")
+    checkpoint_digests = [manifest.checkpoint_digest for manifest in manifests]
+    if len(set(checkpoint_digests)) != len(checkpoint_digests):
+        raise ValueError("Checkpoint comparison requires distinct checkpoint digests")
     expected_placements = frozenset(
         trial.placement_id for trial in manifests[0].trials
     )
@@ -160,18 +178,18 @@ def compare(manifests: Sequence[TrialManifest]) -> list[dict[str, object]]:
                 "Checkpoint comparison requires the same held-out placement IDs"
             )
 
-    summaries = [summarize(manifest) for manifest in manifests]
-    return sorted(
-        summaries,
-        key=lambda row: (
-            -int(row["placement_successes"]),
-            -float(row["overall_success_rate"]),
-            int(row["safety_faults"]),
-            int(row["clamps"]),
-            float(row["mean_completion_s"]),
-            str(row["checkpoint"]),
+    ranked = sorted(
+        manifests,
+        key=lambda manifest: (
+            -sum(trial.placement_success for trial in manifest.trials),
+            sum(trial.safety_faults for trial in manifest.trials),
+            sum(trial.clamps for trial in manifest.trials),
+            math.fsum(trial.completion_s for trial in manifest.trials)
+            / len(manifest.trials),
+            manifest.checkpoint,
         ),
     )
+    return [summarize(manifest) for manifest in ranked]
 
 
 def write_reports(
@@ -253,10 +271,6 @@ def _parse_trial(
     clamps = _nonnegative_integer(value.get("clamps"), "clamps")
     completion_s = _nonnegative_finite(value.get("completion_s"), "completion_s")
     source_paths = _source_paths(value.get("source_jsonl_paths"))
-    if len(source_paths) != attempts_used:
-        raise ValueError(
-            "source JSONL path count must exactly match attempts_used"
-        )
 
     if placement_success and not grasp_success:
         raise ValueError("Placement success requires grasp success")
@@ -272,7 +286,7 @@ def _parse_trial(
     elif safety_faults != 0:
         raise ValueError("Safety fault counts require a safety_fault terminal outcome")
 
-    return Trial(
+    trial = Trial(
         checkpoint=trial_checkpoint,
         checkpoint_digest=trial_digest,
         placement_id=placement_id,
@@ -285,6 +299,8 @@ def _parse_trial(
         completion_s=completion_s,
         source_jsonl_paths=source_paths,
     )
+    _validate_trial_audits(trial)
+    return trial
 
 
 def _report_root(repo_root: Path | str, output_name: str) -> Path:
@@ -316,9 +332,109 @@ def _source_paths(value: object) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise ValueError("source JSONL paths must be a nonempty list")
     paths = tuple(_nonempty_string(item, "source JSONL path") for item in value)
-    if any(Path(path).suffix != ".jsonl" for path in paths):
-        raise ValueError("source JSONL paths must name .jsonl files")
+    if len(set(paths)) != len(paths):
+        raise ValueError("source JSONL paths must be distinct")
+    for source in paths:
+        path = Path(source)
+        if not path.is_absolute():
+            raise ValueError("source JSONL paths must be absolute")
+        if path.suffix != ".jsonl":
+            raise ValueError("source JSONL paths must name .jsonl files")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                "source JSONL paths must be existing regular non-symlink files"
+            )
     return paths
+
+
+def _validate_trial_audits(trial: Trial) -> None:
+    terminal_rows: list[_TerminalAudit] = []
+    for source in trial.source_jsonl_paths:
+        terminal_rows.extend(_read_terminal_audits(Path(source)))
+
+    attempts = sorted(row.attempt for row in terminal_rows)
+    expected_attempts = list(range(1, trial.attempts_used + 1))
+    if attempts != expected_attempts:
+        raise ValueError(
+            "source JSONL terminal attempts must be exactly 1..attempts_used"
+        )
+    ordered = sorted(terminal_rows, key=lambda row: row.attempt)
+    if any(row.terminal_reason != "operator_failure" for row in ordered[:-1]):
+        raise ValueError(
+            "source JSONL non-final attempts must end in operator_failure"
+        )
+    if ordered[-1].terminal_reason != trial.terminal_reason:
+        raise ValueError(
+            "source JSONL final terminal reason does not match the manifest"
+        )
+
+    audit_clamps = sum(row.clamps for row in ordered)
+    if audit_clamps != trial.clamps:
+        raise ValueError("source JSONL clamp count does not match the manifest")
+    audit_safety_faults = sum(
+        row.terminal_reason == "safety_fault" for row in ordered
+    )
+    if audit_safety_faults != trial.safety_faults:
+        raise ValueError(
+            "source JSONL safety fault count does not match the manifest"
+        )
+    audit_completion_s = math.fsum(row.elapsed_seconds for row in ordered)
+    if not math.isclose(
+        audit_completion_s,
+        trial.completion_s,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "source JSONL completion seconds do not match the manifest"
+        )
+
+
+def _read_terminal_audits(path: Path) -> list[_TerminalAudit]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Cannot read source JSONL at {path}: {exc}") from exc
+    terminal_rows: list[_TerminalAudit] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            raise ValueError(f"Source JSONL {path}:{line_number} is blank")
+        try:
+            row = json.loads(line, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(
+                f"Source JSONL {path}:{line_number} is invalid: {exc}"
+            ) from exc
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                f"Source JSONL {path}:{line_number} must contain an object"
+            )
+        if row.get("event") not in ("terminal", "terminal_fallback"):
+            continue
+        attempt = _integer(row.get("attempt"), "source JSONL terminal attempt")
+        if attempt < 1:
+            raise ValueError("source JSONL terminal attempt must be positive")
+        terminal_reason = _nonempty_string(
+            row.get("terminal_reason"),
+            "source JSONL terminal reason",
+        )
+        if terminal_reason not in TERMINAL_REASONS:
+            raise ValueError("source JSONL terminal reason is unrecognized")
+        terminal_rows.append(
+            _TerminalAudit(
+                attempt=attempt,
+                terminal_reason=terminal_reason,
+                clamps=_nonnegative_integer(
+                    row.get("clamp_count"),
+                    "source JSONL clamp count",
+                ),
+                elapsed_seconds=_nonnegative_finite(
+                    row.get("elapsed_seconds"),
+                    "source JSONL elapsed seconds",
+                ),
+            )
+        )
+    return terminal_rows
 
 
 def _validate_summary_rows(rows: Sequence[Mapping[str, object]]) -> None:
@@ -353,12 +469,9 @@ def _nonnegative_integer(value: object, label: str) -> int:
 
 
 def _nonnegative_finite(value: object, label: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be finite and nonnegative")
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be finite and nonnegative") from exc
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a real JSON number")
+    result = float(value)
     if not math.isfinite(result) or result < 0.0:
         raise ValueError(f"{label} must be finite and nonnegative")
     return result

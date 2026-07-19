@@ -147,10 +147,13 @@ Allowed terminal reasons are `operator_success`, `operator_failure`, `stopped`,
 both camera views. `completion_s` is the sum of policy-running elapsed seconds
 across the final trial's one or two attempts; exclude manual-reset downtime.
 This same definition is used for every checkpoint. Sum clamp counts across both
-attempts. `source_jsonl_paths` has one ordered entry per attempt. The current
-retry loop appends both attempts to the same JSONL, so repeat that absolute path
-twice when `attempts_used` is `2`. A safety fault is a failed trial and is never
-retried.
+attempts. `completion_s` must be a JSON number, not a quoted string.
+`source_jsonl_paths` must identify absolute, existing, regular, non-symlink JSONL files.
+The current retry loop appends both attempts to one file: List the shared JSONL path once, never duplicate it.
+Reporting reads the files without modifying them and requires exactly the terminal or
+`terminal_fallback` rows for attempts `1..attempts_used`. Their final reason,
+total clamps, safety-fault count, and summed elapsed seconds must match the
+manifest. A safety fault is a failed trial and is never retried.
 
 Generate the per-checkpoint report:
 
@@ -172,9 +175,10 @@ Compare two or more checkpoints:
 JSON and CSV are written under `runs/policy/reports/`; rollout audit JSONL is
 written under `runs/policy/`. Existing reports are never overwritten.
 Comparison ranks higher placement success first, then fewer safety faults,
-then fewer clamps, then lower mean completion time. Exact remaining ties use
-checkpoint identity only for deterministic output. Training loss is never a
-selection criterion.
+then fewer clamps, then lower unrounded mean completion time. Reports round the
+displayed mean to six decimal places only after ranking. Exact remaining ties
+use checkpoint identity only for deterministic output. Training loss is never
+a selection criterion.
 
 ## Current fail-closed limitation
 
