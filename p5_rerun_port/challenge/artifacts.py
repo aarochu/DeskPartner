@@ -343,23 +343,26 @@ def _write_parquet(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def _write_review_queue(path: Path, payloads: RunPayloads) -> None:
-    rows_by_identity = {row.identity.canonical: row for row in payloads.inventory}
-    fields = ("identity", "role", "task_key", "verdict", "reason_codes", "frame_count")
+    from .report import review_queue_rows
+
+    fields = (
+        "rank", "identity", "role", "task_key", "anomaly_count",
+        "worst_metric", "worst_value", "reason_codes",
+    )
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
-        for verdict in sorted(payloads.verdicts, key=lambda value: value.identity):
-            if verdict.verdict != "REVIEW":
-                continue
-            row = rows_by_identity[verdict.identity]
+        for rank, identity, role, task_key, anomaly_count, metric, value, reasons in review_queue_rows(payloads):
             writer.writerow(
                 {
-                    "identity": verdict.identity,
-                    "role": row.role,
-                    "task_key": row.task_key,
-                    "verdict": verdict.verdict,
-                    "reason_codes": "|".join(verdict.reason_codes),
-                    "frame_count": row.frame_count,
+                    "rank": rank,
+                    "identity": identity,
+                    "role": role,
+                    "task_key": task_key,
+                    "anomaly_count": anomaly_count,
+                    "worst_metric": metric,
+                    "worst_value": value,
+                    "reason_codes": reasons,
                 }
             )
 
@@ -372,6 +375,32 @@ def _run_id(payloads: RunPayloads) -> str:
         "query_code_commit": payloads.source_lock.get("query_code_commit", "unknown"),
     }
     return _sha256_bytes(_json_bytes(value))
+
+
+def verify_run_artifacts(run_dir: Path, expected_manifest_digest: str | None = None) -> dict:
+    """Fail closed unless every immutable run artifact matches its checksum."""
+
+    run_dir = Path(run_dir)
+    try:
+        checksums = json.loads((run_dir / "checksums.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ArtifactError(f"run checksums are unreadable: {run_dir}") from error
+    if checksums.get("run_id") != run_dir.name or not isinstance(checksums.get("sha256"), dict):
+        raise ArtifactError(f"run checksum identity is invalid: {run_dir}")
+    for name, expected in checksums["sha256"].items():
+        path = run_dir / name
+        if not path.is_file() or _sha256_bytes(path.read_bytes()) != expected:
+            raise ArtifactError(f"run artifact checksum mismatch: {path}")
+    try:
+        manifest = json.loads((run_dir / "selection-manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ArtifactError("selection manifest is unreadable") from error
+    actual_digest = selection_payload_digest(manifest)
+    if actual_digest != manifest.get("selection_payload_digest"):
+        raise ArtifactError("selection manifest payload digest is invalid")
+    if expected_manifest_digest is not None and actual_digest != expected_manifest_digest:
+        raise ArtifactError("existing run belongs to a different selection manifest")
+    return checksums
 
 
 def write_run_artifacts(run_root: Path, payloads: RunPayloads) -> Path:
@@ -392,7 +421,10 @@ def write_run_artifacts(run_root: Path, payloads: RunPayloads) -> Path:
     run_id = _run_id(payloads)
     destination = run_root / run_id
     if destination.exists():
-        raise ArtifactError(f"immutable run directory already exists: {destination}")
+        verify_run_artifacts(
+            destination, payloads.selection_manifest["selection_payload_digest"]
+        )
+        return destination
     temporary = Path(tempfile.mkdtemp(prefix=f".{run_id}.", dir=run_root))
     try:
         _write_json(temporary / "source-lock.json", payloads.source_lock)

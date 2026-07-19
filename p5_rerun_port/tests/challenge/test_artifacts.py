@@ -6,6 +6,7 @@ import json
 import pytest
 
 from p5_rerun_port.challenge.artifacts import (
+    ArtifactError,
     ManifestError,
     RunPayloads,
     build_selection_manifest,
@@ -95,3 +96,11 @@ def test_write_run_artifacts_is_complete_and_checksummed(tmp_path) -> None:
     checksums = json.loads((run_dir / "checksums.json").read_text())
     assert set(checksums["sha256"]) == expected - {"checksums.json"}
     assert run_dir.name == checksums["run_id"]
+
+    assert write_run_artifacts(tmp_path, payloads) == run_dir
+    (run_dir / "evaluation.json").write_text("corrupt", encoding="utf-8")
+    with pytest.raises(ArtifactError, match="checksum mismatch"):
+        write_run_artifacts(tmp_path, payloads)
+    review_lines = (run_dir / "review-queue.csv").read_text(encoding="utf-8").splitlines()
+    assert review_lines[0] == "rank,identity,role,task_key,anomaly_count,worst_metric,worst_value,reason_codes"
+    assert review_lines[1].startswith(f"1,{rows[1].identity.canonical},success,single_can,1,")
