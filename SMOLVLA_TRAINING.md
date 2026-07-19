@@ -4,7 +4,9 @@ How to fine-tune a **SmolVLA** policy locally on this machine's GPU, using the
 vendored LeRobot. This is the SmolVLA half of Track B; MolmoAct is trained
 separately on Modal.
 
-Verified working on an Apple Silicon Mac (MPS) on 2026-07-18.
+Verified working on an Apple Silicon Mac (MPS) on 2026-07-18 using the
+repository's standard LeRobot environment,
+`rebot_setup/vendor/rebot_lerobot/.venv`.
 
 **Fine-tune, don't train from scratch.** We warm-start from the pretrained
 `lerobot/smolvla_base` checkpoint — a SmolVLA that already knows how to move an
@@ -17,20 +19,34 @@ will not learn a usable policy on ~150 episodes, so we always pass
 
 ## One-time setup
 
-The system default Python (3.13) is too new for the ML stack — use **Python 3.11**.
+The system default Python (3.13) is too new for the ML stack. Build the
+repository's pinned **Python 3.11** environment, then add the SmolVLA policy
+dependencies to that same environment:
 
 ```bash
 # from the repo root
-python3.11 -m venv .venv-lerobot
-./.venv-lerobot/bin/python -m pip install --upgrade pip
-./.venv-lerobot/bin/python -m pip install -e "./rebot_setup/vendor/rebot_lerobot/lerobot[smolvla]"
+./rebot_setup/setup.sh
+uv pip install \
+  --python rebot_setup/vendor/rebot_lerobot/.venv/bin/python \
+  'transformers>=4.57.1,<5.0.0' \
+  'num2words>=0.5.14,<0.6.0' \
+  'accelerate>=1.7.0,<2.0.0' \
+  'safetensors>=0.4.3,<1.0.0'
 ```
+
+The `uv pip` form is intentional: the environment built by `setup.sh` does not
+install the `pip` module. Also do not install the full vendored
+`lerobot[smolvla]` extra into this shared environment: that package metadata
+pins `rerun-sdk<0.27` and would downgrade the Rerun 0.34 runtime required by the
+Query API integration. `setup.sh` has already installed vendored LeRobot; the
+four packages above are the only SmolVLA additions it needs.
 
 Confirm it worked:
 
 ```bash
-./.venv-lerobot/bin/lerobot-train --help          # should print usage
-./.venv-lerobot/bin/python -c "import torch; print('mps:', torch.backends.mps.is_available())"
+rebot_setup/vendor/rebot_lerobot/.venv/bin/lerobot-train --help
+rebot_setup/vendor/rebot_lerobot/.venv/bin/python -c \
+  "import torch; print('mps:', torch.backends.mps.is_available())"
 ```
 
 ## Important: the `pyav` flag is mandatory on this Mac
@@ -69,7 +85,7 @@ before the first real run — adjust the map if they differ.)
 ## Train
 
 ```bash
-HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
+HF_HUB_ENABLE_HF_TRANSFER=1 rebot_setup/vendor/rebot_lerobot/.venv/bin/lerobot-train \
   --policy.path=lerobot/smolvla_base \
   --dataset.repo_id=<DATASET_REPO_ID> \
   --dataset.video_backend=pyav \
@@ -99,7 +115,7 @@ To prove the machine can train before real recordings exist, run a few steps on 
 public SmolVLA example dataset:
 
 ```bash
-HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
+HF_HUB_ENABLE_HF_TRANSFER=1 rebot_setup/vendor/rebot_lerobot/.venv/bin/lerobot-train \
   --policy.path=lerobot/smolvla_base \
   --dataset.repo_id=lerobot/svla_so101_pickplace \
   --dataset.episodes='[0, 1]' \
@@ -107,7 +123,9 @@ HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
   --rename_map='{"observation.images.side": "observation.images.camera1", "observation.images.up": "observation.images.camera2"}' \
   --policy.empty_cameras=1 \
   --policy.device=mps \
-  --batch_size=2 --steps=20 --save_freq=20 --eval_freq=0 \
+  --policy.push_to_hub=false \
+  --batch_size=2 --steps=20 --log_freq=1 --save_freq=20 --eval_freq=0 \
+  --num_workers=0 \
   --output_dir=outputs/smolvla/smoke_test \
   --wandb.enable=false
 ```
@@ -179,3 +197,13 @@ Done 2026-07-18: merged `rebot-can-sort-stage1-v1-smoke` (52 eps) +
 are NOT in git — checkpoints are hundreds of MB each and datasets are multi-GB.
 Back checkpoints up to Hugging Face or Drive; the datasets already live on the HF
 Hub under the `Cornerf` org.
+
+
+## left over from merge conflict
+than our real reBot data.) Success = all 20 steps report finite loss and
+`checkpoints/000020/pretrained_model/model.safetensors` exists. Do not require a
+monotonic loss curve from only 20 shuffled mini-batches. This exact command path
+was verified end-to-end on MPS on 2026-07-18: it loaded 2 public episodes / 569
+frames, trained 100M of 450M parameters, printed finite losses for every step,
+saved the step-20 checkpoint, and exited 0. It does not validate our reBot data
+or autonomous arm motion.

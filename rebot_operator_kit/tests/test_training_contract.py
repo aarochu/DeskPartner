@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -11,10 +12,11 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 from PIL import Image
+from datasets import config as datasets_config
 
 
 KIT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +35,7 @@ from lerobot.datasets.utils import DEFAULT_FEATURES  # noqa: E402
 EXPECTED = {
     "control_hz": 240,
     "motor_velocity": 2000.0,
-    "max_step": 8.4,
+    "max_step": 33.6,
     "gripper_force": 0.05,
 }
 
@@ -45,8 +47,8 @@ def command_value(command: list[str], flag: str) -> str:
 class TrainingDefaultsTest(unittest.TestCase):
     def test_profile_api_form_and_command_share_exact_defaults(self) -> None:
         status = workspace.require_training_profile()
-        self.assertEqual(status["profile_id"], "rebot-b601-dm-follower1-native7d-v4")
-        self.assertEqual(status["profile_version"], 4)
+        self.assertEqual(status["profile_id"], "rebot-b601-dm-follower1-native7d-v5")
+        self.assertEqual(status["profile_version"], 5)
         for key, expected in EXPECTED.items():
             self.assertEqual(status["defaults"][key], expected)
 
@@ -57,7 +59,8 @@ class TrainingDefaultsTest(unittest.TestCase):
         )
         self.assertEqual(command_value(command, "--control-hz"), "240")
         self.assertEqual(command_value(command, "--motor-velocity"), "2000")
-        self.assertEqual(command_value(command, "--max-step"), "8.4")
+        self.assertEqual(command_value(command, "--episode-time-s"), "1000")
+        self.assertEqual(command_value(command, "--max-step"), "33.6")
         self.assertEqual(command_value(command, "--gripper-force"), "0.05")
         self.assertEqual(command_value(command, "--attempt-root"), str(workspace.ATTEMPT_ROOT))
         self.assertTrue(command_value(command, "--control-file").endswith("record-control.json"))
@@ -65,28 +68,137 @@ class TrainingDefaultsTest(unittest.TestCase):
         training_html = (GUI_ROOT / "static" / "training.html").read_text()
         self.assertIn('id="control-hz-input" type="number" value="240"', training_html)
         self.assertIn('id="velocity-input" type="number" value="2000"', training_html)
-        self.assertIn('id="max-step-input" type="number" value="8.4"', training_html)
+        self.assertIn('id="episode-time-input" type="number" value="1000"', training_html)
+        self.assertIn('id="max-step-input" type="number" value="33.6"', training_html)
+
+    def test_stage_one_can_smoke_defaults_and_finish_notice_are_explicit(self) -> None:
+        status = workspace.require_training_profile()
+        defaults = status["defaults"]
+        self.assertEqual(
+            defaults["task"],
+            "Pick up one can and place it in the taped sorting zone",
+        )
+        self.assertEqual(defaults["dataset"], "rebot-can-sort-stage1-v1-smoke")
+        self.assertEqual(defaults["episodes"], 10)
+        self.assertEqual(defaults["episode_time_s"], 1000)
+
+        training_html = (GUI_ROOT / "static" / "training.html").read_text()
+        self.assertIn(
+            'value="Pick up one can and place it in the taped sorting zone"',
+            training_html,
+        )
+        self.assertIn('value="rebot-can-sort-stage1-v1-smoke"', training_html)
+        self.assertIn('id="episodes-input" type="number" value="1"', training_html)
+        self.assertIn("Manual mode always records exactly one take", training_html)
+
+    def test_resume_schema_accepts_loaded_video_info_and_lerobot_defaults(self) -> None:
+        learning = {
+            "action": {"dtype": "float32", "shape": (7,), "names": ["joint"] * 7},
+            "observation.images.front": {
+                "dtype": "video",
+                "shape": (480, 640, 3),
+                "names": ["height", "width", "channels"],
+            },
+        }
+        loaded = json.loads(
+            json.dumps(
+                {
+                    **learning,
+                    **controlled_record.DEFAULT_FEATURES,
+                }
+            )
+        )
+        loaded["observation.images.front"]["info"] = {
+            "video.codec": "h264",
+            "video.pix_fmt": "yuv420p",
+        }
+        expected = {**learning, **controlled_record.DEFAULT_FEATURES}
+        self.assertEqual(
+            controlled_record.semantic_feature_schema(loaded),
+            controlled_record.semantic_feature_schema(expected),
+        )
+
+        dataset = SimpleNamespace(
+            fps=30,
+            features=loaded,
+            start_image_writer=Mock(),
+        )
+        args = SimpleNamespace(
+            resume=True,
+            repo_id="local/resume-test",
+            dataset_root=Path("/tmp/resume-test"),
+            dataset_fps=30,
+        )
+        robot = SimpleNamespace(action_features={}, observation_features={})
+        with (
+            patch.object(controlled_record, "combine_feature_dicts", return_value=learning),
+            patch.object(controlled_record, "aggregate_pipeline_dataset_features", return_value={}),
+            patch.object(controlled_record, "create_initial_features", return_value={}),
+            patch.object(controlled_record, "LeRobotDataset", return_value=dataset),
+        ):
+            resumed = controlled_record.make_dataset(args, robot, Mock(), Mock())
+        self.assertIs(resumed, dataset)
+        dataset.start_image_writer.assert_called_once_with(num_processes=0, num_threads=8)
+
+        loaded["observation.images.front"]["shape"] = [720, 1280, 3]
+        self.assertNotEqual(
+            controlled_record.semantic_feature_schema(loaded),
+            controlled_record.semantic_feature_schema(expected),
+        )
+        with (
+            patch.object(controlled_record, "combine_feature_dicts", return_value=learning),
+            patch.object(controlled_record, "aggregate_pipeline_dataset_features", return_value={}),
+            patch.object(controlled_record, "create_initial_features", return_value={}),
+            patch.object(controlled_record, "LeRobotDataset", return_value=dataset),
+            self.assertRaisesRegex(RuntimeError, "Resume feature schema"),
+        ):
+            controlled_record.make_dataset(args, robot, Mock(), Mock())
+
+        training_js = (GUI_ROOT / "static" / "training.js").read_text()
+        self.assertIn(
+            "Save accepted. This run is being written to Rerun and LeRobot",
+            training_js,
+        )
+        self.assertIn(
+            "it will disconnect without automatic return after the durable save",
+            training_js,
+        )
+        self.assertIn("Mark failed & exclude from LeRobot", training_js)
+        self.assertIn('/api/training/attempt/review', training_js)
 
     def test_manual_gui_default_matches_collection_profile(self) -> None:
         preset = server.PRESETS["hand_tracking"]
-        self.assertEqual(
-            {
-                "control_hz": preset["hz"],
-                "motor_velocity": preset["velocity"],
-                "max_step": preset["max_step"],
-                "gripper_force": preset["gripper_force"],
-            },
-            EXPECTED,
-        )
+        self.assertEqual(preset["hz"], 240)
+        self.assertEqual(preset["velocity"], 2000)
+        self.assertEqual(preset["max_step"], 8.4)
+        self.assertEqual(preset["gripper_force"], 0.05)
         validated = server.validate_config({})
         self.assertEqual(validated["hz"], 240)
-        self.assertEqual(validated["max_step"], 8.4)
+        self.assertEqual(validated["max_step"], 33.6)
         self.assertEqual(validated["gripper_force"], 0.05)
         self.assertEqual(set(validated["velocities"].values()), {2000.0})
-        self.assertEqual(validated["tracking_cap"], 2016.0)
+        self.assertEqual(validated["tracking_cap"], 8064.0)
         app_js = (GUI_ROOT / "static" / "app.js").read_text()
-        self.assertIn('const STORAGE_KEY = "rebot.teleop.draft.v3";', app_js)
+        self.assertIn('const STORAGE_KEY = "rebot.teleop.draft.v4";', app_js)
         self.assertIn('const DEFAULT_PRESET = "hand_tracking";', app_js)
+        self.assertIn('const DEFAULT_SPEED_MULTIPLIER = 4;', app_js)
+
+    def test_rerun_viewer_cannot_inherit_collector_output_pipe(self) -> None:
+        fake_process = Mock()
+        with (
+            patch.object(controlled_record, "RERUN_NATIVE_BIN", Path("/tmp/rerun")),
+            patch.object(controlled_record.socket, "create_connection") as connect,
+            patch.object(controlled_record.subprocess, "Popen", return_value=fake_process) as popen,
+            patch.object(controlled_record.rr, "init"),
+        ):
+            connect.side_effect = [OSError("not listening"), MagicMock()]
+            self.assertTrue(controlled_record.start_rerun_viewer(True))
+        kwargs = popen.call_args.kwargs
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertTrue(kwargs["close_fds"])
 
     def test_follower_config_receives_2000_for_all_seven_joints(self) -> None:
         status = workspace.require_training_profile()
@@ -101,7 +213,7 @@ class TrainingDefaultsTest(unittest.TestCase):
             side_width=1280,
             side_height=720,
             dataset_fps=30,
-            max_step=8.4,
+            max_step=33.6,
             motor_velocity=2000.0,
             gripper_force=0.05,
             follower_calibration=Path(calibration["follower"]["path"]),
@@ -124,7 +236,7 @@ class TrainingDefaultsTest(unittest.TestCase):
         ):
             follower, _leader = controlled_record.make_hardware(args, status["profile"])
         self.assertEqual(follower.config.pos_vel_velocity, [2000.0] * 7)
-        self.assertEqual(follower.config.max_relative_target, 8.4)
+        self.assertEqual(follower.config.max_relative_target, 33.6)
 
 
 class CollectorSchemaTest(unittest.TestCase):
@@ -211,6 +323,135 @@ class SessionHomeReturnTest(unittest.TestCase):
         def get_action(self) -> dict[str, float]:
             return dict(self.positions)
 
+    def test_locked_follower_joint_read_never_consumes_camera_frames(self) -> None:
+        class State:
+            pos = np.pi / 2
+            vel = np.pi
+            torq = 1.25
+
+        motor = SimpleNamespace(
+            request_feedback=Mock(),
+            get_state=Mock(return_value=State()),
+        )
+        bus = SimpleNamespace(poll_feedback_once=Mock())
+        robot = SimpleNamespace(
+            motors={"shoulder_pan": motor},
+            bus=bus,
+            get_observation=Mock(side_effect=AssertionError("camera path must not run")),
+        )
+        observation = controlled_record.read_follower_joint_observation(robot)
+        self.assertEqual(observation["shoulder_pan.pos"], 90.0)
+        self.assertEqual(observation["shoulder_pan.vel"], 180.0)
+        self.assertEqual(observation["shoulder_pan.torque"], 1.25)
+        motor.request_feedback.assert_called_once_with()
+        bus.poll_feedback_once.assert_called_once_with()
+        robot.get_observation.assert_not_called()
+
+    def test_camera_sampling_peeks_latest_frames_without_waiting(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        robot = SimpleNamespace(cameras={"front": camera})
+        observation = controlled_record.read_latest_camera_observation(robot)
+        self.assertIs(observation["front"], frame)
+        camera.read_latest.assert_called_once_with(
+            max_age_ms=controlled_record.CAMERA_FALLBACK_READ_MAX_AGE_MS
+        )
+        camera.async_read.assert_not_called()
+
+    def test_256_8ms_camera_jitter_is_accepted_and_reported(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            latest_timestamp=0.0,
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        telemetry: dict[str, object] = {}
+        with patch.object(controlled_record.time, "perf_counter", return_value=0.2568):
+            observation = controlled_record.read_latest_camera_observation(
+                SimpleNamespace(cameras={"side": camera}), telemetry
+            )
+        self.assertIs(observation["side"], frame)
+        self.assertEqual(
+            telemetry["side"]["status"], "stale_frame_accepted_manual_mode"
+        )
+        self.assertAlmostEqual(telemetry["side"]["last_age_ms"], 256.8)
+        camera.read_latest.assert_called_once_with(
+            max_age_ms=controlled_record.CAMERA_FALLBACK_READ_MAX_AGE_MS
+        )
+        camera.async_read.assert_not_called()
+
+    def test_real_wrist_camera_jitter_burst_recovers_without_killing_take(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            latest_timestamp=0.0,
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        telemetry: dict[str, object] = {}
+        robot = SimpleNamespace(cameras={"side": camera})
+
+        # The live failure reached 318.896 ms after three consecutive samples.
+        # Every frame remained inside the camera's bounded 500 ms contract and
+        # must be accepted long enough for the producer thread to recover.
+        for age_s in (0.251, 0.285, 0.318896):
+            with patch.object(controlled_record.time, "perf_counter", return_value=age_s):
+                observation = controlled_record.read_latest_camera_observation(
+                    robot, telemetry
+                )
+            self.assertIs(observation["side"], frame)
+
+        self.assertEqual(
+            telemetry["side"]["status"], "stale_frame_accepted_manual_mode"
+        )
+        self.assertEqual(telemetry["side"]["stale_samples_accepted"], 3)
+
+        camera.latest_timestamp = 1.0
+        with patch.object(controlled_record.time, "perf_counter", return_value=1.005):
+            controlled_record.read_latest_camera_observation(robot, telemetry)
+        self.assertEqual(telemetry["side"]["status"], "fresh")
+        camera.async_read.assert_not_called()
+
+    def test_persistent_camera_staleness_is_logged_but_does_not_stop_manual_run(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            latest_timestamp=0.0,
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        telemetry: dict[str, object] = {}
+        robot = SimpleNamespace(cameras={"side": camera})
+        with patch.object(controlled_record.time, "perf_counter", return_value=0.300):
+            for _ in range(20):
+                controlled_record.read_latest_camera_observation(robot, telemetry)
+        self.assertEqual(
+            telemetry["side"]["status"], "stale_frame_accepted_manual_mode"
+        )
+        self.assertEqual(telemetry["side"]["stale_samples_accepted"], 20)
+        self.assertEqual(camera.read_latest.call_count, 20)
+        camera.async_read.assert_not_called()
+
+    def test_camera_that_never_produced_a_frame_remains_a_functional_error(self) -> None:
+        camera = SimpleNamespace(
+            frame_lock=threading.Lock(),
+            latest_frame=None,
+            latest_timestamp=None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "has not produced an image"):
+            controlled_record.read_latest_camera_observation(
+                SimpleNamespace(cameras={"side": camera}), {}
+            )
+
+    def test_manual_runtime_has_no_automatic_home_return_call(self) -> None:
+        import inspect
+
+        self.assertNotIn(
+            "automatic_reset_to_session_home(",
+            inspect.getsource(controlled_record.main),
+        )
+
     def test_capture_inverts_driver_directions_and_reset_returns_home(self) -> None:
         robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
         expected_home = dict(robot.current)
@@ -255,6 +496,85 @@ class SessionHomeReturnTest(unittest.TestCase):
         )
         self.assertIsNone(result)
         self.assertEqual(robot.send_count, 0)
+
+    def test_home_reset_waits_beyond_old_timeout_for_leader_alignment(self) -> None:
+        robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
+        leader_home = {name: 0.0 for name in self.FEATURES}
+        leader = self.FakeLeader(leader_home)
+        home = controlled_record.capture_session_home(robot, leader)
+        leader.positions = {name: 10.0 for name in self.FEATURES}
+        reads = 0
+
+        def delayed_leader_action() -> dict[str, float]:
+            nonlocal reads
+            reads += 1
+            if reads > 70:
+                return dict(leader_home)
+            return dict(leader.positions)
+
+        leader.get_action = delayed_leader_action
+
+        class Clock:
+            now = 0.0
+
+            def __call__(self) -> float:
+                self.now += 1.0
+                return self.now
+
+        with (
+            patch.object(controlled_record.time, "perf_counter", side_effect=Clock()),
+            patch.object(controlled_record, "precise_sleep"),
+            patch.object(controlled_record, "HOME_SETTLE_TIME_S", 0.0),
+        ):
+            result = controlled_record.automatic_reset_to_session_home(
+                args=SimpleNamespace(control_hz=1, max_step=8.4, reset_time_s=0.0),
+                robot=robot,
+                leader=leader,
+                events={"stop": False},
+                session_home=home,
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertGreater(result["elapsed_s"], 50.0)
+        self.assertGreater(reads, 70)
+
+    def test_stop_interrupts_indefinite_leader_wait_after_old_timeout(self) -> None:
+        robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
+        leader = self.FakeLeader({name: 0.0 for name in self.FEATURES})
+        home = controlled_record.capture_session_home(robot, leader)
+        leader.positions = {name: 10.0 for name in self.FEATURES}
+        events = {"stop": False}
+        reads = 0
+
+        def waiting_leader_action() -> dict[str, float]:
+            nonlocal reads
+            reads += 1
+            if reads > 70:
+                events["stop"] = True
+            return dict(leader.positions)
+
+        leader.get_action = waiting_leader_action
+
+        class Clock:
+            now = 0.0
+
+            def __call__(self) -> float:
+                self.now += 1.0
+                return self.now
+
+        with (
+            patch.object(controlled_record.time, "perf_counter", side_effect=Clock()),
+            patch.object(controlled_record, "precise_sleep"),
+        ):
+            result = controlled_record.automatic_reset_to_session_home(
+                args=SimpleNamespace(control_hz=1, max_step=8.4, reset_time_s=0.0),
+                robot=robot,
+                leader=leader,
+                events=events,
+                session_home=home,
+            )
+        self.assertIsNone(result)
+        self.assertGreater(reads, 70)
 
     def test_completed_home_return_is_persisted_in_attempt_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -320,6 +640,59 @@ class SessionHomeReturnTest(unittest.TestCase):
                 record=False,
                 task="failure test",
             )
+
+    def test_control_file_decisions_work_without_a_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            for action, expected in (
+                ("finish", {"finish": True, "rerecord": False, "stop": False}),
+                ("rerecord", {"finish": True, "rerecord": True, "stop": False}),
+                ("stop", {"finish": True, "rerecord": False, "stop": True}),
+            ):
+                events = {"finish": False, "rerecord": False, "stop": False}
+                control_file.write_text(json.dumps({"action": action, "sequence": 17}))
+                sequence = controlled_record.consume_published_decision(
+                    control_file,
+                    events,
+                    None,
+                )
+                self.assertEqual(sequence, 17)
+                self.assertEqual(events, expected)
+
+                # The same atomic publication is idempotent when polled again.
+                self.assertEqual(
+                    controlled_record.consume_published_decision(
+                        control_file,
+                        events,
+                        sequence,
+                    ),
+                    17,
+                )
+
+    def test_pause_and_play_are_polled_without_finishing_the_take(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            events = {
+                "finish": False,
+                "rerecord": False,
+                "stop": False,
+                "paused": False,
+            }
+            control_file.write_text(json.dumps({"action": "pause", "sequence": 1}))
+            sequence = controlled_record.consume_published_decision(
+                control_file, events, None
+            )
+            self.assertEqual(sequence, 1)
+            self.assertTrue(events["paused"])
+            self.assertFalse(events["finish"])
+
+            control_file.write_text(json.dumps({"action": "play", "sequence": 2}))
+            sequence = controlled_record.consume_published_decision(
+                control_file, events, sequence
+            )
+            self.assertEqual(sequence, 2)
+            self.assertFalse(events["paused"])
+            self.assertFalse(events["finish"])
 
 
 class ZeroFrameQuarantineTest(unittest.TestCase):
@@ -400,6 +773,114 @@ class ZeroFrameQuarantineTest(unittest.TestCase):
         self.assertIsNone(destination)
         self.assertTrue(root.is_dir())
         self.assertTrue(manifest.is_file())
+
+    def test_manual_cycle_resume_requires_positive_durable_counts(self) -> None:
+        base = {"episodes": 10, "resume": False}
+
+        missing = workspace.manual_cycle_config(base, self.data_root / "missing")
+        self.assertEqual(missing["episodes"], 1)
+        self.assertFalse(missing["resume"])
+        self.assertTrue(missing["manual_cycle"])
+
+        empty = self.data_root / "empty"
+        empty.mkdir()
+        self.assertFalse(workspace.manual_cycle_config(base, empty)["resume"])
+
+        metadata_only = self.data_root / "metadata-only"
+        (metadata_only / "meta").mkdir(parents=True)
+        (metadata_only / "meta" / "note.json").write_text("{}")
+        self.assertFalse(workspace.manual_cycle_config(base, metadata_only)["resume"])
+
+        zero = self.write_info("zero-durable", 0, 0)
+        self.assertFalse(workspace.manual_cycle_config(base, zero)["resume"])
+
+        durable = self.write_info("durable", 1, 30)
+        self.assertTrue(workspace.manual_cycle_config(base, durable)["resume"])
+
+    def test_manual_cycle_preserves_ambiguous_or_corrupt_dataset(self) -> None:
+        base = {"episodes": 10, "resume": False}
+        ambiguous = self.data_root / "ambiguous"
+        ambiguous.mkdir()
+        (ambiguous / "orphan.mp4").write_bytes(b"not a dataset")
+        with self.assertRaisesRegex(RuntimeError, "preserved for review"):
+            workspace.manual_cycle_config(base, ambiguous)
+        self.assertTrue((ambiguous / "orphan.mp4").is_file())
+
+        malformed = self.data_root / "malformed"
+        (malformed / "meta").mkdir(parents=True)
+        (malformed / "meta" / "info.json").write_text("not-json")
+        with self.assertRaisesRegex(RuntimeError, "preserved for review"):
+            workspace.manual_cycle_config(base, malformed)
+        self.assertTrue((malformed / "meta" / "info.json").is_file())
+
+    def test_failed_zero_durable_retry_moves_only_manifest(self) -> None:
+        name = "keep-one-retry"
+        root = self.write_info(name, 1, 30)
+        raw_attempt = self.run_root / "attempts" / name / "attempt-raw"
+        raw_attempt.mkdir(parents=True)
+        (raw_attempt / "metadata.json").write_text("{}")
+        manifest = self.write_manifest(name, "FAILED", 1)
+        value = json.loads(manifest.read_text())
+        value["lifecycle"]["durable_episodes_this_run"] = 0
+        manifest.write_text(json.dumps(value))
+
+        destination = workspace._quarantine_zero_durable_retry_manifest(
+            name,
+            manifest,
+            reason="camera jitter retry",
+        )
+
+        self.assertIsNotNone(destination)
+        assert destination is not None
+        self.assertTrue(root.is_dir())
+        self.assertEqual(
+            json.loads((root / "meta" / "info.json").read_text())["total_episodes"],
+            1,
+        )
+        self.assertTrue((raw_attempt / "metadata.json").is_file())
+        self.assertFalse(manifest.exists())
+        self.assertTrue((destination / "manifests" / manifest.name).is_file())
+        audit = json.loads((destination / "quarantine.json").read_text())
+        self.assertFalse(audit["dataset_root_moved"])
+        self.assertFalse(audit["raw_attempt_archive_moved"])
+        self.assertEqual(audit["durable_episodes_in_failed_retry"], 0)
+
+
+class PartialRunManifestTest(unittest.TestCase):
+    def test_durable_partial_run_remains_profile_compatible(self) -> None:
+        profile = {"profile_id": "test-profile"}
+        contract = {"dataset": "test-dataset"}
+        profile_digest = workspace._canonical_digest(profile)
+        contract_digest = workspace._canonical_digest(contract)
+
+        def compatibility(durable_episodes: int) -> dict[str, object]:
+            manifest = {
+                "training_profile": {"snapshot": profile, "digest": profile_digest},
+                "collection_contract": {"snapshot": contract, "digest": contract_digest},
+                "lifecycle": {
+                    "state": "PARTIAL_COMPLETE",
+                    "exit_code": 1,
+                    "durable_episodes_this_run": durable_episodes,
+                },
+            }
+            with patch.object(
+                workspace,
+                "_collection_manifests",
+                return_value={"records": [manifest], "errors": [], "candidate_count": 1},
+            ):
+                return workspace._manifest_profile_compatibility(
+                    "test-dataset",
+                    profile_digest,
+                    contract_digest,
+                )
+
+        accepted = compatibility(1)
+        self.assertTrue(accepted["compatible"])
+        self.assertEqual(accepted["invalid_manifest_count"], 0)
+
+        rejected = compatibility(0)
+        self.assertFalse(rejected["compatible"])
+        self.assertEqual(rejected["invalid_manifest_count"], 1)
 
 
 class AttemptArchiveTest(unittest.TestCase):
@@ -539,6 +1020,33 @@ class AttemptArchiveTest(unittest.TestCase):
             ("other", "lighting trial"),
         )
 
+    def test_direct_attempt_artifacts_reject_all_symlink_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive_root = Path(temporary) / "attempts"
+            dataset_root = archive_root / "symlink-test"
+            attempt_id = attempt_archive.new_attempt_id()
+            directory = dataset_root / attempt_id
+            directory.mkdir(parents=True)
+            metadata = {
+                "attempt_id": attempt_id,
+                "dataset": "symlink-test",
+                "archive_complete": True,
+            }
+            attempt_archive.atomic_write_json(directory / "metadata.json", metadata)
+            real_rrd = directory / "real.rrd"
+            real_rrd.write_bytes(b"rrd")
+            os.symlink(real_rrd, directory / "attempt.rrd")
+            with self.assertRaisesRegex(FileNotFoundError, "symlinks"):
+                attempt_archive.artifact_path(archive_root, attempt_id, "rerun")
+
+            (directory / "attempt.rrd").unlink()
+            (directory / "metadata.json").unlink()
+            real_metadata = directory / "real-metadata.json"
+            real_metadata.write_text(json.dumps(metadata))
+            os.symlink(real_metadata, directory / "metadata.json")
+            with self.assertRaisesRegex(FileNotFoundError, "symlinks"):
+                attempt_archive.find_attempt(archive_root, attempt_id)
+
     def test_archive_failure_moves_raw_frames_before_buffer_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -591,6 +1099,55 @@ class AttemptArchiveTest(unittest.TestCase):
             for relative in recovery["camera_directories"].values():
                 self.assertEqual(len(list((directory / relative).glob("*.png"))), 3)
 
+    def test_next_attempt_quarantines_stale_camera_frames_without_deleting_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "frames"
+            self.write_source_frames(source_root)
+            dataset = self.FakeDataset(source_root)
+            # Model a partial recovery: only the side camera was left in the
+            # active episode directory when the same episode index is reused.
+            front = source_root / "observation.images.front"
+            recovered_front = root / "prior-attempt" / "front"
+            recovered_front.parent.mkdir()
+            front.replace(recovered_front)
+
+            result = controlled_record.quarantine_stale_candidate_frames(
+                dataset,
+                root / "attempts",
+                "stale-isolation-test",
+                0,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result["complete"])
+            self.assertEqual(
+                set(result["camera_directories"]), {"observation.images.side"}
+            )
+            self.assertFalse((source_root / "observation.images.side").exists())
+            quarantine_root = (
+                root
+                / "attempts"
+                / "stale-isolation-test"
+                / "_stale_frame_quarantine"
+                / result["quarantine_id"]
+            )
+            quarantined = quarantine_root / "observation_images_side"
+            self.assertEqual(len(list(quarantined.glob("*.png"))), 3)
+            manifest = json.loads((quarantine_root / "manifest.json").read_text())
+            self.assertTrue(manifest["complete"])
+            self.assertEqual(manifest["camera_directories"]["observation.images.side"]["png_frames"], 3)
+            self.assertEqual(len(list(recovered_front.glob("*.png"))), 3)
+            self.assertIsNone(
+                controlled_record.quarantine_stale_candidate_frames(
+                    dataset,
+                    root / "attempts",
+                    "stale-isolation-test",
+                    0,
+                )
+            )
+
     def test_background_rerun_writer_commits_every_submitted_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -640,6 +1197,320 @@ class AttemptArchiveTest(unittest.TestCase):
             self.assertTrue(dataset.finalized)
             self.assertEqual((image_dir / "frame-000000.png").read_bytes(), b"recover me")
 
+    def test_verified_attempt_videos_are_handed_to_lerobot_without_reencoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "attempt"
+            dataset_root = root / "dataset"
+            archive.mkdir()
+            dataset_root.mkdir()
+            sources = {
+                "observation.images.front": archive / "overhead.mp4",
+                "observation.images.side": archive / "wrist.mp4",
+            }
+            sources["observation.images.front"].write_bytes(b"overhead-video")
+            sources["observation.images.side"].write_bytes(b"wrist-video")
+
+            frame_directories: dict[str, Path] = {}
+            for key in sources:
+                frame_directory = dataset_root / "images" / key / "episode-000000"
+                frame_directory.mkdir(parents=True)
+                (frame_directory / "frame-000000.png").write_bytes(b"frame")
+                frame_directories[key] = frame_directory
+
+            original_encoder = Mock(side_effect=AssertionError("must not re-encode"))
+
+            class FakeDataset:
+                root = dataset_root
+                meta = SimpleNamespace(video_keys=list(sources))
+                _encode_temporary_episode_video = original_encoder
+
+                @staticmethod
+                def _get_image_file_dir(_episode_index: int, video_key: str) -> Path:
+                    return frame_directories[video_key]
+
+            dataset = FakeDataset()
+            original_bound_encoder = dataset._encode_temporary_episode_video
+            handed_off: dict[str, Path] = {}
+            with controlled_record.reuse_attempt_videos_for_lerobot(dataset, archive):
+                for key, source in sources.items():
+                    temporary_video = dataset._encode_temporary_episode_video(key, 0)
+                    handed_off[key] = temporary_video
+                    self.assertEqual(temporary_video.read_bytes(), source.read_bytes())
+                    self.assertTrue(source.is_file())
+                    self.assertFalse(frame_directories[key].exists())
+
+            original_encoder.assert_not_called()
+            self.assertIs(dataset._encode_temporary_episode_video, original_bound_encoder)
+            for key, source in sources.items():
+                self.assertEqual(source.read_bytes(), handed_off[key].read_bytes())
+
+    def test_checkpoint_is_fresh_loadable_after_each_of_two_no_video_episodes(self) -> None:
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            cache = Path(temporary) / "huggingface-cache"
+            with patch.object(datasets_config, "HF_DATASETS_CACHE", cache):
+                dataset = LeRobotDataset.create(
+                    "local/two-episode-durability-test",
+                    30,
+                    features,
+                    root=root,
+                    use_videos=False,
+                    batch_encoding_size=1,
+                )
+
+                for episode_index in range(2):
+                    for frame_index in range(3):
+                        offset = float(episode_index * 10 + frame_index)
+                        dataset.add_frame(
+                            {
+                                "observation.state": np.array(
+                                    [offset, offset + 0.5], dtype=np.float32
+                                ),
+                                "action": np.array(
+                                    [offset + 1.0, offset + 1.5], dtype=np.float32
+                                ),
+                                "task": "durability test",
+                            }
+                        )
+                    dataset.save_episode(parallel_encoding=False)
+                    dataset = controlled_record.checkpoint_and_reopen_dataset(
+                        dataset,
+                        expected_episode_index=episode_index,
+                    )
+
+                    fresh = LeRobotDataset(
+                        "local/two-episode-durability-test",
+                        root=root,
+                        batch_encoding_size=1,
+                        vcodec=dataset.vcodec,
+                    )
+                    self.assertEqual(fresh.num_episodes, episode_index + 1)
+                    self.assertEqual(fresh.num_frames, (episode_index + 1) * 3)
+
+                self.assertEqual(dataset.num_episodes, 2)
+                self.assertEqual(dataset.num_frames, 6)
+                dataset.stop_image_writer()
+                dataset.finalize()
+
+                final = LeRobotDataset(
+                    "local/two-episode-durability-test",
+                    root=root,
+                    batch_encoding_size=1,
+                    vcodec=dataset.vcodec,
+                )
+                self.assertEqual(final.num_episodes, 2)
+                self.assertEqual(final.num_frames, 6)
+
+    def test_two_camera_episodes_are_durable_separate_videos_without_reencoding(self) -> None:
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+            "observation.images.front": {
+                "dtype": "video",
+                "shape": (16, 16, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.images.side": {
+                "dtype": "video",
+                "shape": (16, 16, 3),
+                "names": ["height", "width", "channels"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            cache = Path(temporary) / "huggingface-cache"
+            with patch.object(datasets_config, "HF_DATASETS_CACHE", cache):
+                dataset = LeRobotDataset.create(
+                    "local/two-camera-durability-test",
+                    30,
+                    features,
+                    root=root,
+                    use_videos=True,
+                    image_writer_threads=2,
+                    batch_encoding_size=1,
+                    vcodec="h264",
+                )
+                archived_paths: list[tuple[Path, Path]] = []
+                for episode_index in range(2):
+                    for frame_index in range(3):
+                        value = episode_index * 40 + frame_index * 10
+                        image = np.full((16, 16, 3), value, dtype=np.uint8)
+                        dataset.add_frame(
+                            {
+                                "observation.state": np.array(
+                                    [value, value + 0.5], dtype=np.float32
+                                ),
+                                "action": np.array(
+                                    [value + 1.0, value + 1.5], dtype=np.float32
+                                ),
+                                "observation.images.front": image,
+                                "observation.images.side": 255 - image,
+                                "task": "video durability test",
+                            }
+                        )
+
+                    archive = Path(temporary) / f"attempt-{episode_index}"
+                    archive.mkdir()
+                    artifacts = controlled_record.archive_attempt_videos(
+                        dataset,
+                        archive,
+                        samples=3,
+                    )
+                    self.assertEqual(artifacts["overhead"]["frames"], 3)
+                    self.assertEqual(artifacts["wrist"]["frames"], 3)
+                    archived_paths.append((archive / "overhead.mp4", archive / "wrist.mp4"))
+
+                    with controlled_record.reuse_attempt_videos_for_lerobot(dataset, archive):
+                        dataset.save_episode(parallel_encoding=False)
+                    dataset = controlled_record.checkpoint_and_reopen_dataset(
+                        dataset,
+                        expected_episode_index=episode_index,
+                    )
+
+                    for camera_key in (
+                        "observation.images.front",
+                        "observation.images.side",
+                    ):
+                        video_files = sorted((root / "videos" / camera_key).rglob("*.mp4"))
+                        self.assertEqual(len(video_files), episode_index + 1)
+                    for overhead, wrist in archived_paths:
+                        self.assertGreater(overhead.stat().st_size, 0)
+                        self.assertGreater(wrist.stat().st_size, 0)
+
+                fresh = LeRobotDataset(
+                    "local/two-camera-durability-test",
+                    root=root,
+                    batch_encoding_size=1,
+                    vcodec="h264",
+                )
+                self.assertEqual(fresh.num_episodes, 2)
+                self.assertEqual(fresh.num_frames, 6)
+                dataset.stop_image_writer()
+                dataset.finalize()
+
+    def test_record_save_log_lines_drive_visible_workspace_phases(self) -> None:
+        manager = workspace.TrainingManager()
+        observed: list[str | None] = []
+
+        def output_lines():
+            yield "ATTEMPT recording id=attempt-1\n"
+            observed.append(manager._record_phase)
+            yield "AWAITING_DECISION id=attempt-1\n"
+            observed.append(manager._record_phase)
+            yield "ATTEMPT save_started id=attempt-1 phase=rerun_and_attempt_videos\n"
+            observed.append(manager._record_phase)
+            yield "ATTEMPT save_phase id=attempt-1 phase=lerobot\n"
+            observed.append(manager._record_phase)
+            yield "ATTEMPT lerobot_durable id=attempt-1 episode=0 total_episodes=1\n"
+            observed.append(manager._record_phase)
+
+        class FakeProcess:
+            pid = 31337
+            stdout = output_lines()
+
+            @staticmethod
+            def wait() -> int:
+                return 0
+
+            @staticmethod
+            def poll() -> int:
+                return 0
+
+        process = FakeProcess()
+        manager._kind = "record"
+        manager._process = process
+        manager._reader_thread = threading.current_thread()
+        manager._read_process(process, "record", None, None)
+        self.assertEqual(
+            observed,
+            [
+                "recording",
+                "awaiting_decision",
+                "saving_rerun",
+                "saving_lerobot",
+                "saved_ending",
+            ],
+        )
+        self.assertIsNone(manager._record_phase)
+        self.assertEqual(manager.status()["state"], "READY")
+        self.assertIsNone(manager.status()["fault"])
+
+    def test_failed_manual_record_returns_ready_with_visible_nonblocking_error(self) -> None:
+        class FakeProcess:
+            pid = 31338
+            stdout: list[str] = []
+
+            @staticmethod
+            def wait() -> int:
+                return 1
+
+            @staticmethod
+            def poll() -> int:
+                return 1
+
+        process = FakeProcess()
+        manager = workspace.TrainingManager()
+        manager._kind = "record"
+        manager._process = process
+        manager._reader_thread = threading.current_thread()
+        with (
+            patch.object(workspace, "_update_run_manifest"),
+            patch.object(workspace, "_quarantine_zero_frame_attempt", return_value=None),
+            patch.object(
+                workspace,
+                "_quarantine_zero_durable_retry_manifest",
+                return_value=None,
+            ),
+        ):
+            manager._read_process(process, "record", None, {"dataset": "manual-test"})
+        status = manager.status()
+        self.assertEqual(status["state"], "READY")
+        self.assertFalse(status["running"])
+        self.assertIn("retry is allowed", status["fault"])
+
+    def test_pause_control_uses_file_only_and_does_not_latch_save(self) -> None:
+        class FakeProcess:
+            pid = 424241
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            manager = workspace.TrainingManager()
+            manager._kind = "record"
+            manager._process = FakeProcess()
+            manager._record_control_file = control_file
+            manager._record_decision_pending = False
+            with patch.object(workspace.os, "kill") as send_signal:
+                manager.record_control({"action": "pause"})
+                self.assertFalse(manager._record_decision_pending)
+                manager.record_control({"action": "play"})
+            send_signal.assert_not_called()
+            self.assertEqual(json.loads(control_file.read_text())["action"], "play")
+
     def test_record_control_writes_label_before_signalling(self) -> None:
         class FakeProcess:
             pid = 424242
@@ -675,6 +1546,67 @@ class AttemptArchiveTest(unittest.TestCase):
                 manager.record_control({"action": "stop"})
             self.assertEqual(control_file.read_text(), before_stop)
             send_stop.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGHUP)
+
+    def test_record_stop_is_durable_when_no_episode_decision_is_pending(self) -> None:
+        class FakeProcess:
+            pid = 424243
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            manager = workspace.TrainingManager()
+            manager._kind = "record"
+            manager._process = FakeProcess()
+            manager._record_control_file = control_file
+            manager._record_decision_pending = False
+            with patch.object(workspace.os, "kill") as send_signal:
+                manager.record_control({"action": "stop"})
+            decision = json.loads(control_file.read_text())
+            self.assertEqual(decision["action"], "stop")
+            self.assertIsInstance(decision["sequence"], int)
+            send_signal.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGHUP)
+
+    def test_finish_and_stop_is_a_durable_keep_decision(self) -> None:
+        class FakeProcess:
+            pid = 424244
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            manager = workspace.TrainingManager()
+            manager._kind = "record"
+            manager._process = FakeProcess()
+            manager._record_control_file = control_file
+            with patch.object(workspace.os, "kill") as send_signal:
+                manager.record_control({"action": "finish_and_stop"})
+            decision = json.loads(control_file.read_text())
+            self.assertEqual(decision["action"], "finish_and_stop")
+            send_signal.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGUSR1)
+            self.assertEqual(
+                controlled_record.resolve_attempt_disposition(
+                    {"stop": False, "rerecord": False}, "finish_and_stop"
+                ),
+                "kept",
+            )
+
+    def test_record_controls_make_keep_end_and_discard_unambiguous(self) -> None:
+        html = (GUI_ROOT / "static" / "training.html").read_text()
+        javascript = (GUI_ROOT / "static" / "training.js").read_text()
+        self.assertIn("Start new run", html)
+        self.assertIn("Save run", html)
+        self.assertIn("Discard run", html)
+        self.assertIn("Log every run is ON", html)
+        self.assertIn('href="/rerun">Run Library</a>', html)
+        self.assertIn('id="pause-record-button"', html)
+        self.assertIn('{ action: "finish_and_stop" }', javascript)
+        self.assertIn('action === "pause"', javascript)
+        self.assertIn("window.confirm", javascript)
 
     def test_shutdown_waits_for_record_archive_and_escalates_recovery_safely(self) -> None:
         class FakeProcess:
@@ -843,6 +1775,45 @@ class AttemptArchiveTest(unittest.TestCase):
         self.assertIn("OWNER_LOST forwarding=SIGINT", output)
         self.assertIn("WORKER_STOPPED", output)
 
+    def test_owned_process_forwards_finish_while_worker_is_running(self) -> None:
+        owner_read, owner_write = os.pipe()
+        worker_code = (
+            "import signal,time\n"
+            "running=True\n"
+            "def finish(*_):\n global running\n print('FINISH_RECEIVED', flush=True)\n running=False\n"
+            "signal.signal(signal.SIGUSR1, finish)\n"
+            "print('WORKER_READY', flush=True)\n"
+            "while running: time.sleep(0.01)\n"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GUI_ROOT / "owned_process.py"),
+                "--owner-fd",
+                str(owner_read),
+                "--owner-stop-signal",
+                "SIGINT",
+                "--",
+                sys.executable,
+                "-u",
+                "-c",
+                worker_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            pass_fds=(owner_read,),
+            start_new_session=True,
+        )
+        os.close(owner_read)
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.readline().strip(), "WORKER_READY")
+        os.kill(process.pid, signal.SIGUSR1)
+        output = process.communicate(timeout=5)[0]
+        os.close(owner_write)
+        self.assertEqual(process.returncode, 0)
+        self.assertIn("FINISH_RECEIVED", output)
+
     def test_owned_process_cleanup_survives_broken_log_pipe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             ready = Path(temporary) / "ready"
@@ -888,6 +1859,292 @@ class AttemptArchiveTest(unittest.TestCase):
             os.close(owner_write)
             self.assertEqual(process.wait(timeout=5), 0)
             self.assertEqual(stopped.read_text(), "stopped")
+
+
+class FinishedAttemptReviewTest(unittest.TestCase):
+    FEATURES = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_a", "joint_b"],
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_a", "joint_b"],
+        },
+    }
+
+    def make_dataset_and_attempts(
+        self,
+        root: Path,
+        dataset_name: str,
+        episode_count: int,
+    ) -> tuple[Path, Path, list[str]]:
+        data_root = root / "data"
+        attempt_root = root / "training-runs" / "attempts"
+        dataset_root = data_root / dataset_name
+        cache = root / "huggingface-cache"
+        ids: list[str] = []
+        with patch.object(datasets_config, "HF_DATASETS_CACHE", cache):
+            dataset = LeRobotDataset.create(
+                f"local/{dataset_name}",
+                30,
+                self.FEATURES,
+                root=dataset_root,
+                use_videos=False,
+                batch_encoding_size=1,
+            )
+            for episode_index in range(episode_count):
+                for frame_index in range(3):
+                    offset = float(episode_index * 10 + frame_index)
+                    dataset.add_frame(
+                        {
+                            "observation.state": np.array(
+                                [offset, offset + 0.5], dtype=np.float32
+                            ),
+                            "action": np.array(
+                                [offset + 1.0, offset + 1.5], dtype=np.float32
+                            ),
+                            "task": "finished review test",
+                        }
+                    )
+                dataset.save_episode(parallel_encoding=False)
+                dataset = controlled_record.checkpoint_and_reopen_dataset(
+                    dataset,
+                    expected_episode_index=episode_index,
+                )
+                attempt_id = attempt_archive.new_attempt_id()
+                ids.append(attempt_id)
+                directory = attempt_archive.attempt_path(
+                    attempt_root, dataset_name, attempt_id
+                )
+                directory.mkdir(parents=True)
+                attempt_archive.atomic_write_json(
+                    directory / "metadata.json",
+                    {
+                        "schema_version": 1,
+                        "attempt_id": attempt_id,
+                        "dataset": dataset_name,
+                        "started_at": attempt_archive.utc_now(),
+                        "finished_at": attempt_archive.utc_now(),
+                        "disposition": "kept",
+                        "operator_disposition": "kept",
+                        "archive_complete": True,
+                        "training_included": True,
+                        "training_episode_index": episode_index,
+                        "samples": 3,
+                    },
+                )
+            dataset.stop_image_writer()
+            dataset.finalize()
+        return data_root, attempt_root, ids
+
+    def workspace_roots(self, root: Path, data_root: Path, attempt_root: Path):
+        run_root = root / "training-runs"
+        return (
+            patch.object(workspace, "DATA_ROOT", data_root),
+            patch.object(workspace, "RUN_ROOT", run_root),
+            patch.object(workspace, "ATTEMPT_ROOT", attempt_root),
+            patch.object(workspace, "DATASET_REVISION_ROOT", run_root / "dataset-revisions"),
+        )
+
+    def test_finished_kept_episode_can_be_failed_and_compacted_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "finished-review-two"
+            data_root, attempt_root, ids = self.make_dataset_and_attempts(root, name, 2)
+            profile_sidecar = data_root / name / "meta" / "rebot_training_profile.json"
+            profile_sidecar.write_text('{"profile":"review-test"}\n')
+            validation_path = (
+                root / "training-runs" / f"{name}--validation.json"
+            )
+            validation_path.write_text('{"passed":true}\n')
+            patches = self.workspace_roots(root, data_root, attempt_root)
+            with patches[0], patches[1], patches[2], patches[3]:
+                result = workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": ids[0],
+                        "action": "mark_failed",
+                        "failure_label": "test_or_setup",
+                        "failure_note": "calibration trial",
+                        "expected_revision": 0,
+                    }
+                )
+
+                self.assertTrue(result["training_changed"])
+                self.assertEqual(result["remaining_episodes"], 1)
+                fresh = LeRobotDataset(
+                    f"local/{name}", root=data_root / name, batch_encoding_size=1
+                )
+                self.assertEqual(fresh.num_episodes, 1)
+                self.assertEqual(fresh.num_frames, 3)
+                self.assertEqual(
+                    (data_root / name / "meta" / profile_sidecar.name).read_text(),
+                    '{"profile":"review-test"}\n',
+                )
+                self.assertFalse(validation_path.exists())
+                failed = attempt_archive.find_attempt(attempt_root, ids[0])[1]
+                kept = attempt_archive.find_attempt(attempt_root, ids[1])[1]
+                self.assertEqual(failed["disposition"], "failed")
+                self.assertEqual(failed["recorded_disposition"], "kept")
+                self.assertFalse(failed["training_included"])
+                self.assertEqual(failed["failure_label"], "test_or_setup")
+                self.assertEqual(kept["training_episode_index"], 0)
+                backup = Path(result["backup_root"])
+                self.assertTrue(backup.is_dir())
+                original = LeRobotDataset(
+                    f"local/{name}", root=backup, batch_encoding_size=1
+                )
+                self.assertEqual(original.num_episodes, 2)
+                self.assertTrue((backup.parent / "previous-validation.json").is_file())
+
+    def test_reviewing_only_episode_preserves_backup_and_reopens_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "finished-review-one"
+            data_root, attempt_root, ids = self.make_dataset_and_attempts(root, name, 1)
+            patches = self.workspace_roots(root, data_root, attempt_root)
+            with patches[0], patches[1], patches[2], patches[3]:
+                result = workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": ids[0],
+                        "action": "mark_failed",
+                        "failure_label": "failed_to_perform_task",
+                        "expected_revision": 0,
+                    }
+                )
+                self.assertTrue(result["dataset_empty"])
+                self.assertFalse((data_root / name).exists())
+                backup = Path(result["backup_root"])
+                self.assertTrue(backup.is_dir())
+                original = LeRobotDataset(
+                    f"local/{name}", root=backup, batch_encoding_size=1
+                )
+                self.assertEqual(original.num_episodes, 1)
+                failed = attempt_archive.find_attempt(attempt_root, ids[0])[1]
+                self.assertFalse(failed["training_included"])
+                self.assertIsNone(failed["training_episode_index"])
+
+    def test_system_attempt_can_be_labeled_without_changing_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt_root = Path(temporary) / "attempts"
+            attempt_id = attempt_archive.new_attempt_id()
+            directory = attempt_archive.attempt_path(
+                attempt_root, "excluded-review", attempt_id
+            )
+            directory.mkdir(parents=True)
+            attempt_archive.atomic_write_json(
+                directory / "metadata.json",
+                {
+                    "attempt_id": attempt_id,
+                    "dataset": "excluded-review",
+                    "disposition": "collector_error",
+                    "operator_disposition": "collector_error",
+                    "archive_complete": True,
+                    "training_included": False,
+                    "training_episode_index": None,
+                },
+            )
+            with patch.object(workspace, "ATTEMPT_ROOT", attempt_root):
+                result = workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": attempt_id,
+                        "action": "label_excluded",
+                        "failure_label": "camera_problem",
+                        "expected_revision": 0,
+                    }
+                )
+            updated = result["attempt"]
+            self.assertEqual(updated["disposition"], "collector_error")
+            self.assertEqual(updated["failure_label"], "camera_problem")
+            self.assertFalse(updated["training_included"])
+            self.assertEqual(updated["review_revision"], 1)
+
+    def test_metadata_failure_rolls_back_original_lerobot_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "finished-review-rollback"
+            data_root, attempt_root, ids = self.make_dataset_and_attempts(root, name, 2)
+            patches = self.workspace_roots(root, data_root, attempt_root)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patch.object(
+                    workspace,
+                    "write_reviewed_failure",
+                    side_effect=RuntimeError("simulated metadata failure"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "original LeRobot dataset was restored"
+                ),
+            ):
+                workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": ids[0],
+                        "action": "mark_failed",
+                        "failure_label": "test_or_setup",
+                        "expected_revision": 0,
+                    }
+                )
+
+            restored = LeRobotDataset(
+                f"local/{name}", root=data_root / name, batch_encoding_size=1
+            )
+            self.assertEqual(restored.num_episodes, 2)
+            self.assertEqual(restored.num_frames, 6)
+            metadata = attempt_archive.find_attempt(attempt_root, ids[0])[1]
+            self.assertEqual(metadata["disposition"], "kept")
+            self.assertTrue(metadata["training_included"])
+            self.assertEqual(metadata["training_episode_index"], 0)
+
+    def test_stale_review_revision_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt_root = Path(temporary) / "attempts"
+            attempt_id = attempt_archive.new_attempt_id()
+            directory = attempt_archive.attempt_path(
+                attempt_root, "stale-review", attempt_id
+            )
+            directory.mkdir(parents=True)
+            attempt_archive.atomic_write_json(
+                directory / "metadata.json",
+                {
+                    "attempt_id": attempt_id,
+                    "dataset": "stale-review",
+                    "disposition": "failed",
+                    "archive_complete": True,
+                    "training_included": False,
+                    "review_revision": 1,
+                },
+            )
+            with (
+                patch.object(workspace, "ATTEMPT_ROOT", attempt_root),
+                self.assertRaisesRegex(
+                    workspace.TrainingConfigError, "reviewed in another tab"
+                ),
+            ):
+                workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": attempt_id,
+                        "action": "label_excluded",
+                        "failure_label": "test_or_setup",
+                        "expected_revision": 0,
+                    }
+                )
+
+    def test_review_is_rejected_while_collection_is_running(self) -> None:
+        class RunningProcess:
+            @staticmethod
+            def poll():
+                return None
+
+        manager = workspace.TrainingManager()
+        manager._kind = "record"
+        manager._process = RunningProcess()
+        with self.assertRaisesRegex(RuntimeError, "still running"):
+            manager.review_attempt({})
 
 
 class FileStreamingTest(unittest.TestCase):

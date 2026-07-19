@@ -8,7 +8,7 @@ drivers, and it never writes datasets or checkpoints into the Git repository.
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -23,6 +23,8 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from attempt_archive import (
     FAILURE_LABELS,
@@ -30,7 +32,11 @@ from attempt_archive import (
     atomic_write_json,
     attempt_inventory as read_attempt_inventory,
     find_attempt,
+    mark_kept_attempt_failed as write_reviewed_failure,
+    reindex_training_episode as write_reindexed_episode,
+    review_revision,
     update_failure_label as write_failure_label,
+    utc_now,
     validate_failure_label,
 )
 
@@ -50,6 +56,7 @@ MODEL_ROOT = Path(os.environ.get("KIT_MODEL_ROOT", KIT_ROOT / "models"))
 CAMERA_ROOT = Path(os.environ.get("KIT_CAMERA_ROOT", KIT_ROOT / "camera-check"))
 RUN_ROOT = Path(os.environ.get("KIT_RUN_ROOT", KIT_ROOT / "training-runs"))
 ATTEMPT_ROOT = RUN_ROOT / "attempts"
+DATASET_REVISION_ROOT = RUN_ROOT / "dataset-revisions"
 CONTROL_ROOT = RUN_ROOT / "controls"
 CONTROLLED_RECORD = GUI_ROOT / "controlled_record.py"
 OWNED_PROCESS = GUI_ROOT / "owned_process.py"
@@ -66,7 +73,18 @@ def _venv_site_packages() -> Path:
 
 
 SITE_PACKAGES = _venv_site_packages()
-RERUN_NATIVE_BIN = SITE_PACKAGES / "rerun_sdk" / "rerun_cli" / "rerun"
+_RERUN_CLI_ROOT = SITE_PACKAGES / "rerun_sdk" / "rerun_cli"
+RERUN_NATIVE_BIN = next(
+    (
+        candidate
+        for candidate in (
+            _RERUN_CLI_ROOT / "rerun",
+            _RERUN_CLI_ROOT / "Rerun.app" / "Contents" / "MacOS" / "Rerun",
+        )
+        if candidate.is_file()
+    ),
+    _RERUN_CLI_ROOT / "rerun",
+)
 
 DATASET_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,47}$")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,95}$")
@@ -396,7 +414,7 @@ def validate_collection_config(payload: Any) -> dict[str, Any]:
         "repo_id": f"local/{slug}",
         "task": task,
         "episodes": _number(payload.get("episodes", defaults["episodes"]), "Episodes this run", 1, 500, whole=True),
-        "episode_time_s": _number(payload.get("episode_time_s", defaults["episode_time_s"]), "Episode time", 5, 300),
+        "episode_time_s": _number(payload.get("episode_time_s", defaults["episode_time_s"]), "Episode time", 5, 3600),
         "reset_time_s": _number(payload.get("reset_time_s", defaults["reset_time_s"]), "Reset time", 3, 180),
         "fps": _number(payload.get("fps", defaults["fps"]), "Dataset FPS", 5, 60, whole=True),
         "control_hz": _number(payload.get("control_hz", defaults["control_hz"]), "Control Hz", 30, 240, whole=True),
@@ -436,6 +454,28 @@ def collection_contract(config: dict[str, Any]) -> dict[str, Any]:
     return {key: config[key] for key in COLLECTION_CONTRACT_KEYS}
 
 
+def manual_cycle_config(config: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Force one explicit physical take and infer append mode from disk."""
+
+    counts = _zero_frame_dataset_counts(root)
+    if counts is None:
+        raise RuntimeError(
+            "Dataset folder is nonempty but is not a valid durable LeRobot dataset or a "
+            "safely retryable zero-frame initialization. It was preserved for review."
+        )
+    episodes, frames = counts
+    if (episodes == 0) != (frames == 0):
+        raise RuntimeError(
+            "Dataset metadata has inconsistent durable episode/frame counts; it was "
+            "preserved for review"
+        )
+    result = dict(config)
+    result["episodes"] = 1
+    result["resume"] = episodes > 0 and frames > 0
+    result["manual_cycle"] = True
+    return result
+
+
 def collection_contract_lock(config: dict[str, Any]) -> dict[str, Any]:
     snapshot = collection_contract(config)
     return {"digest": _canonical_digest(snapshot), "snapshot": snapshot}
@@ -443,6 +483,8 @@ def collection_contract_lock(config: dict[str, Any]) -> dict[str, Any]:
 
 def runtime_env() -> dict[str, str]:
     env = os.environ.copy()
+    hf_home = KIT_ROOT / ".state" / "huggingface"
+    hf_home.mkdir(parents=True, exist_ok=True)
     paths = [
         RUNTIME_ROOT / "lerobot" / "src",
         RUNTIME_ROOT / "lerobot-robot-seeed-b601",
@@ -454,6 +496,11 @@ def runtime_env() -> dict[str, str]:
         [str(path) for path in paths] + ([inherited] if inherited else [])
     )
     env["HF_LEROBOT_HOME"] = str(HF_LEROBOT_HOME)
+    # Keep every dataset-loader cache inside the isolated Operator Kit instead
+    # of modifying the user's shared ~/.cache/huggingface state.
+    env["HF_HOME"] = str(hf_home)
+    env["HF_DATASETS_CACHE"] = str(hf_home / "datasets")
+    env["HUGGINGFACE_HUB_CACHE"] = str(hf_home / "hub")
     env["PATH"] = str(VENV / "bin") + os.pathsep + env.get("PATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
@@ -689,6 +736,91 @@ def _quarantine_zero_frame_attempt(
     return destination
 
 
+def _quarantine_zero_durable_retry_manifest(
+    dataset_name: str,
+    manifest_path: Path,
+    *,
+    reason: str,
+) -> Path | None:
+    """Recoverably remove only a failed zero-save retry from active manifests."""
+
+    if not DATASET_SLUG_RE.fullmatch(dataset_name) or not manifest_path.is_file():
+        return None
+    try:
+        resolved = manifest_path.resolve()
+        if resolved.parent != RUN_ROOT.resolve():
+            return None
+        if not resolved.name.startswith(f"{dataset_name}--") or resolved.name.endswith(
+            "--validation.json"
+        ):
+            return None
+        manifest = json.loads(resolved.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    lifecycle = manifest.get("lifecycle") if isinstance(manifest, dict) else None
+    if not isinstance(lifecycle, dict):
+        return None
+    durable = lifecycle.get("durable_episodes_this_run")
+    exit_code = lifecycle.get("exit_code")
+    if not (
+        lifecycle.get("state") == "FAILED"
+        and isinstance(durable, int)
+        and not isinstance(durable, bool)
+        and durable == 0
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+    ):
+        return None
+    counts = _zero_frame_dataset_counts(DATA_ROOT / dataset_name)
+    if counts is None or counts[0] <= 0 or counts[1] <= 0:
+        return None
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    destination = RUN_ROOT / "quarantine" / f"{stamp}-{dataset_name}-zero-durable-retry"
+    manifest_destination = destination / "manifests"
+    manifest_destination.mkdir(parents=True, exist_ok=False)
+    target = manifest_destination / resolved.name
+    shutil.move(str(resolved), str(target))
+    audit = {
+        "quarantined_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": dataset_name,
+        "reason": reason,
+        "saved_episodes_unchanged": counts[0],
+        "saved_frames_unchanged": counts[1],
+        "durable_episodes_in_failed_retry": 0,
+        "moved_manifest": str(target),
+        "dataset_root_moved": False,
+        "raw_attempt_archive_moved": False,
+        "raw_attempt_archive": str(ATTEMPT_ROOT / dataset_name),
+        "recoverable": True,
+    }
+    (destination / "quarantine.json").write_text(json.dumps(audit, indent=2) + "\n")
+    return destination
+
+
+def _quarantine_zero_durable_retry_manifests(
+    dataset_name: str,
+    *,
+    reason: str,
+) -> list[Path]:
+    destinations: list[Path] = []
+    paths = (
+        sorted(RUN_ROOT.glob(f"{dataset_name}--*.json"))
+        if RUN_ROOT.is_dir()
+        else []
+    )
+    for path in paths:
+        destination = _quarantine_zero_durable_retry_manifest(
+            dataset_name,
+            path,
+            reason=reason,
+        )
+        if destination is not None:
+            destinations.append(destination)
+    return destinations
+
+
 def _manifest_profile_compatibility(
     dataset_name: str,
     profile_digest: str,
@@ -723,7 +855,16 @@ def _manifest_profile_compatibility(
         lifecycle_exit = lifecycle.get("exit_code") if isinstance(lifecycle, dict) else None
         state = str(lifecycle.get("state", "")) if isinstance(lifecycle, dict) else ""
         lifecycle_states.add(state)
-        if state != "COMPLETE" or lifecycle_exit != 0:
+        durable_partial = (
+            state == "PARTIAL_COMPLETE"
+            and isinstance(lifecycle_exit, int)
+            and not isinstance(lifecycle_exit, bool)
+            and lifecycle_exit != 0
+            and isinstance(lifecycle.get("durable_episodes_this_run"), int)
+            and not isinstance(lifecycle.get("durable_episodes_this_run"), bool)
+            and lifecycle["durable_episodes_this_run"] > 0
+        ) if isinstance(lifecycle, dict) else False
+        if not ((state == "COMPLETE" and lifecycle_exit == 0) or durable_partial):
             invalid += 1
     compatible = bool(
         result["candidate_count"]
@@ -981,7 +1122,6 @@ def preflight(devices: dict[str, Any]) -> dict[str, Any]:
         and calibrations.get("follower")
         and calibrations.get("leader")
         and profile_status.get("passed")
-        and report.get("passed")
         and all(components[name] for name in ("python", "record", "controlled_record", "validator"))
         and free_bytes >= 5 * 1024**3
     )
@@ -1212,10 +1352,263 @@ def update_attempt_failure_label(payload: Any) -> dict[str, Any]:
             str(payload.get("attempt_id", "")),
             payload.get("failure_label"),
             payload.get("failure_note", ""),
+            expected_revision=payload.get("expected_revision"),
         )
     except (ValueError, FileNotFoundError) as exc:
         raise TrainingConfigError(str(exc)) from exc
     return {"attempt": metadata}
+
+
+def _review_local_now() -> str:
+    return datetime.now(ZoneInfo("America/Los_Angeles")).isoformat(timespec="seconds")
+
+
+def _review_transaction_update(transaction_root: Path, **updates: Any) -> dict[str, Any]:
+    path = transaction_root / "review-transaction.json"
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Review transaction manifest is unreadable: {path}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Review transaction manifest is invalid: {path}")
+    value.update(updates)
+    atomic_write_json(path, value)
+    return value
+
+
+def _load_review_dataset(root: Path, repo_id: str):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    return LeRobotDataset(repo_id, root=root, batch_encoding_size=1)
+
+
+def _prepare_lerobot_episode_exclusion(
+    dataset_name: str,
+    episode_index: int,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Build and verify a recoverable replacement without touching the source."""
+
+    if not DATASET_SLUG_RE.fullmatch(dataset_name):
+        raise TrainingConfigError("Invalid dataset name")
+    dataset_root = DATA_ROOT / dataset_name
+    if not dataset_root.is_dir() or dataset_root.is_symlink():
+        raise RuntimeError(f"LeRobot dataset is not safely available: {dataset_root}")
+
+    repo_id = f"local/{dataset_name}"
+    try:
+        source = _load_review_dataset(dataset_root, repo_id)
+    except Exception as exc:
+        raise RuntimeError(f"LeRobot dataset could not be fresh-loaded: {exc}") from exc
+
+    total_episodes = int(source.num_episodes)
+    if isinstance(episode_index, bool) or not 0 <= episode_index < total_episodes:
+        raise TrainingConfigError("Attempt points to an invalid LeRobot episode")
+    episode_metadata = source.meta.episodes[episode_index]
+    removed_frames = int(episode_metadata.get("length", 0))
+    expected_frames = int(source.num_frames) - removed_frames
+    remaining_episodes = total_episodes - 1
+    if expected_frames < 0:
+        raise RuntimeError("LeRobot episode frame metadata is inconsistent")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    transaction_root = (
+        DATASET_REVISION_ROOT
+        / dataset_name
+        / f"{stamp}--exclude-{attempt_id}-{uuid4().hex[:8]}"
+    )
+    transaction_root.mkdir(parents=True, exist_ok=False)
+    backup_root = transaction_root / "source-dataset"
+    replacement_root = transaction_root / "replacement-dataset"
+    validation_path = RUN_ROOT / f"{dataset_name}--validation.json"
+    validation_backup = transaction_root / "previous-validation.json"
+    manifest = {
+        "schema_version": 1,
+        "transaction_id": transaction_root.name,
+        "state": "preparing",
+        "created_at_utc": utc_now(),
+        "created_at_local": _review_local_now(),
+        "timezone": "America/Los_Angeles",
+        "dataset": dataset_name,
+        "source_path": str(dataset_root),
+        "backup_path": str(backup_root),
+        "replacement_path": str(replacement_root) if remaining_episodes else None,
+        "attempt_id": attempt_id,
+        "removed_episode_index": episode_index,
+        "source_episodes": total_episodes,
+        "source_frames": int(source.num_frames),
+        "removed_frames": removed_frames,
+        "remaining_episodes": remaining_episodes,
+        "expected_remaining_frames": expected_frames,
+    }
+    atomic_write_json(transaction_root / "review-transaction.json", manifest)
+
+    if remaining_episodes:
+        try:
+            from lerobot.datasets.dataset_tools import delete_episodes
+
+            replacement = delete_episodes(
+                source,
+                [episode_index],
+                output_dir=replacement_root,
+                repo_id=repo_id,
+            )
+            profile_sidecar = dataset_root / "meta" / "rebot_training_profile.json"
+            if profile_sidecar.is_file():
+                destination = replacement_root / "meta" / profile_sidecar.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(profile_sidecar, destination)
+            del replacement
+            verified = _load_review_dataset(replacement_root, repo_id)
+            if (
+                int(verified.num_episodes) != remaining_episodes
+                or int(verified.num_frames) != expected_frames
+            ):
+                raise RuntimeError(
+                    "Replacement LeRobot episode/frame counts do not match the review plan"
+                )
+            del verified
+        except Exception as exc:
+            _review_transaction_update(
+                transaction_root,
+                state="prepare_failed",
+                error=str(exc),
+                failed_at_utc=utc_now(),
+                failed_at_local=_review_local_now(),
+            )
+            raise RuntimeError(
+                "Could not build a verified LeRobot dataset without this episode; "
+                "the original dataset was not changed"
+            ) from exc
+
+    del source
+    _review_transaction_update(
+        transaction_root,
+        state="prepared",
+        prepared_at_utc=utc_now(),
+        prepared_at_local=_review_local_now(),
+    )
+    return {
+        **manifest,
+        "transaction_root": transaction_root,
+        "dataset_root": dataset_root,
+        "backup_root": backup_root,
+        "replacement_root": replacement_root if remaining_episodes else None,
+        "validation_path": validation_path,
+        "validation_backup": validation_backup,
+        "repo_id": repo_id,
+    }
+
+
+def _commit_lerobot_episode_exclusion(plan: dict[str, Any]) -> None:
+    dataset_root = Path(plan["dataset_root"])
+    backup_root = Path(plan["backup_root"])
+    replacement_root = (
+        Path(plan["replacement_root"]) if plan.get("replacement_root") else None
+    )
+    validation_path = Path(plan["validation_path"])
+    validation_backup = Path(plan["validation_backup"])
+    transaction_root = Path(plan["transaction_root"])
+    try:
+        dataset_root.replace(backup_root)
+        if replacement_root is not None:
+            replacement_root.replace(dataset_root)
+            verified = _load_review_dataset(dataset_root, str(plan["repo_id"]))
+            if (
+                int(verified.num_episodes) != int(plan["remaining_episodes"])
+                or int(verified.num_frames) != int(plan["expected_remaining_frames"])
+            ):
+                raise RuntimeError("Active replacement failed fresh-load verification")
+            del verified
+        elif dataset_root.exists():
+            raise RuntimeError("Zero-episode exclusion left an active dataset behind")
+        if validation_path.is_file():
+            validation_path.replace(validation_backup)
+        _review_transaction_update(
+            transaction_root,
+            state="dataset_swapped",
+            swapped_at_utc=utc_now(),
+            swapped_at_local=_review_local_now(),
+        )
+    except Exception as exc:
+        try:
+            if dataset_root.exists():
+                failed_replacement = transaction_root / "failed-active-replacement"
+                dataset_root.replace(failed_replacement)
+            if backup_root.exists():
+                backup_root.replace(dataset_root)
+            if validation_backup.exists() and not validation_path.exists():
+                validation_backup.replace(validation_path)
+        except Exception as rollback_exc:
+            _review_transaction_update(
+                transaction_root,
+                state="rollback_failed",
+                error=str(exc),
+                rollback_error=str(rollback_exc),
+                failed_at_utc=utc_now(),
+                failed_at_local=_review_local_now(),
+            )
+            raise RuntimeError(
+                "LeRobot review swap and automatic rollback both failed; validation is blocked"
+            ) from rollback_exc
+        _review_transaction_update(
+            transaction_root,
+            state="swap_failed_rolled_back",
+            error=str(exc),
+            failed_at_utc=utc_now(),
+            failed_at_local=_review_local_now(),
+        )
+        raise RuntimeError(
+            "LeRobot review swap failed and was rolled back; no training episode was removed"
+        ) from exc
+
+
+def _rollback_lerobot_episode_exclusion(plan: dict[str, Any], reason: str) -> None:
+    dataset_root = Path(plan["dataset_root"])
+    backup_root = Path(plan["backup_root"])
+    validation_path = Path(plan["validation_path"])
+    validation_backup = Path(plan["validation_backup"])
+    transaction_root = Path(plan["transaction_root"])
+    if dataset_root.exists():
+        rolled_back_replacement = transaction_root / "rolled-back-replacement"
+        dataset_root.replace(rolled_back_replacement)
+    if not backup_root.exists():
+        raise RuntimeError("Review rollback source dataset is missing")
+    backup_root.replace(dataset_root)
+    if validation_backup.exists() and not validation_path.exists():
+        validation_backup.replace(validation_path)
+    restored = _load_review_dataset(dataset_root, str(plan["repo_id"]))
+    if int(restored.num_episodes) != int(plan["source_episodes"]):
+        raise RuntimeError("Review rollback did not restore the source episode count")
+    del restored
+    _review_transaction_update(
+        transaction_root,
+        state="metadata_failed_rolled_back",
+        error=reason,
+        rolled_back_at_utc=utc_now(),
+        rolled_back_at_local=_review_local_now(),
+    )
+
+
+def _dataset_attempt_mapping(dataset_name: str, expected_episodes: int) -> list[dict[str, Any]]:
+    attempts = read_attempt_inventory(ATTEMPT_ROOT, dataset_name)
+    included = [item for item in attempts if item.get("training_included") is True]
+    raw_indices = [item.get("training_episode_index") for item in included]
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in raw_indices):
+        raise RuntimeError(
+            "Attempt-to-LeRobot episode mapping is inconsistent; review cannot safely mutate data"
+        )
+    indices = sorted(raw_indices)
+    if indices != list(range(expected_episodes)):
+        raise RuntimeError(
+            "Attempt-to-LeRobot episode mapping is inconsistent; review cannot safely mutate data"
+        )
+    return included
+
+
+def _restore_attempt_metadata(snapshots: dict[Path, dict[str, Any]]) -> None:
+    for path, value in snapshots.items():
+        atomic_write_json(path, value)
 
 
 def attempt_artifact_path(attempt_id: str, artifact: str) -> Path:
@@ -1280,6 +1673,7 @@ class TrainingManager:
         self._fault: str | None = None
         self._record_control_file: Path | None = None
         self._record_decision_pending = False
+        self._record_phase: str | None = None
         self._seq = 0
         self._logs: deque[dict[str, Any]] = deque(maxlen=2500)
         self._append_log("INFO", "ReBot data and training workspace ready")
@@ -1371,6 +1765,7 @@ class TrainingManager:
             self._fault = None
             self._record_control_file = record_control_file if kind == "record" else None
             self._record_decision_pending = kind == "record"
+            self._record_phase = "starting" if kind == "record" else None
         self._append_log("INFO", f"Starting {kind}")
         owner_read_fd, owner_write_fd = os.pipe()
         owner_stop_signal = "SIGHUP" if kind == "record" else "SIGINT"
@@ -1435,6 +1830,7 @@ class TrainingManager:
                 self._fault = str(exc)
                 self._record_control_file = None
                 self._record_decision_pending = False
+                self._record_phase = None
             self._append_log("ERROR", f"{kind} failed to start: {exc}")
             raise
         os.close(owner_read_fd)
@@ -1486,6 +1882,7 @@ class TrainingManager:
                 self._fault = str(exc)
                 self._record_control_file = None
                 self._record_decision_pending = False
+                self._record_phase = None
             self._append_log("ERROR", str(exc))
             raise
         reader.start()
@@ -1499,14 +1896,43 @@ class TrainingManager:
         config: dict[str, Any] | None,
     ) -> None:
         assert process.stdout is not None
+        durable_episodes_this_run = 0
+        durable_dataset_episodes = 0
         for raw in process.stdout:
             line = raw.rstrip("\r\n")
             if not line:
                 continue
             lower = line.lower()
-            if kind == "record" and line.startswith("ATTEMPT recording"):
+            if kind == "record":
                 with self._lock:
-                    self._record_decision_pending = False
+                    if line.startswith("ATTEMPT recording"):
+                        self._record_decision_pending = False
+                        self._record_phase = "recording"
+                    elif line.startswith("AWAITING_DECISION"):
+                        self._record_phase = "awaiting_decision"
+                    elif line.startswith("ATTEMPT save_started"):
+                        self._record_phase = "saving_rerun"
+                    elif line.startswith("ATTEMPT save_phase") and "phase=lerobot" in line:
+                        self._record_phase = "saving_lerobot"
+                    elif line.startswith("ATTEMPT lerobot_durable"):
+                        self._record_phase = "saved_ending"
+                        durable_episodes_this_run += 1
+                        total_match = re.search(r"\btotal_episodes=(\d+)\b", line)
+                        if total_match:
+                            durable_dataset_episodes = int(total_match.group(1))
+                    elif line.startswith("GUI_EVENT pause_manual_run"):
+                        self._record_phase = "paused"
+                    elif line.startswith("GUI_EVENT resume_manual_run"):
+                        self._record_phase = "recording"
+                if line.startswith("ATTEMPT lerobot_durable"):
+                    try:
+                        _update_run_manifest(
+                            manifest_path,
+                            durable_episodes_this_run=durable_episodes_this_run,
+                            durable_dataset_episodes=durable_dataset_episodes,
+                        )
+                    except RuntimeError as exc:
+                        self._append_log("ERROR", str(exc))
             level = "INFO"
             if line.startswith("ATTEMPT archived_failed"):
                 level = "INFO"
@@ -1516,13 +1942,22 @@ class TrainingManager:
                 level = "WARN"
             self._append_log(level, line)
         exit_code = process.wait()
+        lifecycle_state = (
+            "COMPLETE"
+            if exit_code == 0
+            else "PARTIAL_COMPLETE"
+            if durable_episodes_this_run > 0
+            else "FAILED"
+        )
         try:
             _update_run_manifest(
                 manifest_path,
-                state="COMPLETE" if exit_code == 0 else "FAILED",
+                state=lifecycle_state,
                 finished_at=datetime.now().isoformat(timespec="seconds"),
                 exit_code=exit_code,
                 error=None if exit_code == 0 else f"{kind} exited with code {exit_code}",
+                durable_episodes_this_run=durable_episodes_this_run,
+                durable_dataset_episodes=durable_dataset_episodes,
             )
         except RuntimeError as exc:
             self._append_log("ERROR", str(exc))
@@ -1541,6 +1976,21 @@ class TrainingManager:
                         "Zero-frame attempt quarantined; the same dataset name is ready "
                         f"to retry: {quarantined}",
                     )
+                elif lifecycle_state == "FAILED" and durable_episodes_this_run == 0:
+                    retry_quarantine = _quarantine_zero_durable_retry_manifest(
+                        str(config["dataset"]),
+                        manifest_path,
+                        reason=(
+                            "record retry failed before saving a durable episode; "
+                            f"exit code {exit_code}"
+                        ),
+                    ) if manifest_path else None
+                    if retry_quarantine:
+                        self._append_log(
+                            "WARN",
+                            "Failed zero-save retry manifest quarantined; existing durable "
+                            f"episodes and raw attempt archive are unchanged: {retry_quarantine}",
+                        )
             except (OSError, RuntimeError) as exc:
                 self._append_log("ERROR", f"Zero-frame quarantine failed: {exc}")
         with self._lock:
@@ -1552,7 +2002,17 @@ class TrainingManager:
             if kind == "record":
                 self._record_control_file = None
                 self._record_decision_pending = False
-            if exit_code == 0:
+                self._record_phase = None
+            if kind == "record":
+                # A failed manual take is an archived outcome, not a latched
+                # workspace state. Keep the details in the log/attempt archive
+                # and return the controls to retry-ready immediately.
+                self._state = "READY"
+                self._fault = None if exit_code == 0 else (
+                    f"Previous run exited with code {exit_code}; retry is allowed and "
+                    "any archived raw attempt remains available for review"
+                )
+            elif exit_code == 0:
                 self._state = "COMPLETE"
                 self._fault = None
             else:
@@ -1635,8 +2095,6 @@ class TrainingManager:
                 reasons.append(devices.get("error", "arms unavailable"))
             elif not devices.get("ports_free"):
                 reasons.append("arm serial ports are busy; stop teleop first")
-            if not current_preflight["camera_report"].get("passed"):
-                reasons.append("dual-camera check has not passed")
             if not current_preflight["training_profile"].get("passed"):
                 reasons.append(
                     current_preflight["training_profile"].get("error")
@@ -1645,12 +2103,14 @@ class TrainingManager:
             if not reasons:
                 reasons.append("preflight is incomplete")
             raise RuntimeError("; ".join(reasons))
-        if not camera_report_matches(config, current_preflight["camera_report"]):
-            raise RuntimeError(
-                "Camera check does not match the selected indices, FPS, and actual frame sizes"
-            )
-
         root = DATA_ROOT / config["dataset"]
+        # Manual-cycle mode always records one take and decides Resume from the
+        # durable dataset itself. The operator never has to manage a batch
+        # counter or remember a Resume checkbox between physical runs.
+        if root.exists() and not root.is_dir():
+            raise RuntimeError(f"Dataset path is not a directory: {root}")
+        config = manual_cycle_config(config, root)
+        populated = config["resume"]
         if not config["resume"]:
             quarantined = _quarantine_zero_frame_attempt(
                 config["dataset"],
@@ -1662,8 +2122,6 @@ class TrainingManager:
                     "Earlier zero-frame attempt quarantined; retry namespace is clean: "
                     f"{quarantined}",
                 )
-        if root.exists() and not root.is_dir():
-            raise RuntimeError(f"Dataset path is not a directory: {root}")
         populated = root.exists() and any(root.iterdir())
         if populated and not config["resume"]:
             raise RuntimeError(
@@ -1678,6 +2136,16 @@ class TrainingManager:
             raise RuntimeError("Resume requires an existing LeRobot dataset with meta/info.json")
         contract = collection_contract_lock(config)
         if config["resume"]:
+            quarantined_retries = _quarantine_zero_durable_retry_manifests(
+                config["dataset"],
+                reason="resume cleanup of failed retry with zero durable episodes",
+            )
+            for destination in quarantined_retries:
+                self._append_log(
+                    "WARN",
+                    "Failed zero-save retry manifest quarantined before Resume; dataset and "
+                    f"raw attempts are unchanged: {destination}",
+                )
             sidecar_status = _dataset_profile_sidecar(
                 root,
                 profile_status["profile_digest"],
@@ -1823,6 +2291,204 @@ class TrainingManager:
             config={"dataset": name, "minimum_episodes": minimum},
         )
 
+    def review_attempt(self, payload: Any) -> dict[str, Any]:
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise RuntimeError("Another training workspace operation is in progress")
+        try:
+            self._ensure_idle()
+            return self._review_attempt_locked(payload)
+        finally:
+            self._lifecycle_lock.release()
+
+    def _review_attempt_locked(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise TrainingConfigError("Request body must be a JSON object")
+        attempt_id = str(payload.get("attempt_id", ""))
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"", "mark_failed", "label_excluded"}:
+            raise TrainingConfigError("Unknown attempt review action")
+        try:
+            directory, metadata = find_attempt(ATTEMPT_ROOT, attempt_id)
+            label, note = validate_failure_label(
+                payload.get("failure_label"), payload.get("failure_note", "")
+            )
+            current_revision = review_revision(metadata)
+        except (ValueError, FileNotFoundError) as exc:
+            raise TrainingConfigError(str(exc)) from exc
+        if metadata.get("archive_complete") is not True:
+            raise TrainingConfigError("Only a completed archived attempt can be reviewed")
+        expected_revision = payload.get("expected_revision")
+        if expected_revision is not None:
+            if isinstance(expected_revision, bool):
+                raise TrainingConfigError("Attempt review revision is invalid")
+            try:
+                expected = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise TrainingConfigError("Attempt review revision is invalid") from exc
+            if expected != current_revision:
+                raise TrainingConfigError(
+                    "This attempt was reviewed in another tab; refresh the archive before saving"
+                )
+
+        is_included_kept = bool(
+            metadata.get("disposition") == "kept"
+            and metadata.get("training_included") is True
+            and isinstance(metadata.get("training_episode_index"), int)
+            and not isinstance(metadata.get("training_episode_index"), bool)
+        )
+        if not is_included_kept:
+            if action == "mark_failed":
+                raise TrainingConfigError("This attempt is already excluded from LeRobot")
+            try:
+                updated = write_failure_label(
+                    ATTEMPT_ROOT,
+                    attempt_id,
+                    label,
+                    note,
+                    expected_revision=expected_revision,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise TrainingConfigError(str(exc)) from exc
+            self._append_log(
+                "INFO",
+                f"Reviewed excluded attempt {attempt_id}: {label}",
+            )
+            return {
+                "attempt": updated,
+                "review_action": "label_excluded",
+                "training_changed": False,
+                "message": "Review label saved; this attempt remains excluded from LeRobot.",
+            }
+
+        if action == "label_excluded":
+            raise TrainingConfigError(
+                "A kept attempt must be marked failed and removed from LeRobot"
+            )
+        dataset_name = str(metadata.get("dataset", ""))
+        episode_index = int(metadata["training_episode_index"])
+        info_path = DATA_ROOT / dataset_name / "meta" / "info.json"
+        try:
+            info = json.loads(info_path.read_text())
+            expected_episodes = int(info["total_episodes"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("LeRobot dataset metadata is unavailable or invalid") from exc
+        included = _dataset_attempt_mapping(dataset_name, expected_episodes)
+        matching = [item for item in included if item.get("attempt_id") == attempt_id]
+        if len(matching) != 1 or matching[0].get("training_episode_index") != episode_index:
+            raise RuntimeError(
+                "Finished attempt does not map uniquely to its LeRobot episode"
+            )
+
+        reindexed = sorted(
+            (
+                item
+                for item in included
+                if int(item["training_episode_index"]) > episode_index
+            ),
+            key=lambda item: int(item["training_episode_index"]),
+        )
+        affected_ids = [attempt_id, *(str(item["attempt_id"]) for item in reindexed)]
+        snapshots: dict[Path, dict[str, Any]] = {}
+        for affected_id in affected_ids:
+            affected_directory, affected_metadata = find_attempt(ATTEMPT_ROOT, affected_id)
+            snapshots[affected_directory / "metadata.json"] = affected_metadata
+
+        plan = _prepare_lerobot_episode_exclusion(
+            dataset_name,
+            episode_index,
+            attempt_id,
+        )
+        _commit_lerobot_episode_exclusion(plan)
+        try:
+            updated = write_reviewed_failure(
+                ATTEMPT_ROOT,
+                attempt_id,
+                label,
+                note,
+                expected_revision=expected_revision,
+            )
+            updated["training_exclusion_transaction"] = Path(
+                plan["transaction_root"]
+            ).name
+            updated["training_dataset_revision_backup"] = str(plan["backup_root"])
+            updated["training_dataset_remaining_episodes"] = int(
+                plan["remaining_episodes"]
+            )
+            atomic_write_json(directory / "metadata.json", updated)
+
+            for item in reindexed:
+                old_index = int(item["training_episode_index"])
+                changed = write_reindexed_episode(
+                    ATTEMPT_ROOT,
+                    str(item["attempt_id"]),
+                    old_index=old_index,
+                    new_index=old_index - 1,
+                    review_attempt_id=attempt_id,
+                )
+                changed["training_reindex_transaction"] = Path(
+                    plan["transaction_root"]
+                ).name
+                changed_directory, _ = find_attempt(
+                    ATTEMPT_ROOT, str(item["attempt_id"])
+                )
+                atomic_write_json(changed_directory / "metadata.json", changed)
+
+            _dataset_attempt_mapping(
+                dataset_name,
+                int(plan["remaining_episodes"]),
+            )
+            _review_transaction_update(
+                Path(plan["transaction_root"]),
+                state="complete",
+                failure_label=label,
+                failure_note=note,
+                completed_at_utc=utc_now(),
+                completed_at_local=_review_local_now(),
+            )
+        except Exception as exc:
+            metadata_restore_error: Exception | None = None
+            try:
+                _restore_attempt_metadata(snapshots)
+            except Exception as restore_exc:
+                metadata_restore_error = restore_exc
+            try:
+                _rollback_lerobot_episode_exclusion(plan, str(exc))
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "Post-review metadata failed and the LeRobot rollback needs manual recovery"
+                ) from rollback_exc
+            if metadata_restore_error is not None:
+                raise RuntimeError(
+                    "LeRobot was restored but attempt metadata needs manual recovery"
+                ) from metadata_restore_error
+            raise RuntimeError(
+                "Post-review metadata failed; the original LeRobot dataset was restored"
+            ) from exc
+
+        remaining = int(plan["remaining_episodes"])
+        self._append_log(
+            "INFO",
+            f"Attempt {attempt_id} marked failed and removed from LeRobot episode "
+            f"{episode_index}; {remaining} episode(s) remain",
+        )
+        return {
+            "attempt": updated,
+            "review_action": "mark_failed",
+            "training_changed": True,
+            "removed_episode_index": episode_index,
+            "remaining_episodes": remaining,
+            "dataset_empty": remaining == 0,
+            "backup_root": str(plan["backup_root"]),
+            "message": (
+                "Failure label saved and the episode was removed from LeRobot. "
+                + (
+                    "The dataset now has no kept episodes; start the next run with Resume off."
+                    if remaining == 0
+                    else f"{remaining} kept episode(s) remain and were fresh-load verified."
+                )
+            ),
+        }
+
     def record_control(self, payload: Any) -> dict[str, Any]:
         with self._decision_lock:
             return self._record_control_locked(payload)
@@ -1835,8 +2501,11 @@ class TrainingManager:
         action = str(payload.get("action", ""))
         signals = {
             "finish": signal.SIGUSR1,
+            "finish_and_stop": signal.SIGUSR1,
             "rerecord": signal.SIGUSR2,
             "stop": signal.SIGHUP,
+            "pause": None,
+            "play": None,
         }
         if action not in signals:
             raise TrainingConfigError("Unknown recording action")
@@ -1866,13 +2535,18 @@ class TrainingManager:
             if self._record_decision_pending and action != "stop":
                 raise RuntimeError("The previous decision is still being archived")
             was_pending = self._record_decision_pending
-            self._record_decision_pending = True
+            terminal_action = action in {"finish", "finish_and_stop", "rerecord", "stop"}
+            if terminal_action:
+                self._record_decision_pending = True
         try:
             # Stop never overwrites a finish/failure decision that the collector
-            # may not have consumed yet. SIGHUP carries the stop event itself.
-            if action != "stop":
+            # may not have consumed yet.  With no pending decision, publish Stop
+            # too so the collector has a durable fallback if signal forwarding
+            # is delayed.
+            if action != "stop" or not was_pending:
                 atomic_write_json(control_file, decision)
-            os.kill(process.pid, signals[action])
+            if signals[action] is not None:
+                os.kill(process.pid, signals[action])
         except Exception as exc:
             with self._lock:
                 if self._process is process:
@@ -2026,6 +2700,7 @@ class TrainingManager:
                 "config": self._config,
                 "fault": self._fault,
                 "decision_pending": self._record_decision_pending if running and self._kind == "record" else False,
+                "record_phase": self._record_phase if running and self._kind == "record" else None,
                 "last_exit_code": self._last_exit_code,
                 "latest_seq": self._seq,
                 "simulate": self.simulate,

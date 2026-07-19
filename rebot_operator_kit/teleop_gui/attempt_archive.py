@@ -61,6 +61,61 @@ def validate_failure_label(label: Any, note: Any = "") -> tuple[str, str]:
     return normalized, normalized_note
 
 
+def review_revision(metadata: dict[str, Any]) -> int:
+    """Return the optimistic-concurrency revision for a review sidecar."""
+
+    value = metadata.get("review_revision", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("Attempt review revision is invalid")
+    return value
+
+
+def _require_review_revision(metadata: dict[str, Any], expected_revision: Any) -> int:
+    current = review_revision(metadata)
+    if expected_revision is None:
+        return current
+    if isinstance(expected_revision, bool):
+        raise ValueError("Attempt review revision is invalid")
+    try:
+        expected = int(expected_revision)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Attempt review revision is invalid") from exc
+    if expected != current:
+        raise ValueError(
+            "This attempt was reviewed in another tab; refresh the archive before saving"
+        )
+    return current
+
+
+def _append_review_history(
+    metadata: dict[str, Any],
+    *,
+    action: str,
+    previous: dict[str, Any],
+    label: str,
+    note: str,
+    revision: int,
+) -> str:
+    reviewed_at = utc_now()
+    history = metadata.get("review_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "revision": revision,
+            "reviewed_at": reviewed_at,
+            "action": action,
+            "previous": previous,
+            "failure_label": label,
+            "failure_note": note,
+        }
+    )
+    metadata["review_history"] = history
+    metadata["review_revision"] = revision
+    metadata["reviewed_at"] = reviewed_at
+    return reviewed_at
+
+
 def attempt_path(archive_root: Path, dataset: str, attempt_id: str) -> Path:
     if not DATASET_RE.fullmatch(dataset):
         raise ValueError("Invalid dataset name")
@@ -96,11 +151,19 @@ def attempt_inventory(archive_root: Path, dataset: str = "") -> list[dict[str, A
     roots = [archive_root / dataset] if dataset else list(archive_root.glob("*"))
     attempts: list[dict[str, Any]] = []
     for dataset_root in roots:
-        if not dataset_root.is_dir() or not DATASET_RE.fullmatch(dataset_root.name):
+        if (
+            dataset_root.is_symlink()
+            or not dataset_root.is_dir()
+            or not DATASET_RE.fullmatch(dataset_root.name)
+        ):
             continue
         for metadata_path in dataset_root.glob("*/metadata.json"):
             directory = metadata_path.parent
-            if not ATTEMPT_ID_RE.fullmatch(directory.name):
+            if (
+                directory.is_symlink()
+                or metadata_path.is_symlink()
+                or not ATTEMPT_ID_RE.fullmatch(directory.name)
+            ):
                 continue
             try:
                 metadata = json.loads(metadata_path.read_text())
@@ -135,8 +198,12 @@ def find_attempt(archive_root: Path, attempt_id: str) -> tuple[Path, dict[str, A
     if len(matches) != 1:
         raise FileNotFoundError("Attempt was not found")
     metadata_path = matches[0]
+    directory = metadata_path.parent
+    dataset_root = directory.parent
+    if dataset_root.is_symlink() or directory.is_symlink() or metadata_path.is_symlink():
+        raise FileNotFoundError("Attempt archive symlinks are not allowed")
     root = archive_root.resolve()
-    resolved = metadata_path.resolve()
+    resolved = metadata_path.resolve(strict=True)
     try:
         resolved.relative_to(root)
     except ValueError as exc:
@@ -147,7 +214,7 @@ def find_attempt(archive_root: Path, attempt_id: str) -> tuple[Path, dict[str, A
         raise ValueError("Attempt metadata is unreadable") from exc
     if not isinstance(metadata, dict):
         raise ValueError("Attempt metadata is invalid")
-    return resolved.parent, metadata
+    return directory, metadata
 
 
 def update_failure_label(
@@ -155,17 +222,139 @@ def update_failure_label(
     attempt_id: str,
     label: Any,
     note: Any = "",
+    *,
+    expected_revision: Any = None,
 ) -> dict[str, Any]:
     directory, metadata = find_attempt(archive_root, attempt_id)
-    if not (
+    manually_failed = bool(
         metadata.get("disposition") == "failed"
         or metadata.get("operator_disposition") == "failed"
-    ):
-        raise ValueError("Only failed attempts can have a failure label")
+    )
+    already_excluded = bool(
+        metadata.get("archive_complete") is True
+        and metadata.get("training_included") is False
+        and metadata.get("disposition") not in {"kept", "recording"}
+    )
+    if not (manually_failed or already_excluded):
+        raise ValueError(
+            "Only failed or already-excluded attempts can have a failure label"
+        )
+    current_revision = _require_review_revision(metadata, expected_revision)
     normalized, normalized_note = validate_failure_label(label, note)
+    previous = {
+        "disposition": metadata.get("disposition"),
+        "operator_disposition": metadata.get("operator_disposition"),
+        "failure_label": metadata.get("failure_label"),
+        "failure_note": metadata.get("failure_note"),
+        "training_included": metadata.get("training_included"),
+        "training_episode_index": metadata.get("training_episode_index"),
+    }
     metadata["failure_label"] = normalized
     metadata["failure_note"] = normalized_note
-    metadata["label_updated_at"] = utc_now()
+    reviewed_at = _append_review_history(
+        metadata,
+        action="update_failure_label" if manually_failed else "classify_excluded_attempt",
+        previous=previous,
+        label=normalized,
+        note=normalized_note,
+        revision=current_revision + 1,
+    )
+    metadata["label_updated_at"] = reviewed_at
+    atomic_write_json(directory / "metadata.json", metadata)
+    return metadata
+
+
+def mark_kept_attempt_failed(
+    archive_root: Path,
+    attempt_id: str,
+    label: Any,
+    note: Any = "",
+    *,
+    expected_revision: Any = None,
+) -> dict[str, Any]:
+    """Commit the sidecar half of a post-hoc LeRobot exclusion.
+
+    The caller must remove and verify the corresponding physical LeRobot
+    episode first. This function deliberately refuses metadata-only exclusion.
+    """
+
+    directory, metadata = find_attempt(archive_root, attempt_id)
+    if metadata.get("archive_complete") is not True:
+        raise ValueError("Only a completed attempt can be reviewed")
+    if not (
+        metadata.get("disposition") == "kept"
+        and metadata.get("training_included") is True
+        and isinstance(metadata.get("training_episode_index"), int)
+    ):
+        raise ValueError("Attempt is not an included kept LeRobot episode")
+    current_revision = _require_review_revision(metadata, expected_revision)
+    normalized, normalized_note = validate_failure_label(label, note)
+    previous_episode_index = int(metadata["training_episode_index"])
+    previous = {
+        "disposition": metadata.get("disposition"),
+        "operator_disposition": metadata.get("operator_disposition"),
+        "failure_label": metadata.get("failure_label"),
+        "failure_note": metadata.get("failure_note"),
+        "training_included": True,
+        "training_episode_index": previous_episode_index,
+    }
+    metadata.setdefault("recorded_disposition", metadata.get("disposition"))
+    metadata.setdefault(
+        "recorded_operator_disposition", metadata.get("operator_disposition")
+    )
+    metadata["disposition"] = "failed"
+    metadata["operator_disposition"] = "failed"
+    metadata["review_disposition"] = "failed"
+    metadata["failure_label"] = normalized
+    metadata["failure_note"] = normalized_note
+    metadata["training_included"] = False
+    metadata["training_episode_index"] = None
+    metadata["previous_training_episode_index"] = previous_episode_index
+    reviewed_at = _append_review_history(
+        metadata,
+        action="mark_failed_and_exclude_from_lerobot",
+        previous=previous,
+        label=normalized,
+        note=normalized_note,
+        revision=current_revision + 1,
+    )
+    metadata["label_updated_at"] = reviewed_at
+    metadata["training_excluded_at"] = reviewed_at
+    atomic_write_json(directory / "metadata.json", metadata)
+    return metadata
+
+
+def reindex_training_episode(
+    archive_root: Path,
+    attempt_id: str,
+    *,
+    old_index: int,
+    new_index: int,
+    review_attempt_id: str,
+) -> dict[str, Any]:
+    """Update an included attempt after a reviewed episode is compacted out."""
+
+    directory, metadata = find_attempt(archive_root, attempt_id)
+    if not (
+        metadata.get("training_included") is True
+        and metadata.get("training_episode_index") == old_index
+    ):
+        raise ValueError("Attempt-to-LeRobot episode mapping changed during review")
+    changed_at = utc_now()
+    history = metadata.get("training_reindex_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "changed_at": changed_at,
+            "old_index": old_index,
+            "new_index": new_index,
+            "caused_by_review_attempt_id": review_attempt_id,
+        }
+    )
+    metadata["training_reindex_history"] = history
+    metadata["training_episode_index"] = new_index
+    metadata["training_reindexed_at"] = changed_at
     atomic_write_json(directory / "metadata.json", metadata)
     return metadata
 
@@ -182,9 +371,12 @@ def artifact_path(archive_root: Path, attempt_id: str, artifact: str) -> Path:
     if metadata.get("archive_complete") is not True:
         raise FileNotFoundError("Attempt archive is not committed and verified")
     path = directory / filenames[artifact]
+    if directory.is_symlink() or path.is_symlink():
+        raise FileNotFoundError(f"{artifact.title()} artifact symlinks are not allowed")
     try:
         resolved = path.resolve(strict=True)
-        resolved.relative_to(directory.resolve())
+        if resolved.parent != directory.resolve(strict=True):
+            raise FileNotFoundError(f"{artifact.title()} artifact leaves its attempt archive")
     except (OSError, ValueError) as exc:
         raise FileNotFoundError(f"{artifact.title()} artifact is not safely available") from exc
     if not resolved.is_file():

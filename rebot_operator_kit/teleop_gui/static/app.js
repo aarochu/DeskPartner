@@ -10,10 +10,11 @@ const JOINT_LABELS = {
   gripper: "Gripper",
 };
 
-// v3 intentionally resets older saved drafts once so the verified 240 Hz /
-// 2000°/s / 8.4° profile becomes the actual default on upgraded machines.
-const STORAGE_KEY = "rebot.teleop.draft.v3";
+// v4 intentionally resets older saved drafts once so the verified 4x
+// hand-tracking result (240 Hz / 2000°/s / 33.6°) is the actual default.
+const STORAGE_KEY = "rebot.teleop.draft.v4";
 const DEFAULT_PRESET = "hand_tracking";
+const DEFAULT_SPEED_MULTIPLIER = 4;
 
 const elements = {};
 let joints = Object.keys(JOINT_LABELS);
@@ -354,7 +355,7 @@ function updateMultiplierPanel() {
   });
 }
 
-function applySpeedMultiplier(value) {
+function applySpeedMultiplier(value, announce = true) {
   const result = calculateMultiplier(value);
   if (!result) {
     showNotice("Speed multiplier must be from 0.1× to 10×.", "error", 0);
@@ -377,6 +378,7 @@ function applySpeedMultiplier(value) {
   updateMultiplierPanel();
   saveDraft();
 
+  if (!announce) return;
   if (result.limited) {
     const achieved = Math.abs(result.achievedMin - result.achievedMax) < 0.01
       ? formatMultiplier(result.achievedMin)
@@ -769,7 +771,10 @@ async function initialize() {
     joints = presetData.joints || joints;
     presets = presetData.presets || {};
     renderJointFields();
-    if (!loadSavedDraft()) applyPreset(DEFAULT_PRESET, false);
+    if (!loadSavedDraft()) {
+      applyPreset(DEFAULT_PRESET, false);
+      applySpeedMultiplier(DEFAULT_SPEED_MULTIPLIER, false);
+    }
     renderPresets();
     renderStatus(status);
     renderDevices(devices);

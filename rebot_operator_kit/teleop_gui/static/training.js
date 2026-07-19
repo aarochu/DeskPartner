@@ -14,6 +14,10 @@ let latestLog = 0;
 let selectedDataset = "";
 let pollCount = 0;
 let actionPending = false;
+let noticeTimer = null;
+let previousRecordPhase = null;
+const requestedAttemptId = new URLSearchParams(window.location.search).get("attempt_id");
+let requestedAttemptFocused = false;
 
 const fields = {
   task: "task-input", dataset: "dataset-input", episodes: "episodes-input",
@@ -38,10 +42,19 @@ async function api(path, options = {}) {
 
 function showNotice(message, kind = "info", timeout = 0) {
   const notice = $("notice");
+  if (noticeTimer !== null) {
+    window.clearTimeout(noticeTimer);
+    noticeTimer = null;
+  }
   $("notice-text").textContent = message;
   notice.dataset.kind = kind;
   notice.classList.remove("hidden");
-  if (timeout) window.setTimeout(() => notice.classList.add("hidden"), timeout);
+  if (timeout) {
+    noticeTimer = window.setTimeout(() => {
+      notice.classList.add("hidden");
+      noticeTimer = null;
+    }, timeout);
+  }
 }
 
 function number(id) { return Number($(id).value); }
@@ -56,6 +69,10 @@ function config() {
     const element = $(id);
     result[key] = element.type === "checkbox" ? element.checked : (element.type === "number" ? Number(element.value) : element.value.trim());
   });
+  result.episodes = 1;
+  result.resume = latestDatasets.some((item) => (
+    item.name === result.dataset && Number(item.episodes || 0) > 0
+  ));
   result.profile_digest = appliedProfileDigest;
   return result;
 }
@@ -105,9 +122,13 @@ function applyProfileDefaults(profile = latestProfile, announce = false) {
     if (element.type === "checkbox") element.checked = Boolean(defaults[key]);
     else element.value = defaults[key];
   });
+  $("episodes-input").value = 1;
+  $("resume-input").checked = latestDatasets.some((item) => (
+    item.name === $("dataset-input").value.trim() && Number(item.episodes || 0) > 0
+  ));
   $("front-index-label").textContent = defaults.front_camera;
   $("side-index-label").textContent = defaults.side_camera;
-  $("ready-checkbox").checked = false;
+  $("ready-checkbox").checked = true;
   appliedProfileDigest = profile.profile_digest || "";
   updateButtons();
   if (announce) showNotice(`Restored ${profile.profile_id} verified defaults.`, "success", 2400);
@@ -158,18 +179,19 @@ function renderPreflight(preflight) {
   setGate("leader", devices.ok && calibration.leader, calibration.leader ? "Ready" : "Blocked", devices.ports?.leader || devices.error);
   setGate("ports", devices.ok && devices.ports_free, devices.ports_free ? "Free" : "Busy", devices.ports_free ? "Exclusive access available" : "Stop teleop before collecting");
   const report = preflight.camera_report || {};
-  setGate("camera", report.passed, report.passed ? "Passed" : "Blocked", report.checked_at || "Run a fresh check");
+  setGate("camera", true, report.passed ? "Checked" : "Advisory", report.checked_at || "Optional manual check");
   setGate("disk", preflight.disk?.free_bytes >= 5 * 1024 ** 3, formatBytes(preflight.disk?.free_bytes), preflight.disk?.data_root || "—");
   renderCamera("front", report.cameras?.front, report.minimum_fps);
   renderCamera("side", report.cameras?.side, report.minimum_fps);
   $("data-root-footer").textContent = preflight.paths?.data || "—";
+  if (latestStatus?.running) {
+    return;
+  }
   if (!preflight.training_profile?.passed) {
     showNotice(preflight.training_profile?.error || "The calibration/training profile is not verified.", "error", 0);
-  } else if (!report.passed) {
-    showNotice("Recording is blocked until a fresh dual-camera check passes and both snapshots are visually useful.", "error", 0);
   } else if (preflight.ready_to_record) {
     showNotice(
-      "Ready to collect. Put both arms in the exact session-home pose, check readiness, then Start collection will capture those poses as it connects.",
+      "Ready for one manual run. Put both arms in your start pose, then press Start new run.",
       "success",
       5000,
     );
@@ -178,15 +200,27 @@ function renderPreflight(preflight) {
 }
 
 function renderStatus(status) {
+  const oldPhase = previousRecordPhase;
   latestStatus = status;
+  previousRecordPhase = status.record_phase || null;
   if (status.control_token) controlToken = status.control_token;
   $("job-pill").dataset.state = status.state || "READY";
   $("job-state").textContent = status.state || "READY";
-  $("job-kind").textContent = status.kind ? status.kind.replaceAll("_", " ") : "Idle";
+  const phaseLabels = {
+    starting: "Connecting arms",
+    recording: "Recording episode",
+    awaiting_decision: "Waiting for keep / fail",
+    saving_rerun: "Saving Rerun replay",
+    saving_lerobot: "Checkpointing LeRobot",
+    saved_ending: "Saved · disconnecting",
+    paused: "Paused · not recording",
+  };
+  $("job-kind").textContent = phaseLabels[status.record_phase]
+    || (status.kind ? status.kind.replaceAll("_", " ") : "Idle");
   $("job-runtime").textContent = formatDuration(status.runtime_s);
   updateButtons();
   if (status.fault) {
-    const previousJob = !status.running && status.state === "FAULT";
+    const previousJob = !status.running;
     showNotice(
       previousJob
         ? `Previous job ended: ${status.fault}. This saved status does not block a corrected retry.`
@@ -194,6 +228,14 @@ function renderStatus(status) {
       previousJob ? "info" : "error",
       0,
     );
+  } else if (previousRecordPhase !== oldPhase) {
+    if (previousRecordPhase === "saving_rerun") {
+      showNotice("Keep accepted. Saving the two replay videos and Rerun episode now—do not press Stop.", "info", 0);
+    } else if (previousRecordPhase === "saving_lerobot") {
+      showNotice("Replay saved. Writing and fresh-loading the LeRobot checkpoint now—do not press Stop.", "info", 0);
+    } else if (previousRecordPhase === "saved_ending") {
+      showNotice("Run is durable. The process is disconnecting without moving either arm; return both arms manually before Play.", "success", 0);
+    }
   }
 }
 
@@ -201,6 +243,7 @@ function updateButtons() {
   const running = Boolean(latestStatus?.running);
   const recording = running && latestStatus.kind === "record";
   const decisionPending = Boolean(latestStatus?.decision_pending);
+  const paused = latestStatus?.record_phase === "paused";
   const profileCurrent = Boolean(
     latestProfile?.passed
     && latestProfile.profile_digest
@@ -208,8 +251,10 @@ function updateButtons() {
   );
   const ready = Boolean(latestPreflight?.ready_to_record && profileCurrent);
   $("camera-check-button").disabled = running || actionPending;
-  $("start-record-button").disabled = running || actionPending || !ready || !$("ready-checkbox").checked;
-  $("finish-button").disabled = !recording || decisionPending || actionPending;
+  $("start-record-button").disabled = running || actionPending || !ready;
+  $("pause-record-button").disabled = !recording || decisionPending || actionPending;
+  $("pause-record-button").textContent = paused ? "Play / resume" : "Pause";
+  $("finish-stop-button").disabled = !recording || decisionPending || actionPending;
   const failureLabel = $("failure-label-input").value;
   const failureNote = $("failure-note-input").value.trim();
   const failureReady = Boolean(failureLabel && (failureLabel !== "other" || failureNote));
@@ -245,6 +290,11 @@ function setFailureLabelOptions(labels) {
 
 function makeFailureSelect(value) {
   const select = document.createElement("select");
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Choose a failure reason…";
+  placeholder.selected = !value;
+  select.append(placeholder);
   failureLabels.forEach((item) => {
     const option = document.createElement("option");
     option.value = item.value;
@@ -273,9 +323,13 @@ function renderAttempts(payload) {
   latestAttempts.forEach((attempt) => {
     const state = attempt.disposition || "unknown";
     const manuallyFailed = state === "failed" || attempt.operator_disposition === "failed";
+    const includedKept = state === "kept" && attempt.training_included === true;
+    const alreadyExcluded = attempt.training_included === false && state !== "recording";
+    const reviewable = attempt.archive_complete === true && (includedKept || alreadyExcluded);
     const card = document.createElement("article");
     card.className = "attempt-card";
     card.dataset.state = state;
+    card.dataset.attemptId = attempt.attempt_id;
 
     const summary = document.createElement("div");
     summary.className = "attempt-summary";
@@ -291,7 +345,7 @@ function renderAttempts(payload) {
     const included = attempt.training_included ? `training episode ${attempt.training_episode_index}` : "excluded from training";
     meta.textContent = `${attempt.dataset || "—"} · ${attempt.samples || 0} frames · ${Number(attempt.duration_s || 0).toFixed(1)}s · ${included} · ${attempt.started_at || "—"}`;
     summary.append(title, meta);
-    if (manuallyFailed) {
+    if (attempt.failure_label) {
       const label = document.createElement("p");
       label.className = "attempt-label";
       label.textContent = `Failure: ${failureLabelText(attempt.failure_label)}${attempt.failure_note ? ` — ${attempt.failure_note}` : ""}`;
@@ -303,7 +357,7 @@ function renderAttempts(payload) {
       const replay = document.createElement("button");
       replay.type = "button";
       replay.className = "button secondary";
-      replay.textContent = "Replay in Rerun";
+      replay.textContent = "Open Rerun visualization";
       replay.addEventListener("click", () => runAction("Rerun replay failed", async () => {
         await post("/api/training/attempt/replay", { attempt_id: attempt.attempt_id });
         showNotice(`Opening ${attempt.attempt_id} in Rerun.`, "success", 2600);
@@ -323,37 +377,78 @@ function renderAttempts(payload) {
     summary.append(actions);
 
     const edit = document.createElement("div");
-    edit.className = `attempt-edit${manuallyFailed ? "" : " hidden"}`;
-    if (manuallyFailed) {
+    edit.className = `attempt-edit${reviewable ? "" : " hidden"}`;
+    if (reviewable) {
       const select = makeFailureSelect(attempt.failure_label);
       const note = document.createElement("input");
       note.maxLength = 500;
       note.placeholder = "Failure note";
       note.value = attempt.failure_note || "";
       const help = document.createElement("small");
-      help.textContent = "Only failed attempts are labeled. Editing this sidecar never adds the take to training.";
+      help.textContent = includedKept
+        ? "If review shows this take failed or was only a test, it will be removed from LeRobot. Both videos and the Rerun replay remain preserved."
+        : "Save a review reason for this excluded take. Its recorded system outcome and raw files remain preserved.";
       const save = document.createElement("button");
       save.type = "button";
       save.className = "button danger-outline";
-      save.textContent = "Save failure label";
+      save.textContent = includedKept
+        ? "Mark failed & exclude from LeRobot"
+        : (manuallyFailed ? "Update failure label" : "Label excluded attempt");
       save.addEventListener("click", () => runAction("Failure label could not be saved", async () => {
-        await post("/api/training/attempt/label", {
+        if (!select.value) throw new Error("Choose a failure reason first");
+        if (includedKept && !window.confirm(
+          `Mark ${attempt.attempt_id} failed and remove training episode ${attempt.training_episode_index} from LeRobot? The MP4s and Rerun replay will be kept.`,
+        )) return;
+        showNotice(
+          includedKept
+            ? "Reclassifying this finished episode and rebuilding the success-only LeRobot dataset. Keep this page open…"
+            : "Saving the review label…",
+          "info",
+          0,
+        );
+        const result = await post("/api/training/attempt/review", {
           attempt_id: attempt.attempt_id,
+          action: includedKept ? "mark_failed" : "label_excluded",
           failure_label: select.value,
           failure_note: note.value.trim(),
+          expected_revision: Number(attempt.review_revision || 0),
         });
-        renderAttempts(await api("/api/training/attempts"));
-        showNotice("Failure label updated.", "success", 2200);
+        if (result.dataset_empty) $("resume-input").checked = false;
+        const [attempts, datasets] = await Promise.all([
+          api("/api/training/attempts"),
+          api("/api/training/datasets"),
+        ]);
+        renderAttempts(attempts);
+        renderDatasets(datasets.datasets);
+        showNotice(result.message || "Finished-attempt review saved.", "success", 7000);
       }));
       edit.append(select, note, help, save);
     }
     card.append(summary, edit);
     list.append(card);
   });
+  if (requestedAttemptId && !requestedAttemptFocused) {
+    const requested = [...list.querySelectorAll(".attempt-card")].find(
+      (card) => card.dataset.attemptId === requestedAttemptId,
+    );
+    if (requested) {
+      requestedAttemptFocused = true;
+      document.body.classList.add("show-advanced");
+      $("advanced-toggle").textContent = "Simple view";
+      requested.classList.add("requested");
+      window.requestAnimationFrame(() => requested.scrollIntoView({ behavior: "smooth", block: "center" }));
+    }
+  }
 }
 
 function renderDatasets(datasets) {
   latestDatasets = datasets || [];
+  const activeName = $("dataset-input").value.trim();
+  const activeDataset = latestDatasets.find((item) => item.name === activeName);
+  const savedCount = Number(activeDataset?.episodes || 0);
+  $("session-dataset").textContent = activeName;
+  $("session-saved-count").textContent = `${savedCount} run${savedCount === 1 ? "" : "s"}`;
+  $("session-next-run").textContent = `Run ${savedCount + 1}`;
   const list = $("dataset-list");
   list.replaceChildren();
   if (!datasets?.length) {
@@ -362,10 +457,14 @@ function renderDatasets(datasets) {
     empty.textContent = "No recorded datasets yet.";
     list.append(empty);
     selectedDataset = "";
+    $("resume-input").checked = false;
     updateButtons();
     return;
   }
   if (!selectedDataset || !datasets.some((item) => item.name === selectedDataset)) selectedDataset = datasets.at(-1).name;
+  $("resume-input").checked = datasets.some((item) => (
+    item.name === $("dataset-input").value.trim() && Number(item.episodes || 0) > 0
+  ));
   datasets.forEach((item) => {
     const row = document.createElement("button");
     row.type = "button";
@@ -444,6 +543,10 @@ async function runAction(label, action) {
 }
 
 function bind() {
+  $("advanced-toggle").addEventListener("click", () => {
+    document.body.classList.toggle("show-advanced");
+    $("advanced-toggle").textContent = document.body.classList.contains("show-advanced") ? "Simple view" : "Advanced";
+  });
   $("notice-close").addEventListener("click", () => $("notice").classList.add("hidden"));
   $("refresh-button").addEventListener("click", () => runAction("Refresh failed", refreshAll));
   $("restore-defaults-button").addEventListener("click", () => applyProfileDefaults(latestProfile, true));
@@ -458,11 +561,27 @@ function bind() {
   $("start-record-button").addEventListener("click", () => runAction("Collection could not start", async () => {
     renderStatus(await post("/api/training/record/start", config()));
     clearFailureDraft();
-    showNotice("Collection is starting. Keep both arms in the desired home pose until they connect and that pose is captured; then begin teleoperation.", "success", 7500);
+    showNotice("One manual run is starting. Move the can, then Save successful run or discard this run.", "success", 7500);
   }));
-  $("finish-button").addEventListener("click", () => runAction("Episode control failed", async () => {
-    await post("/api/training/record/control", { action: "finish" });
+  $("pause-record-button").addEventListener("click", () => runAction("Pause/play failed", async () => {
+    const action = latestStatus?.record_phase === "paused" ? "play" : "pause";
+    renderStatus(await post("/api/training/record/control", { action }));
+    showNotice(
+      action === "pause"
+        ? "Run paused. No arm commands or dataset frames are being added."
+        : "Run resumed. Arm control and recording are active again.",
+      "info",
+      4500,
+    );
+  }));
+  $("finish-stop-button").addEventListener("click", () => runAction("Episode control failed", async () => {
+    await post("/api/training/record/control", { action: "finish_and_stop" });
     clearFailureDraft();
+    showNotice(
+      "Save accepted. This run is being written to Rerun and LeRobot; it will disconnect without automatic return after the durable save.",
+      "info",
+      0,
+    );
   }));
   $("rerecord-button").addEventListener("click", () => runAction("Episode control failed", async () => {
     const failureLabel = $("failure-label-input").value;
@@ -473,12 +592,13 @@ function bind() {
       failure_note: failureNote,
     });
     clearFailureDraft();
-    showNotice("Failed take is archived and excluded. The follower now returns home automatically; return the passive leader and reset the task objects before the next attempt.", "info", 8500);
+    showNotice("Failed run is archived and excluded. The process will end without moving either arm; return both arms manually, then press Start new run.", "info", 8500);
   }));
   $("stop-record-button").addEventListener("click", () => runAction("Stop failed", async () => {
+    if (!window.confirm("Discard the current take? It will be archived for review but will NOT be added to LeRobot.")) return;
     await post("/api/training/record/control", { action: "stop" });
     clearFailureDraft();
-    showNotice("Stop requested. The partial take is being archived as aborted and excluded from training; saved episodes are finalizing.", "info", 9000);
+    showNotice("Discard requested. This run will be archived, excluded, and disconnected without automatic return. Earlier saved episodes remain unchanged.", "info", 9000);
   }));
   $("validate-button").addEventListener("click", () => runAction("Validation could not start", async () => {
     renderStatus(await post("/api/training/validate", { dataset: selectedDataset, minimum_episodes: number("minimum-episodes-input") }));
@@ -510,6 +630,20 @@ function bind() {
   $("failure-label-input").addEventListener("change", updateButtons);
   $("failure-note-input").addEventListener("input", updateButtons);
   Object.values(fields).forEach((id) => $(id).addEventListener("input", updateButtons));
+  document.addEventListener("keydown", (event) => {
+    if (["INPUT", "SELECT", "TEXTAREA", "BUTTON", "A", "VIDEO"].includes(document.activeElement?.tagName)) return;
+    const recording = Boolean(latestStatus?.running && latestStatus.kind === "record");
+    if (event.code === "Space" && recording && !$("pause-record-button").disabled) {
+      event.preventDefault();
+      $("pause-record-button").click();
+    } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && recording && !$("finish-stop-button").disabled) {
+      event.preventDefault();
+      $("finish-stop-button").click();
+    } else if (event.key === "Escape" && recording && !$("stop-record-button").disabled) {
+      event.preventDefault();
+      $("stop-record-button").click();
+    }
+  });
 }
 
 async function poll() {

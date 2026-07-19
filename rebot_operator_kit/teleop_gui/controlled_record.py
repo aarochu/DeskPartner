@@ -23,17 +23,21 @@ from __future__ import annotations
 
 import argparse
 import av
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
 import math
 import numbers
+import os
 from pathlib import Path
 import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -70,6 +74,16 @@ from lerobot_teleoperator_rebot_arm_102 import (
 )
 
 
+# Manual collection never lets camera-age telemetry stop arm control. The
+# operator explicitly starts, judges, saves, and ends each take. We still log
+# frame age for later review, but reuse the latest available frame regardless
+# of age or producer-thread state. A camera that has never produced any frame
+# remains a functional error because a valid two-camera LeRobot sample cannot
+# be constructed without an image.
+CAMERA_FRESH_REFERENCE_MS = 250.0
+CAMERA_FALLBACK_READ_MAX_AGE_MS = 86_400_000
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--follower-port", required=True)
@@ -89,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--leader-implementation", type=Path, required=True)
     parser.add_argument("--task", required=True)
     parser.add_argument("--episodes", type=int, required=True)
-    parser.add_argument("--episode-time-s", type=float, default=30.0)
+    parser.add_argument("--episode-time-s", type=float, default=1000.0)
     parser.add_argument("--reset-time-s", type=float, default=20.0)
     parser.add_argument("--control-hz", type=int, default=240)
     parser.add_argument("--dataset-fps", type=int, default=30)
@@ -100,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side-width", type=int, default=1280)
     parser.add_argument("--side-height", type=int, default=720)
     parser.add_argument("--excluded-camera", type=int, required=True)
-    parser.add_argument("--max-step", type=float, default=8.4)
+    parser.add_argument("--max-step", type=float, default=33.6)
     parser.add_argument("--motor-velocity", type=float, default=2000.0)
     parser.add_argument("--gripper-force", type=float, default=0.05)
     parser.add_argument("--resume", action="store_true")
@@ -338,7 +352,18 @@ def write_profile_sidecar(
 
 
 RERUN_VIEWER_PORT = 9876
-RERUN_NATIVE_BIN = Path(rr.__file__).resolve().parents[1] / "rerun_cli" / "rerun"
+_RERUN_CLI_ROOT = Path(rr.__file__).resolve().parents[1] / "rerun_cli"
+RERUN_NATIVE_BIN = next(
+    (
+        candidate
+        for candidate in (
+            _RERUN_CLI_ROOT / "rerun",
+            _RERUN_CLI_ROOT / "Rerun.app" / "Contents" / "MacOS" / "Rerun",
+        )
+        if candidate.is_file()
+    ),
+    _RERUN_CLI_ROOT / "rerun",
+)
 
 
 def read_control_decision(args: argparse.Namespace, expected_action: str) -> dict[str, Any]:
@@ -353,6 +378,51 @@ def read_control_decision(args: argparse.Namespace, expected_action: str) -> dic
     return payload
 
 
+def consume_published_decision(
+    control_file: Path,
+    events: dict[str, bool],
+    last_sequence: int | None,
+) -> int | None:
+    """Consume an atomic browser decision without relying solely on signals.
+
+    POSIX signals remain the low-latency wakeup, while the atomic control file
+    is the durable source of truth for Finish, Re-record, and an unopposed Stop.
+    Polling it closes the gap if a supervisor is briefly unable to forward a
+    signal.
+    """
+
+    try:
+        payload = json.loads(control_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return last_sequence
+    if not isinstance(payload, dict):
+        return last_sequence
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, int) or sequence == last_sequence:
+        return last_sequence
+    action = payload.get("action")
+    if action in {"finish", "finish_and_stop"}:
+        events["finish"] = True
+        print(f"GUI_EVENT {action} source=control_file", flush=True)
+    elif action == "rerecord":
+        events["rerecord"] = True
+        events["finish"] = True
+        print("GUI_EVENT rerecord_current_episode source=control_file", flush=True)
+    elif action == "stop":
+        events["stop"] = True
+        events["finish"] = True
+        print("GUI_EVENT stop_and_finalize source=control_file", flush=True)
+    elif action == "pause":
+        events["paused"] = True
+        print("GUI_EVENT pause_manual_run source=control_file", flush=True)
+    elif action == "play":
+        events["paused"] = False
+        print("GUI_EVENT resume_manual_run source=control_file", flush=True)
+    else:
+        return last_sequence
+    return sequence
+
+
 def resolve_attempt_disposition(
     events: dict[str, bool],
     published_action: str | None,
@@ -361,7 +431,7 @@ def resolve_attempt_disposition(
 
     if events.get("rerecord") or published_action == "rerecord":
         return "failed"
-    if events.get("stop") and published_action != "finish":
+    if events.get("stop") and published_action not in {"finish", "finish_and_stop"}:
         return "aborted"
     return "kept"
 
@@ -369,15 +439,41 @@ def resolve_attempt_disposition(
 def start_rerun_viewer(enabled: bool) -> bool:
     if not enabled:
         return False
+
+    def viewer_ready() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", RERUN_VIEWER_PORT), timeout=0.2):
+                return True
+        except OSError:
+            return False
+
+    if viewer_ready():
+        return True
     try:
         rr.init("rebot_training_collection")
-        rr.spawn(
-            connect=False,
-            port=RERUN_VIEWER_PORT,
-            memory_limit="10%",
-            detach_process=True,
+        # Do not use rr.spawn here. A detached viewer inherits the collector's
+        # stdout pipe, which prevents owned_process.py and the GUI from seeing
+        # EOF after the robot has already saved and disconnected.
+        subprocess.Popen(
+            [
+                str(RERUN_NATIVE_BIN),
+                f"--port={RERUN_VIEWER_PORT}",
+                "--memory-limit=10%",
+                "--server-memory-limit=0B",
+                "--expect-data-soon",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
-        return True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if viewer_ready():
+                return True
+            time.sleep(0.05)
+        raise RuntimeError("Rerun viewer did not open its local port")
     except Exception as exc:
         logging.warning("Rerun viewer could not start; attempt RRD files will still be saved: %s", exc)
         return False
@@ -598,6 +694,73 @@ def buffered_sample_count(dataset: LeRobotDataset) -> int:
     return int(buffer.get("size", 0))
 
 
+def quarantine_stale_candidate_frames(
+    dataset: LeRobotDataset,
+    attempt_root: Path,
+    dataset_name: str,
+    candidate_episode_index: int,
+) -> dict[str, Any] | None:
+    """Move leftover PNGs away before reusing an unsaved episode index.
+
+    A failed encoder can leave one camera directory behind after the in-memory
+    episode buffer is released.  The next take would otherwise append to that
+    same ``episode-N`` directory and silently mix two physical attempts.  This
+    guard is deliberately recoverable: it moves every leftover camera
+    directory into an audit quarantine and never deletes recorded frames.
+    """
+
+    dataset._wait_image_writer()
+    stale_sources = {
+        camera_key: dataset._get_image_file_dir(candidate_episode_index, camera_key)
+        for camera_key in dataset.meta.camera_keys
+    }
+    stale_sources = {
+        camera_key: source
+        for camera_key, source in stale_sources.items()
+        if source.exists()
+    }
+    if not stale_sources:
+        return None
+    for source in stale_sources.values():
+        if not source.is_dir() or source.is_symlink():
+            raise RuntimeError(f"Unsafe stale camera-frame path: {source}")
+
+    quarantine_id = new_attempt_id()
+    quarantine = attempt_root / dataset_name / "_stale_frame_quarantine" / quarantine_id
+    quarantine.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "quarantine_id": quarantine_id,
+        "dataset": dataset_name,
+        "candidate_episode_index": candidate_episode_index,
+        "quarantined_at": utc_now(),
+        "reason": "stale camera frames existed before a new attempt",
+        "camera_directories": {},
+        "complete": False,
+    }
+    atomic_write_json(quarantine / "manifest.json", manifest)
+    try:
+        for camera_key, source in stale_sources.items():
+            destination = quarantine / camera_key.replace(".", "_")
+            if destination.exists():
+                raise RuntimeError(f"Stale-frame quarantine destination exists: {destination}")
+            source.replace(destination)
+            manifest["camera_directories"][camera_key] = {
+                "path": str(destination.relative_to(quarantine)),
+                "png_frames": len(list(destination.glob("*.png"))),
+            }
+            atomic_write_json(quarantine / "manifest.json", manifest)
+    except Exception as exc:
+        manifest["error"] = str(exc)
+        atomic_write_json(quarantine / "manifest.json", manifest)
+        raise RuntimeError(
+            "Could not isolate stale frames from the prior attempt; refusing to record"
+        ) from exc
+    manifest["complete"] = True
+    atomic_write_json(quarantine / "manifest.json", manifest)
+    return manifest
+
+
 def _camera_artifact_name(camera_key: str) -> str:
     suffix = camera_key.rsplit(".", 1)[-1]
     names = {"front": "overhead.mp4", "side": "wrist.mp4"}
@@ -663,6 +826,101 @@ def archive_attempt_videos(
     for partial, destination in pending:
         partial.replace(destination)
     return artifacts
+
+
+@contextmanager
+def reuse_attempt_videos_for_lerobot(
+    dataset: LeRobotDataset,
+    directory: Path,
+):
+    """Hand verified attempt MP4s to LeRobot instead of encoding them twice.
+
+    ``finalize_attempt_archive`` has already encoded and frame-checked one MP4
+    per camera.  LeRobot normally encodes the same PNG directories again in
+    ``save_episode``.  Temporarily replace that encoder with a hard-link (or a
+    copy when links are unavailable) to the verified archive video.  LeRobot
+    is then free to move/concatenate its private link while the replay archive
+    remains immutable beside ``attempt.rrd``.
+    """
+
+    original_encoder = dataset._encode_temporary_episode_video
+    expected_keys = set(dataset.meta.video_keys)
+    handed_off: set[str] = set()
+
+    def archived_video(video_key: str, episode_index: int) -> Path:
+        if video_key not in expected_keys:
+            raise RuntimeError(f"Unexpected LeRobot video key: {video_key}")
+        source = directory / _camera_artifact_name(video_key)
+        if not source.is_file() or source.stat().st_size <= 0:
+            raise RuntimeError(f"Verified attempt video is missing: {source}")
+
+        temporary_dir = Path(
+            tempfile.mkdtemp(prefix=".rebot-video-handoff-", dir=dataset.root)
+        )
+        temporary_video = temporary_dir / f"episode-{episode_index:06d}.mp4"
+        try:
+            os.link(source, temporary_video)
+        except OSError:
+            shutil.copy2(source, temporary_video)
+
+        # This mirrors LeRobot's normal encoder worker: after the encoded
+        # video exists, its temporary source PNGs are no longer needed.
+        frame_directory = dataset._get_image_file_dir(episode_index, video_key)
+        if frame_directory.is_dir():
+            shutil.rmtree(frame_directory)
+        handed_off.add(video_key)
+        return temporary_video
+
+    dataset._encode_temporary_episode_video = archived_video  # type: ignore[method-assign]
+    try:
+        yield
+        if handed_off != expected_keys:
+            missing = sorted(expected_keys - handed_off)
+            raise RuntimeError(f"LeRobot did not consume archived camera videos: {missing}")
+    finally:
+        dataset._encode_temporary_episode_video = original_encoder  # type: ignore[method-assign]
+
+
+def checkpoint_and_reopen_dataset(
+    dataset: LeRobotDataset,
+    *,
+    expected_episode_index: int,
+) -> LeRobotDataset:
+    """Finalize one episode and prove a fresh LeRobot loader can read it.
+
+    Reusing a finalized dataset object would reopen and overwrite its last
+    parquet file.  A fresh object intentionally advances to new parquet/video
+    files, so every subsequent attempt stays independently durable.
+    """
+
+    expected_episodes = expected_episode_index + 1
+    expected_frames = int(dataset.meta.total_frames)
+    expected_fps = int(dataset.fps)
+    expected_video_keys = set(dataset.meta.video_keys)
+    dataset._wait_image_writer()
+    dataset.stop_image_writer()
+    dataset.finalize()
+
+    reopened = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        batch_encoding_size=1,
+        vcodec=dataset.vcodec,
+    )
+    if reopened.num_episodes != expected_episodes:
+        raise RuntimeError(
+            "LeRobot durability check failed: "
+            f"fresh loader sees {reopened.num_episodes} episodes, expected {expected_episodes}"
+        )
+    if reopened.num_frames != expected_frames:
+        raise RuntimeError(
+            "LeRobot durability check failed: "
+            f"fresh loader sees {reopened.num_frames} frames, expected {expected_frames}"
+        )
+    if reopened.fps != expected_fps or set(reopened.meta.video_keys) != expected_video_keys:
+        raise RuntimeError("LeRobot durability check failed: reopened schema does not match")
+    reopened.start_image_writer(num_processes=0, num_threads=8)
+    return reopened
 
 
 def verify_and_commit_rerun(directory: Path) -> Path:
@@ -858,6 +1116,8 @@ def mark_attempt_in_training(directory: Path, episode_index: int) -> None:
     metadata["training_included"] = True
     metadata["training_episode_index"] = episode_index
     metadata["training_saved_at"] = utc_now()
+    metadata["training_commit_state"] = "durable"
+    metadata["lerobot_fresh_load_verified"] = True
     atomic_write_json(path, metadata)
 
 
@@ -977,7 +1237,7 @@ class RecoverySafeVideoEncodingManager(VideoEncodingManager):
 
 
 def install_signal_controls() -> dict[str, bool]:
-    events = {"finish": False, "rerecord": False, "stop": False}
+    events = {"finish": False, "rerecord": False, "stop": False, "paused": False}
 
     def finish(_signum: int, _frame: Any) -> None:
         events["finish"] = True
@@ -1102,16 +1362,10 @@ def make_dataset(
             raise RuntimeError(
                 f"Resume FPS mismatch: dataset={dataset.fps}, requested={args.dataset_fps}"
             )
-        # Shapes are tuples before JSON serialization and lists after loading an
-        # existing dataset. Compare the semantic schema, not the container type.
-        def canonical_schema(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {key: canonical_schema(item) for key, item in sorted(value.items())}
-            if isinstance(value, (list, tuple)):
-                return [canonical_schema(item) for item in value]
-            return value
-
-        if canonical_schema(dataset.features) != canonical_schema(features):
+        expected_features = {**features, **DEFAULT_FEATURES}
+        if semantic_feature_schema(dataset.features) != semantic_feature_schema(
+            expected_features
+        ):
             raise RuntimeError("Resume feature schema does not match the connected ReBot/cameras")
         dataset.start_image_writer(num_processes=0, num_threads=8)
         return dataset
@@ -1127,6 +1381,33 @@ def make_dataset(
         batch_encoding_size=1,
         vcodec="h264",
     )
+
+
+def semantic_feature_schema(features: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Normalize the stable schema fields used to authorize dataset resume.
+
+    A fresh dataset declaration omits LeRobot-owned index fields and encoded
+    video metadata.  A loaded dataset contains both.  Resume must compare the
+    complete learning plus LeRobot-owned dtype/shape/name contract while
+    ignoring derived codec details such as pix_fmt and has_audio.
+    """
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in sorted(value.items())}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        return value
+
+    return {
+        key: canonical(
+            {
+                field: feature.get(field)
+                for field in ("dtype", "shape", "names")
+            }
+        )
+        for key, feature in sorted(features.items())
+    }
 
 
 def build_training_frame(
@@ -1159,7 +1440,6 @@ HOME_FOLLOWER_TOLERANCE_DEG = 2.0
 HOME_GRIPPER_TOLERANCE_DEG = 5.0
 HOME_LEADER_MIN_TOLERANCE_DEG = 1.0
 HOME_SETTLE_TIME_S = 0.25
-HOME_ALIGNMENT_GRACE_S = 30.0
 
 
 def _joint_positions(
@@ -1170,6 +1450,126 @@ def _joint_positions(
     if missing:
         raise RuntimeError("Joint position snapshot is missing: " + ", ".join(missing))
     return {name: float(values[name]) for name in feature_names}
+
+
+def read_follower_joint_observation(robot: SeeedB601DMFollower) -> dict[str, float]:
+    """Read follower motor state without waiting on either 30 FPS camera.
+
+    The follower driver's public ``get_observation`` also consumes a new frame
+    from every camera. Calling it in the control loop therefore caps teleop at
+    camera FPS. This motor-only read preserves the driver's feedback/error
+    contract while letting the requested control clock run independently.
+    """
+
+    # Preserve the generic Robot protocol for simulations/test doubles. The
+    # locked B601 runtime always takes the motor-only path below.
+    if not hasattr(robot, "motors") or not hasattr(robot, "bus"):
+        return {
+            key: float(value)
+            for key, value in robot.get_observation().items()
+            if key.endswith((".pos", ".vel", ".torque"))
+        }
+
+    for motor in robot.motors.values():
+        motor.request_feedback()
+    try:
+        robot.bus.poll_feedback_once()
+    except Exception as exc:
+        raise RuntimeError("Follower feedback poll failed; teleoperation stopped.") from exc
+
+    observation: dict[str, float] = {}
+    for motor_name, motor in robot.motors.items():
+        state = motor.get_state()
+        if state is None:
+            raise RuntimeError(
+                f"Follower motor {motor_name!r} has no feedback; teleoperation stopped."
+            )
+        observation[f"{motor_name}.pos"] = math.degrees(state.pos)
+        observation[f"{motor_name}.vel"] = math.degrees(state.vel)
+        observation[f"{motor_name}.torque"] = float(state.torq)
+    return observation
+
+
+def _camera_frame_age_ms(camera: Any) -> float | None:
+    timestamp = getattr(camera, "latest_timestamp", None)
+    if not isinstance(timestamp, numbers.Real) or isinstance(timestamp, bool):
+        return None
+    return max(0.0, (time.perf_counter() - float(timestamp)) * 1e3)
+
+
+def _camera_freshness_entry(telemetry: dict[str, Any], camera_key: str) -> dict[str, Any]:
+    return telemetry.setdefault(
+        camera_key,
+        {
+            "mode": "manual_unchecked",
+            "age_enforced": False,
+            "fresh_reference_ms": CAMERA_FRESH_REFERENCE_MS,
+            "sample_attempts": 0,
+            "fresh_samples": 0,
+            "stale_samples_accepted": 0,
+            "last_age_ms": None,
+            "max_age_ms_seen": 0.0,
+            "status": "waiting_for_sample",
+        },
+    )
+
+
+def read_latest_camera_observation(
+    robot: SeeedB601DMFollower,
+    freshness_telemetry: dict[str, Any] | None = None,
+) -> dict[str, np.ndarray]:
+    """Peek at camera buffers without waiting or enforcing frame age."""
+
+    telemetry = freshness_telemetry if freshness_telemetry is not None else {}
+    observation: dict[str, np.ndarray] = {}
+    for camera_key, camera in robot.cameras.items():
+        entry = _camera_freshness_entry(telemetry, camera_key)
+        entry["sample_attempts"] += 1
+        frame = None
+        frame_lock = getattr(camera, "frame_lock", None)
+        if frame_lock is not None and hasattr(camera, "latest_frame"):
+            # OpenCVCamera.read_latest also rejects a stopped producer thread
+            # and old timestamps. Manual mode deliberately bypasses those
+            # health gates while retaining the latest buffer for this take.
+            with frame_lock:
+                frame = getattr(camera, "latest_frame", None)
+        else:
+            # Compatibility path for test doubles and alternative cameras.
+            # This remains nonblocking and effectively disables age rejection.
+            frame = camera.read_latest(max_age_ms=CAMERA_FALLBACK_READ_MAX_AGE_MS)
+        if frame is None:
+            entry["status"] = "no_frame_available"
+            entry["error"] = f"{camera_key} has not produced an image"
+            raise RuntimeError(entry["error"])
+
+        age_ms = _camera_frame_age_ms(camera)
+        if age_ms is None:
+            entry["fresh_samples"] += 1
+            entry["status"] = "accepted_age_unknown"
+            observation[camera_key] = frame
+            continue
+
+        entry["last_age_ms"] = round(age_ms, 3)
+        entry["max_age_ms_seen"] = round(
+            max(float(entry["max_age_ms_seen"]), age_ms), 3
+        )
+        if age_ms <= CAMERA_FRESH_REFERENCE_MS:
+            entry["fresh_samples"] += 1
+            entry["status"] = "fresh"
+            entry.pop("error", None)
+        else:
+            entry["stale_samples_accepted"] += 1
+            entry["status"] = "stale_frame_accepted_manual_mode"
+            stale_count = int(entry["stale_samples_accepted"])
+            if stale_count == 1 or stale_count % 30 == 0:
+                print(
+                    f"CAMERA_FRESHNESS key={camera_key} "
+                    f"status=stale_frame_accepted_manual_mode age_ms={age_ms:.1f} "
+                    f"accepted_samples={stale_count}",
+                    flush=True,
+                )
+        observation[camera_key] = frame
+    return observation
 
 
 def _physical_positions_to_follower_input(
@@ -1190,10 +1590,13 @@ def capture_session_home(
     robot: SeeedB601DMFollower,
     leader: RebotArm102Leader,
 ) -> dict[str, Any]:
-    """Capture the stationary pose that this collection session returns to."""
+    """Capture the operator-selected start pose for audit metadata only."""
 
     feature_names = list(robot.action_features)
-    follower_positions = _joint_positions(robot.get_observation(), feature_names)
+    follower_positions = _joint_positions(
+        read_follower_joint_observation(robot),
+        feature_names,
+    )
     leader_positions = _joint_positions(leader.get_action(), feature_names)
     follower_input = _physical_positions_to_follower_input(robot, follower_positions)
     leader_tolerances: dict[str, float] = {}
@@ -1214,6 +1617,8 @@ def capture_session_home(
     return {
         "captured_at": utc_now(),
         "capture_event": "collection_process_connected_before_first_attempt",
+        "return_policy": "manual_operator_return_after_process_exit",
+        "automatic_return": False,
         "follower_positions_deg": follower_positions,
         "follower_input_deg": follower_input,
         "leader_positions_deg": leader_positions,
@@ -1259,10 +1664,6 @@ def automatic_reset_to_session_home(
     next_control = started
     stable_since: float | None = None
     last_status = started - 1.0
-    hard_deadline_s = max(
-        float(args.reset_time_s) + HOME_ALIGNMENT_GRACE_S,
-        HOME_ALIGNMENT_GRACE_S,
-    )
     loops = 0
 
     print(
@@ -1275,7 +1676,10 @@ def automatic_reset_to_session_home(
             print("RESET auto_home interrupted_by_stop", flush=True)
             return None
 
-        observation = _joint_positions(robot.get_observation(), feature_names)
+        observation = _joint_positions(
+            read_follower_joint_observation(robot),
+            feature_names,
+        )
         intermediate_physical = {
             name: observation[name]
             + max(
@@ -1323,12 +1727,6 @@ def automatic_reset_to_session_home(
             )
             return result
 
-        if elapsed >= hard_deadline_s:
-            raise RuntimeError(
-                "Automatic reset did not reach the captured session pose; "
-                "collection stopped before another attempt could start"
-            )
-
         if now - last_status >= 1.0:
             follower_delta = max(
                 abs(observation[name] - follower_target[name]) for name in feature_names
@@ -1347,7 +1745,8 @@ def automatic_reset_to_session_home(
                 f"RESET auto_home elapsed={elapsed:.1f}s "
                 f"follower_delta={follower_delta:.1f}deg "
                 f"leader_delta={leader_delta:.1f}deg "
-                f"waiting_for={'+'.join(waiting_for) or 'settle'}",
+                f"waiting_for={'+'.join(waiting_for) or 'settle'} "
+                f"waiting_for_operator={str(not leader_aligned).lower()}",
                 flush=True,
             )
             last_status = now
@@ -1370,6 +1769,7 @@ def control_segment(
     task: str,
     rerun_writer: AttemptRerunWriter | None = None,
     sample_offset: int = 0,
+    camera_freshness: dict[str, Any] | None = None,
 ) -> tuple[int, float]:
     control_period = 1.0 / args.control_hz
     sample_period = 1.0 / args.dataset_fps
@@ -1381,13 +1781,26 @@ def control_segment(
     status_started = started
     status_loops = 0
     minimum_free_bytes = 5 * 1024**3
+    next_decision_poll = started
+    last_decision_sequence: int | None = None
 
     while time.perf_counter() - started < duration_s:
+        now = time.perf_counter()
+        if record and now >= next_decision_poll:
+            last_decision_sequence = consume_published_decision(
+                args.control_file,
+                events,
+                last_decision_sequence,
+            )
+            next_decision_poll = now + 0.05
         if events["finish"] or events["stop"]:
             break
+        if events.get("paused"):
+            precise_sleep(0.02)
+            continue
         loop_started = time.perf_counter()
         try:
-            observation = robot.get_observation()
+            joint_observation = read_follower_joint_observation(robot)
             leader_action = leader.get_action()
             sent_action = robot.send_action(leader_action)
         except Exception:
@@ -1404,6 +1817,10 @@ def control_segment(
         status_loops += 1
 
         if record and now + 1e-9 >= next_sample:
+            observation = {
+                **joint_observation,
+                **read_latest_camera_observation(robot, camera_freshness),
+            }
             # The learning target is the exact follower-space action after directions,
             # limits, and per-tick clipping—not the raw leader command.
             # LeRobot adds frame_index and the exact frame_index / dataset_fps
@@ -1449,6 +1866,10 @@ def control_segment(
 
 def main() -> int:
     args = parse_args()
+    # Manual-cycle contract: one process owns exactly one physical take. Saving,
+    # failing, or discarding always ends the process; the operator returns both
+    # arms and explicitly starts the next take from the GUI.
+    args.episodes = 1
     init_logging()
     profile = verify_profile_lock(args)
     contract = verify_collection_contract(args)
@@ -1467,8 +1888,7 @@ def main() -> int:
             raise RuntimeError("Locked calibration did not load; refusing to collect")
         session_home = capture_session_home(robot, leader)
         print(
-            "SESSION home_captured joints=7 "
-            f"return_speed={session_home['return_speed_deg_s']:g}deg_s",
+            "SESSION manual_start_pose_captured joints=7 automatic_return=false",
             flush=True,
         )
         dataset = make_dataset(args, robot, action_processor, observation_processor)
@@ -1485,9 +1905,22 @@ def main() -> int:
 
         completed_this_run = 0
         attempt_number = 0
-        with RecoverySafeVideoEncodingManager(dataset):
+        with RecoverySafeVideoEncodingManager(dataset) as encoding_manager:
             while completed_this_run < args.episodes and not events["stop"]:
                 episode_index = dataset.num_episodes
+                quarantine = quarantine_stale_candidate_frames(
+                    dataset,
+                    args.attempt_root,
+                    args.dataset_root.name,
+                    episode_index,
+                )
+                if quarantine is not None:
+                    print(
+                        "RECOVERY stale_candidate_frames_quarantined "
+                        f"id={quarantine['quarantine_id']} episode={episode_index} "
+                        f"cameras={len(quarantine['camera_directories'])}",
+                        flush=True,
+                    )
                 attempt_number += 1
                 events["finish"] = False
                 events["rerecord"] = False
@@ -1513,6 +1946,8 @@ def main() -> int:
                     },
                 )
                 rerun_writer = AttemptRerunWriter(attempt_recording, args.dataset_fps)
+                camera_freshness: dict[str, Any] = {}
+                metadata["camera_freshness"] = camera_freshness
                 attempt_started = time.perf_counter()
                 samples = 0
                 measured_rates: list[float] = []
@@ -1534,6 +1969,7 @@ def main() -> int:
                         task=args.task,
                         rerun_writer=rerun_writer,
                         sample_offset=samples,
+                        camera_freshness=camera_freshness,
                     )
                     samples += segment_samples
                     measured_rates.append(actual_hz)
@@ -1609,26 +2045,17 @@ def main() -> int:
                             f"label={failure_label} training_included=false",
                             flush=True,
                         )
-                        if events["stop"]:
-                            print("SESSION stop_after_failed_attempt", flush=True)
-                            break
-                        events["finish"] = False
-                        events["rerecord"] = False
-                        home_result = automatic_reset_to_session_home(
-                            args=args,
-                            robot=robot,
-                            leader=leader,
-                            events=events,
-                            session_home=session_home,
+                        print(
+                            "SESSION manual_cycle_failed_take_complete "
+                            "automatic_return=false start_next_run_manually=true",
+                            flush=True,
                         )
-                        if events["stop"]:
-                            print("SESSION stop_requested_during_reset", flush=True)
-                            break
-                        if home_result is not None:
-                            mark_attempt_home_return(directory, home_result)
-                        continue
+                        break
 
-                    read_control_decision(args, "finish")
+                    read_control_decision(
+                        args,
+                        "finish_and_stop" if published_action == "finish_and_stop" else "finish",
+                    )
                     minimum_samples = max(2, int(args.dataset_fps * 1.0))
                     if samples < minimum_samples:
                         finalize_attempt_archive(
@@ -1651,6 +2078,11 @@ def main() -> int:
                             "archived but excluded from training"
                         )
 
+                    print(
+                        f"ATTEMPT save_started id={metadata['attempt_id']} "
+                        "phase=rerun_and_attempt_videos",
+                        flush=True,
+                    )
                     finalize_attempt_archive(
                         dataset=dataset,
                         directory=directory,
@@ -1662,19 +2094,54 @@ def main() -> int:
                         duration_s=duration_s,
                         actual_hz=mean_hz,
                     )
-                    dataset.save_episode(parallel_encoding=False)
+                    print(
+                        f"ATTEMPT save_phase id={metadata['attempt_id']} phase=lerobot",
+                        flush=True,
+                    )
+                    with reuse_attempt_videos_for_lerobot(dataset, directory):
+                        dataset.save_episode(parallel_encoding=False)
+                    dataset = checkpoint_and_reopen_dataset(
+                        dataset,
+                        expected_episode_index=episode_index,
+                    )
+                    encoding_manager.dataset = dataset
                     dataset_save_completed = True
                     mark_attempt_in_training(directory, episode_index)
                     completed_this_run += 1
+                    print(
+                        f"ATTEMPT lerobot_durable id={metadata['attempt_id']} "
+                        f"episode={episode_index} total_episodes={dataset.num_episodes}",
+                        flush=True,
+                    )
                     print(
                         f"ATTEMPT archived_kept id={metadata['attempt_id']} "
                         f"episode={episode_index} samples={samples} control_hz={mean_hz:.1f} "
                         "training_included=true",
                         flush=True,
                     )
-                    if events["stop"]:
-                        print("SESSION stop_after_kept_attempt", flush=True)
-                        break
+                    stale_cameras = {
+                        key: value
+                        for key, value in camera_freshness.items()
+                        if int(value.get("stale_samples_accepted", 0)) > 0
+                    }
+                    if stale_cameras:
+                        summary = ",".join(
+                            f"{key}:{value.get('stale_samples_accepted', 0)}samples/"
+                            f"max{value.get('max_age_ms_seen', 0)}ms"
+                            for key, value in sorted(stale_cameras.items())
+                        )
+                        print(
+                            "WARNING manual_camera_staleness_was_accepted "
+                            f"id={metadata['attempt_id']} cameras={summary} "
+                            "operator_review_required=true",
+                            flush=True,
+                        )
+                    print(
+                        "SESSION manual_cycle_saved_and_ending automatic_return=false "
+                        "start_next_run_manually=true",
+                        flush=True,
+                    )
+                    break
                 except KeyboardInterrupt:
                     if metadata.get("disposition") == "recording":
                         finalize_attempt_archive(
@@ -1740,23 +2207,6 @@ def main() -> int:
                     if dataset.episode_buffer and dataset.episode_buffer.get("size", 0) > 0:
                         release_unsaved_attempt_after_archive(dataset, directory, metadata)
                     raise
-
-                events["finish"] = False
-                home_result = automatic_reset_to_session_home(
-                    args=args,
-                    robot=robot,
-                    leader=leader,
-                    events=events,
-                    session_home=session_home,
-                )
-                if events["stop"]:
-                    print("SESSION stop_requested_during_reset", flush=True)
-                    break
-                if home_result is not None:
-                    mark_attempt_home_return(directory, home_result)
-                if completed_this_run >= args.episodes:
-                    break
-
         print(
             f"SESSION complete added_episodes={completed_this_run} total_episodes={dataset.num_episodes}",
             flush=True,
