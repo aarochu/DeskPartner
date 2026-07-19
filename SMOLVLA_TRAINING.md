@@ -6,6 +6,13 @@ separately on Modal.
 
 Verified working on an Apple Silicon Mac (MPS) on 2026-07-18.
 
+**Fine-tune, don't train from scratch.** We warm-start from the pretrained
+`lerobot/smolvla_base` checkpoint — a SmolVLA that already knows how to move an
+arm — and adapt it to our data. This matches the official hackathon recipe
+("warm-start from the SO-101 base"). Training from scratch (`--policy.type=smolvla`)
+will not learn a usable policy on ~150 episodes, so we always pass
+`--policy.path=lerobot/smolvla_base` instead.
+
 ---
 
 ## One-time setup
@@ -43,7 +50,7 @@ needed. Leave this flag out and training fails at the first batch.
 
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
-  --policy.type=smolvla \
+  --policy.path=lerobot/smolvla_base \
   --dataset.repo_id=<DATASET_REPO_ID> \
   --dataset.video_backend=pyav \
   --policy.device=mps \
@@ -71,7 +78,7 @@ public SmolVLA example dataset:
 
 ```bash
 HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
-  --policy.type=smolvla \
+  --policy.path=lerobot/smolvla_base \
   --dataset.repo_id=lerobot/svla_so101_pickplace \
   --dataset.episodes='[0, 1]' \
   --dataset.video_backend=pyav \
