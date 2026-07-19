@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from p5_rerun_port.challenge.config import ChallengeConfig
 from p5_rerun_port.challenge.hub import HuggingFaceHubReader
 from p5_rerun_port.challenge.inventory import InventoryError, build_inventory, write_source_lock
+from p5_rerun_port.challenge.models import EpisodeIdentity
 
 
 CONFIG_PATH = Path("config/rerun_query_challenge.yaml")
@@ -24,7 +26,8 @@ class FakeHub:
         self.shas = {source.repo_id: source.revision for source in config.sources}
         self.jsons: dict[tuple[str, str], dict] = {}
         self.parquets: dict[tuple[str, str], pd.DataFrame] = {}
-        self.downloads: dict[tuple[str, str], Path] = {}
+        self.paths: dict[str, set[str]] = {}
+        self.download_calls: list[tuple[str, str, str]] = []
         for source in config.sources:
             if source.role == "success":
                 self._add_success(source.repo_id, source.task_key, source.expected_items, source.expected_frames or 0)
@@ -72,6 +75,7 @@ class FakeHub:
                     "episode_index": index,
                     "attempt_id": f"attempt-{index}",
                     "started_at_utc": f"2026-07-19T01:{index:02d}:00.000Z",
+                    "finished_at_utc": f"2026-07-19T01:{index:02d}:05.000Z",
                 }
                 for index in range(count)
             ],
@@ -95,7 +99,7 @@ class FakeHub:
             )
             filename = "attempt.partial.rrd" if index == 0 else "attempt.rrd"
             path = f"failed_attempts/{attempt_id}/{filename}"
-            self.downloads[(repo, path)] = Path("/fake") / repo / path
+            self.paths.setdefault(repo, set()).add(path)
         self.jsons[(repo, "FAILURE_INDEX.json")] = {
             "training_eligible": False,
             "attempt_count": count,
@@ -111,11 +115,12 @@ class FakeHub:
     def read_parquet(self, repo_id: str, revision: str, path: str) -> pd.DataFrame:
         return self.parquets[(repo_id, path)].copy(deep=True)
 
+    def list_paths(self, repo_id: str, revision: str, prefix: str) -> tuple[str, ...]:
+        return tuple(sorted(path for path in self.paths.get(repo_id, set()) if path.startswith(prefix)))
+
     def download(self, repo_id: str, revision: str, path: str) -> Path:
-        try:
-            return self.downloads[(repo_id, path)]
-        except KeyError as error:
-            raise FileNotFoundError(path) from error
+        self.download_calls.append((repo_id, revision, path))
+        raise AssertionError("failure inventory must not download RRD files")
 
 
 JOINTS = (
@@ -144,6 +149,7 @@ def test_builds_all_102_revision_locked_rows(config: ChallengeConfig, fake_hub: 
     assert [row.frame_count for row in inventory if row.role == "success"][:2] == [861, 1086]
     partial = next(row for row in inventory if row.source_path.endswith("attempt.partial.rrd"))
     assert partial.source_path.startswith(f"failed_attempts/{partial.attempt_id}/")
+    assert fake_hub.download_calls == []
 
 
 def test_rejects_sha_mismatch(config: ChallengeConfig, fake_hub: FakeHub) -> None:
@@ -164,13 +170,13 @@ def test_rejects_missing_or_ambiguous_failure_rrd(config: ChallengeConfig, fake_
     source = next(source for source in config.sources if source.role == "failure")
     attempt = fake_hub.jsons[(source.repo_id, "FAILURE_INDEX.json")]["attempts"][0]
     partial = f"failed_attempts/{attempt['attempt_id']}/attempt.partial.rrd"
-    del fake_hub.downloads[(source.repo_id, partial)]
+    fake_hub.paths[source.repo_id].remove(partial)
     with pytest.raises(InventoryError, match="exactly one authoritative RRD"):
         build_inventory(config, fake_hub)
 
-    fake_hub.downloads[(source.repo_id, partial)] = Path("/fake") / partial
+    fake_hub.paths[source.repo_id].add(partial)
     final = f"failed_attempts/{attempt['attempt_id']}/attempt.rrd"
-    fake_hub.downloads[(source.repo_id, final)] = Path("/fake") / final
+    fake_hub.paths[source.repo_id].add(final)
     with pytest.raises(InventoryError, match="exactly one authoritative RRD"):
         build_inventory(config, fake_hub)
 
@@ -186,6 +192,46 @@ def test_rejects_blank_capture_time(config: ChallengeConfig, fake_hub: FakeHub) 
     repo = config.sources[0].repo_id
     fake_hub.jsons[(repo, "SHARE_MANIFEST.json")]["source_attempts"][0]["started_at_utc"] = " "
     with pytest.raises(InventoryError, match="started_at_utc"):
+        build_inventory(config, fake_hub)
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-time", "2026-07-19T01:00:00", "2026-07-19 01:00:00Z"])
+def test_rejects_malformed_or_naive_timestamp(
+    config: ChallengeConfig, fake_hub: FakeHub, timestamp: str
+) -> None:
+    repo = config.sources[0].repo_id
+    fake_hub.jsons[(repo, "SHARE_MANIFEST.json")]["source_attempts"][0]["started_at_utc"] = timestamp
+    with pytest.raises(InventoryError, match="timezone-aware ISO-8601"):
+        build_inventory(config, fake_hub)
+
+
+def test_rejects_reversed_timestamp_range(config: ChallengeConfig, fake_hub: FakeHub) -> None:
+    source = next(source for source in config.sources if source.role == "failure")
+    attempt = fake_hub.jsons[(source.repo_id, "FAILURE_INDEX.json")]["attempts"][0]
+    attempt["finished_at"] = "2026-07-19T01:59:59.000Z"
+    with pytest.raises(InventoryError, match="finished_at must not precede started_at"):
+        build_inventory(config, fake_hub)
+
+
+@pytest.mark.parametrize(
+    ("archive_complete", "existing_filename"),
+    [(True, "attempt.partial.rrd"), (False, "attempt.rrd")],
+)
+def test_rejects_archive_complete_filename_mismatch(
+    config: ChallengeConfig,
+    fake_hub: FakeHub,
+    archive_complete: bool,
+    existing_filename: str,
+) -> None:
+    source = next(source for source in config.sources if source.role == "failure")
+    attempt = fake_hub.jsons[(source.repo_id, "FAILURE_INDEX.json")]["attempts"][0]
+    attempt["archive_complete"] = archive_complete
+    prefix = f"failed_attempts/{attempt['attempt_id']}/"
+    fake_hub.paths[source.repo_id] = {
+        f"{prefix}{existing_filename}" if path.startswith(prefix) else path
+        for path in fake_hub.paths[source.repo_id]
+    }
+    with pytest.raises(InventoryError, match="archive_complete does not match RRD filename"):
         build_inventory(config, fake_hub)
 
 
@@ -228,6 +274,41 @@ def test_writes_deterministic_source_lock(config: ChallengeConfig, fake_hub: Fak
     ]
 
 
+@pytest.mark.parametrize("mismatch", ["repo_id", "revision", "role", "task"])
+def test_source_lock_rejects_row_source_mismatch(
+    config: ChallengeConfig, fake_hub: FakeHub, tmp_path: Path, mismatch: str
+) -> None:
+    inventory = list(build_inventory(config, fake_hub))
+    row = inventory[0]
+    if mismatch == "repo_id":
+        row = replace(row, identity=EpisodeIdentity("other/repo", row.identity.revision, row.identity.source_key))
+    elif mismatch == "revision":
+        row = replace(row, identity=EpisodeIdentity(row.identity.repo_id, "f" * 40, row.identity.source_key))
+    elif mismatch == "role":
+        row = replace(row, role="failure")  # type: ignore[arg-type]
+    else:
+        row = replace(row, task_key="two_can")
+    inventory[0] = row
+    output = tmp_path / "source-lock.json"
+
+    with pytest.raises(InventoryError, match=mismatch):
+        write_source_lock(output, config, inventory, config_path=CONFIG_PATH)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mismatch", ["items", "frames"])
+def test_source_lock_rejects_per_source_count_mismatch(
+    config: ChallengeConfig, fake_hub: FakeHub, tmp_path: Path, mismatch: str
+) -> None:
+    inventory = list(build_inventory(config, fake_hub))
+    if mismatch == "items":
+        inventory.pop()
+    else:
+        inventory[0] = replace(inventory[0], frame_count=inventory[0].frame_count + 1)
+    with pytest.raises(InventoryError, match="count"):
+        write_source_lock(tmp_path / "source-lock.json", config, inventory, config_path=CONFIG_PATH)
+
+
 def test_production_adapter_forwards_the_locked_revision(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls: list[tuple[str, str, str]] = []
 
@@ -235,6 +316,20 @@ def test_production_adapter_forwards_the_locked_revision(monkeypatch: pytest.Mon
         def dataset_info(self, repo_id: str, *, revision: str):
             calls.append(("info", repo_id, revision))
             return type("Info", (), {"sha": revision})()
+
+        def list_repo_tree(
+            self,
+            repo_id: str,
+            *,
+            path_in_repo: str,
+            recursive: bool,
+            revision: str,
+            repo_type: str,
+        ):
+            assert recursive is True
+            assert repo_type == "dataset"
+            calls.append((f"tree:{path_in_repo}", repo_id, revision))
+            return [type("Entry", (), {"path": f"{path_in_repo}/attempt.rrd"})()]
 
     downloaded = tmp_path / "value.json"
     downloaded.write_text("{}", encoding="utf-8")
@@ -250,7 +345,11 @@ def test_production_adapter_forwards_the_locked_revision(monkeypatch: pytest.Mon
 
     assert reader.dataset_sha("owner/repo", revision) == revision
     assert reader.read_json("owner/repo", revision, "meta/info.json") == {}
+    assert reader.list_paths("owner/repo", revision, "failed_attempts/id") == (
+        "failed_attempts/id/attempt.rrd",
+    )
     assert calls == [
         ("info", "owner/repo", revision),
         ("meta/info.json", "owner/repo", revision),
+        ("tree:failed_attempts/id", "owner/repo", revision),
     ]

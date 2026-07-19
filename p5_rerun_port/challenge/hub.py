@@ -17,6 +17,8 @@ class HubReader(Protocol):
 
     def read_parquet(self, repo_id: str, revision: str, path: str) -> pd.DataFrame: ...
 
+    def list_paths(self, repo_id: str, revision: str, prefix: str) -> tuple[str, ...]: ...
+
     def download(self, repo_id: str, revision: str, path: str) -> Path: ...
 
 
@@ -43,6 +45,16 @@ class HuggingFaceHubReader:
 
     def read_parquet(self, repo_id: str, revision: str, path: str) -> pd.DataFrame:
         return pd.read_parquet(self.download(repo_id, revision, path))
+
+    def list_paths(self, repo_id: str, revision: str, prefix: str) -> tuple[str, ...]:
+        entries = self._api.list_repo_tree(
+            repo_id,
+            path_in_repo=prefix,
+            recursive=True,
+            revision=revision,
+            repo_type="dataset",
+        )
+        return tuple(sorted({entry.path for entry in entries}))
 
     def download(self, repo_id: str, revision: str, path: str) -> Path:
         try:

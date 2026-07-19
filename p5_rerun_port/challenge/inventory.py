@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
+from datetime import datetime
 import hashlib
 import json
 from numbers import Integral
@@ -23,6 +24,9 @@ class InventoryError(ValueError):
 
 
 _EPISODE_METADATA = re.compile(r"meta/episodes/chunk-\d+/file-\d+\.parquet")
+_ISO_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})"
+)
 _ALLOWED_DISPOSITIONS = frozenset({"aborted", "collector_error", "failed"})
 _TASKS = {
     "single_can": "Pick up one can and place it in the taped sorting zone",
@@ -52,6 +56,19 @@ def _integer(value: Any, field: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < minimum:
         raise InventoryError(f"{field} must be an integer of at least {minimum}")
     return int(value)
+
+
+def _timestamp(value: Any, field: str) -> tuple[str, datetime]:
+    text = _text(value, field)
+    if not _ISO_TIMESTAMP.fullmatch(text):
+        raise InventoryError(f"{field} must be a timezone-aware ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(f"{text[:-1]}+00:00" if text.endswith("Z") else text)
+    except ValueError as error:
+        raise InventoryError(f"{field} must be a timezone-aware ISO-8601 timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InventoryError(f"{field} must be a timezone-aware ISO-8601 timestamp")
+    return text, parsed
 
 
 def _safe_path(value: Any, field: str, prefix: str) -> str:
@@ -100,9 +117,17 @@ def _manifest_capture_times(manifest: Mapping[str, Any], repo_id: str) -> dict[i
         index = _integer(entry.get("episode_index"), f"{repo_id} source_attempts[{offset}].episode_index")
         if index in result:
             raise InventoryError(f"{repo_id} has duplicate source_attempt episode_index {index}")
-        result[index] = _text(
+        started_text, started = _timestamp(
             entry.get("started_at_utc"), f"{repo_id} source_attempts[{offset}].started_at_utc"
         )
+        _, finished = _timestamp(
+            entry.get("finished_at_utc"), f"{repo_id} source_attempts[{offset}].finished_at_utc"
+        )
+        if finished < started:
+            raise InventoryError(
+                f"{repo_id} source_attempts[{offset}].finished_at must not precede started_at"
+            )
+        result[index] = started_text
     return result
 
 
@@ -179,17 +204,14 @@ def _success_rows(config: ChallengeConfig, source: SourceSpec, hub: HubReader) -
     return ordered
 
 
-def _existing_attempt_paths(source: SourceSpec, attempt_id: str, hub: HubReader) -> list[str]:
-    found: list[str] = []
+def _existing_attempt_paths(source: SourceSpec, attempt_id: str, available_paths: set[str]) -> list[str]:
+    candidates: list[str] = []
     for filename in ("attempt.rrd", "attempt.partial.rrd"):
         path = f"failed_attempts/{attempt_id}/{filename}"
         _safe_path(path, f"{source.repo_id} attempt {attempt_id}", f"failed_attempts/{attempt_id}/")
-        try:
-            hub.download(source.repo_id, source.revision, path)
-        except (FileNotFoundError, OSError):
-            continue
-        found.append(path)
-    return found
+        if path in available_paths:
+            candidates.append(path)
+    return candidates
 
 
 def _failure_rows(source: SourceSpec, hub: HubReader) -> list[InventoryRow]:
@@ -203,6 +225,7 @@ def _failure_rows(source: SourceSpec, hub: HubReader) -> list[InventoryRow]:
     attempts = _sequence(index.get("attempts"), f"{source.repo_id} attempts")
     if len(attempts) != source.expected_items:
         raise InventoryError(f"{source.repo_id} observed attempt count does not match the lock")
+    available_paths = set(hub.list_paths(source.repo_id, source.revision, "failed_attempts"))
 
     rows: list[InventoryRow] = []
     seen: set[str] = set()
@@ -219,17 +242,31 @@ def _failure_rows(source: SourceSpec, hub: HubReader) -> list[InventoryRow]:
             raise InventoryError(f"{source.repo_id} attempt {attempt_id} has unknown disposition")
         if attempt.get("training_included") is not False:
             raise InventoryError(f"{source.repo_id} attempt {attempt_id} training_included must be false")
-        if not isinstance(attempt.get("archive_complete"), bool):
+        archive_complete = attempt.get("archive_complete")
+        if not isinstance(archive_complete, bool):
             raise InventoryError(f"{source.repo_id} attempt {attempt_id} archive_complete must be boolean")
         samples = _integer(attempt.get("samples"), f"{source.repo_id} attempt {attempt_id}.samples", minimum=1)
-        captured_at = _text(attempt.get("started_at"), f"{source.repo_id} attempt {attempt_id}.started_at")
-        _text(attempt.get("finished_at"), f"{source.repo_id} attempt {attempt_id}.finished_at")
+        captured_at, started = _timestamp(
+            attempt.get("started_at"), f"{source.repo_id} attempt {attempt_id}.started_at"
+        )
+        _, finished = _timestamp(
+            attempt.get("finished_at"), f"{source.repo_id} attempt {attempt_id}.finished_at"
+        )
+        if finished < started:
+            raise InventoryError(
+                f"{source.repo_id} attempt {attempt_id}.finished_at must not precede started_at"
+            )
         if _text(attempt.get("task"), f"{source.repo_id} attempt {attempt_id}.task") != _TASKS[source.task_key]:
             raise InventoryError(f"{source.repo_id} attempt {attempt_id} has an unknown task")
-        paths = _existing_attempt_paths(source, attempt_id, hub)
+        paths = _existing_attempt_paths(source, attempt_id, available_paths)
         if len(paths) != 1:
             raise InventoryError(
                 f"{source.repo_id} attempt {attempt_id} must have exactly one authoritative RRD; found {len(paths)}"
+            )
+        expected_filename = "attempt.rrd" if archive_complete else "attempt.partial.rrd"
+        if PurePosixPath(paths[0]).name != expected_filename:
+            raise InventoryError(
+                f"{source.repo_id} attempt {attempt_id} archive_complete does not match RRD filename"
             )
         rows.append(
             InventoryRow(
@@ -280,6 +317,36 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_source_lock_inventory(config: ChallengeConfig, inventory: Sequence[InventoryRow]) -> None:
+    sources = {source.repo_id: source for source in config.sources}
+    grouped: dict[str, list[InventoryRow]] = {source.repo_id: [] for source in config.sources}
+    identities: set[str] = set()
+    for row in inventory:
+        repo_id = row.identity.repo_id
+        source = sources.get(repo_id)
+        if source is None:
+            raise InventoryError(f"source-lock row repo_id {repo_id!r} is not configured")
+        if row.identity.revision != source.revision:
+            raise InventoryError(f"source-lock row {row.identity.canonical} revision does not match SourceSpec")
+        if row.role != source.role:
+            raise InventoryError(f"source-lock row {row.identity.canonical} role does not match SourceSpec")
+        if row.task_key != source.task_key:
+            raise InventoryError(f"source-lock row {row.identity.canonical} task does not match SourceSpec")
+        if row.identity.canonical in identities:
+            raise InventoryError(f"source-lock has duplicate identity {row.identity.canonical}")
+        identities.add(row.identity.canonical)
+        grouped[repo_id].append(row)
+
+    for source in config.sources:
+        rows = grouped[source.repo_id]
+        if len(rows) != source.expected_items:
+            raise InventoryError(
+                f"source-lock {source.repo_id} count {len(rows)} does not match {source.expected_items}"
+            )
+        if source.role == "success" and sum(row.frame_count for row in rows) != source.expected_frames:
+            raise InventoryError(f"source-lock {source.repo_id} frame count does not match SourceSpec")
+
+
 def write_source_lock(
     path: Path,
     config: ChallengeConfig,
@@ -289,6 +356,7 @@ def write_source_lock(
 ) -> dict[str, Any]:
     """Write a stable source-lock whose digests exclude generation time."""
 
+    _validate_source_lock_inventory(config, inventory)
     inventory_payload = _inventory_payload(inventory)
     expected_counts = {
         "success": sum(source.expected_items for source in config.sources if source.role == "success"),
