@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Any, Iterator
@@ -52,9 +53,36 @@ def _jpeg_bytes(rgb: tuple[int, int, int]) -> bytes:
 
 
 def _source_path(tmp_path: Path, row: InventoryRow) -> Path:
-    path = tmp_path.joinpath(*Path(row.source_path).parts)
+    owner, repo = row.identity.repo_id.split("/", 1)
+    path = tmp_path.joinpath(
+        "hub",
+        f"datasets--{owner}--{repo}",
+        "snapshots",
+        row.identity.revision,
+        *Path(row.source_path).parts,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _write_snapshot_symlink(
+    tmp_path: Path,
+    row: InventoryRow,
+    config: ChallengeConfig,
+) -> Path:
+    snapshot = _source_path(tmp_path, row)
+    owner, repo = row.identity.repo_id.split("/", 1)
+    blob = (
+        tmp_path
+        / "hub"
+        / f"datasets--{owner}--{repo}"
+        / "blobs"
+        / ("a" * 64)
+    )
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    _write_native_rrd(blob, row, config)
+    snapshot.symlink_to(os.path.relpath(blob, snapshot.parent))
+    return snapshot
 
 
 def _write_native_rrd(
@@ -330,6 +358,122 @@ def test_accepts_authoritative_partial_filename_for_integrity_evaluation(
     artifact = materialize_failure(row, config, source, tmp_path / "partial-canonical.rrd")
 
     assert artifact.status == "ready", artifact
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_accepts_production_shaped_hf_snapshot_symlink_before_resolving_blob(
+    partial: bool,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    if partial:
+        row = replace(
+            row,
+            source_path=f"failed_attempts/{row.attempt_id}/attempt.partial.rrd",
+        )
+    snapshot = _write_snapshot_symlink(tmp_path, row, config)
+
+    artifact = materialize_failure(
+        row, config, snapshot, tmp_path / f"canonical-{partial}.rrd"
+    )
+
+    assert snapshot.is_symlink()
+    assert artifact.status == "ready", artifact
+
+
+def test_rejects_suffix_only_path_outside_pinned_hf_snapshot_before_query(
+    monkeypatch: pytest.MonkeyPatch,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path.joinpath(*Path(row.source_path).parts)
+    source.parent.mkdir(parents=True)
+    _write_native_rrd(source, row, config)
+
+    @contextmanager
+    def should_not_open(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        raise AssertionError("untrusted suffix-only path reached Query")
+        yield
+
+    monkeypatch.setattr(failure_canonical, "open_dataset_server", should_not_open)
+
+    artifact = materialize_failure(row, config, source, tmp_path / "untrusted.rrd")
+
+    assert artifact.status == "rejected"
+    assert artifact.reason_codes == ("SOURCE_LOCK_MISMATCH",)
+
+
+@pytest.mark.parametrize("mismatch", ["namespace", "snapshot_revision", "blob_store"])
+def test_rejects_wrong_hf_cache_binding_before_query(
+    mismatch: str,
+    monkeypatch: pytest.MonkeyPatch,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    source = _source_path(tmp_path, row)
+    if mismatch == "namespace":
+        source = Path(str(source).replace("datasets--Cornerf--", "datasets--Other--"))
+        source.parent.mkdir(parents=True)
+        _write_native_rrd(source, row, config)
+    elif mismatch == "snapshot_revision":
+        source = Path(str(source).replace(row.identity.revision, "0" * 40))
+        source.parent.mkdir(parents=True)
+        _write_native_rrd(source, row, config)
+    else:
+        outside = tmp_path / "outside-blobs" / ("b" * 64)
+        outside.parent.mkdir()
+        _write_native_rrd(outside, row, config)
+        source.symlink_to(os.path.relpath(outside, source.parent))
+
+    @contextmanager
+    def should_not_open(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        raise AssertionError("wrong HF cache binding reached Query")
+        yield
+
+    monkeypatch.setattr(failure_canonical, "open_dataset_server", should_not_open)
+
+    artifact = materialize_failure(row, config, source, tmp_path / "untrusted.rrd")
+
+    assert artifact.status == "rejected"
+    assert artifact.reason_codes == ("SOURCE_LOCK_MISMATCH",)
+
+
+@pytest.mark.parametrize("alias", ["same", "symlink", "hardlink"])
+def test_rejects_output_aliases_before_query_or_temp_creation(
+    alias: str,
+    monkeypatch: pytest.MonkeyPatch,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    source = _source_path(tmp_path, row)
+    _write_native_rrd(source, row, config)
+    before = source.read_bytes()
+    if alias == "same":
+        output = source
+    elif alias == "symlink":
+        output = tmp_path / "output-symlink.rrd"
+        output.symlink_to(source)
+    else:
+        output = tmp_path / "output-hardlink.rrd"
+        os.link(source, output)
+
+    @contextmanager
+    def should_not_open(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        raise AssertionError("aliased output reached Query")
+        yield
+
+    monkeypatch.setattr(failure_canonical, "open_dataset_server", should_not_open)
+
+    artifact = materialize_failure(row, config, source, output)
+
+    assert artifact.status == "rejected"
+    assert artifact.reason_codes == ("OUTPUT_ALIASES_SOURCE",)
+    assert source.read_bytes() == before
+    assert not list(source.parent.glob(f".{source.stem}.*.tmp.rrd"))
 
 
 def test_query_api_failure_rejects_without_output(

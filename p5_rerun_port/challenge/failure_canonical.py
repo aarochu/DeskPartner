@@ -7,6 +7,7 @@ import io
 import json
 import math
 from numbers import Integral
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -54,10 +55,20 @@ def _rejected(identity: EpisodeIdentity, reason: str, frame_count: int = 0) -> C
     return CanonicalArtifact(identity.canonical, "rejected", None, None, frame_count, (reason,))
 
 
-def _authorized(row: InventoryRow, config: ChallengeConfig, source_rrd: Path) -> bool:
+def _lexical_absolute(path: Path) -> Path:
+    """Make a path absolute without following its final or parent symlinks."""
+
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _authenticated_source(
+    row: InventoryRow, config: ChallengeConfig, source_rrd: Path
+) -> tuple[Path, Path] | None:
+    """Authenticate an HF snapshot path before resolving its blob symlink."""
+
     matches = [source for source in config.sources if source.repo_id == row.identity.repo_id]
     if len(matches) != 1:
-        return False
+        return None
     source = matches[0]
     attempt_id = row.attempt_id
     if not (
@@ -69,19 +80,70 @@ def _authorized(row: InventoryRow, config: ChallengeConfig, source_rrd: Path) ->
         and _ATTEMPT_ID.fullmatch(attempt_id)
         and row.identity.source_key == attempt_id
     ):
-        return False
+        return None
     inventory_path = Path(row.source_path)
     allowed = {
         Path("failed_attempts") / attempt_id / "attempt.rrd",
         Path("failed_attempts") / attempt_id / "attempt.partial.rrd",
     }
     if inventory_path.is_absolute() or inventory_path not in allowed:
-        return False
+        return None
+
     try:
-        actual = source_rrd.expanduser().resolve(strict=True)
+        owner, repo = row.identity.repo_id.split("/", 1)
+    except ValueError:
+        return None
+    if not owner or not repo or "/" in repo:
+        return None
+    namespace = f"datasets--{owner}--{repo}"
+    expected_tail = (
+        namespace,
+        "snapshots",
+        row.identity.revision,
+        *inventory_path.parts,
+    )
+    lexical = _lexical_absolute(source_rrd)
+    if lexical.parts[-len(expected_tail) :] != expected_tail:
+        return None
+    namespace_index = len(lexical.parts) - len(expected_tail)
+    cache_repo_root = Path(*lexical.parts[: namespace_index + 1])
+
+    is_symlink = lexical.is_symlink()
+    if not is_symlink and not lexical.is_file():
+        return None
+    try:
+        resolved = lexical.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file():
+        return None
+    if is_symlink and resolved.parent != cache_repo_root / "blobs":
+        return None
+    if not is_symlink and resolved != lexical:
+        return None
+    return lexical, resolved
+
+
+def _output_aliases_source(
+    source_lexical: Path, source_resolved: Path, output: Path
+) -> bool:
+    """Reject lexical, symlink, and inode aliases before creating writer state."""
+
+    output_lexical = _lexical_absolute(output)
+    if output_lexical in {source_lexical, source_resolved}:
+        return True
+    try:
+        output_resolved = output_lexical.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return True
+    if output_resolved in {source_lexical, source_resolved}:
+        return True
+    try:
+        return output_lexical.exists() and os.path.samefile(
+            output_lexical, source_resolved
+        )
     except OSError:
         return False
-    return actual.is_file() and actual.parts[-len(inventory_path.parts) :] == inventory_path.parts
 
 
 def _column(schema: Any, entity: str, component: str) -> str | None:
@@ -421,10 +483,15 @@ def materialize_failure(
     """Query one authenticated native failure RRD into a label-blind canonical RRD."""
 
     source_rrd = Path(source_rrd)
-    if not _authorized(row, config, source_rrd):
+    authenticated = _authenticated_source(row, config, source_rrd)
+    if authenticated is None:
         return _rejected(row.identity, "SOURCE_LOCK_MISMATCH")
+    source_lexical, source_resolved = authenticated
+    output = Path(output)
+    if _output_aliases_source(source_lexical, source_resolved, output):
+        return _rejected(row.identity, "OUTPUT_ALIASES_SOURCE")
     try:
-        return _transform(row, config, source_rrd, Path(output))
+        return _transform(row, config, source_resolved, output)
     except IdentityError:
         raise
     except _Reject as error:
