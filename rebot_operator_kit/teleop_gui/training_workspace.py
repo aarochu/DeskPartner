@@ -703,6 +703,91 @@ def _quarantine_zero_frame_attempt(
     return destination
 
 
+def _quarantine_zero_durable_retry_manifest(
+    dataset_name: str,
+    manifest_path: Path,
+    *,
+    reason: str,
+) -> Path | None:
+    """Recoverably remove only a failed zero-save retry from active manifests."""
+
+    if not DATASET_SLUG_RE.fullmatch(dataset_name) or not manifest_path.is_file():
+        return None
+    try:
+        resolved = manifest_path.resolve()
+        if resolved.parent != RUN_ROOT.resolve():
+            return None
+        if not resolved.name.startswith(f"{dataset_name}--") or resolved.name.endswith(
+            "--validation.json"
+        ):
+            return None
+        manifest = json.loads(resolved.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    lifecycle = manifest.get("lifecycle") if isinstance(manifest, dict) else None
+    if not isinstance(lifecycle, dict):
+        return None
+    durable = lifecycle.get("durable_episodes_this_run")
+    exit_code = lifecycle.get("exit_code")
+    if not (
+        lifecycle.get("state") == "FAILED"
+        and isinstance(durable, int)
+        and not isinstance(durable, bool)
+        and durable == 0
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+    ):
+        return None
+    counts = _zero_frame_dataset_counts(DATA_ROOT / dataset_name)
+    if counts is None or counts[0] <= 0 or counts[1] <= 0:
+        return None
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    destination = RUN_ROOT / "quarantine" / f"{stamp}-{dataset_name}-zero-durable-retry"
+    manifest_destination = destination / "manifests"
+    manifest_destination.mkdir(parents=True, exist_ok=False)
+    target = manifest_destination / resolved.name
+    shutil.move(str(resolved), str(target))
+    audit = {
+        "quarantined_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": dataset_name,
+        "reason": reason,
+        "saved_episodes_unchanged": counts[0],
+        "saved_frames_unchanged": counts[1],
+        "durable_episodes_in_failed_retry": 0,
+        "moved_manifest": str(target),
+        "dataset_root_moved": False,
+        "raw_attempt_archive_moved": False,
+        "raw_attempt_archive": str(ATTEMPT_ROOT / dataset_name),
+        "recoverable": True,
+    }
+    (destination / "quarantine.json").write_text(json.dumps(audit, indent=2) + "\n")
+    return destination
+
+
+def _quarantine_zero_durable_retry_manifests(
+    dataset_name: str,
+    *,
+    reason: str,
+) -> list[Path]:
+    destinations: list[Path] = []
+    paths = (
+        sorted(RUN_ROOT.glob(f"{dataset_name}--*.json"))
+        if RUN_ROOT.is_dir()
+        else []
+    )
+    for path in paths:
+        destination = _quarantine_zero_durable_retry_manifest(
+            dataset_name,
+            path,
+            reason=reason,
+        )
+        if destination is not None:
+            destinations.append(destination)
+    return destinations
+
+
 def _manifest_profile_compatibility(
     dataset_name: str,
     profile_digest: str,
@@ -1857,6 +1942,21 @@ class TrainingManager:
                         "Zero-frame attempt quarantined; the same dataset name is ready "
                         f"to retry: {quarantined}",
                     )
+                elif lifecycle_state == "FAILED" and durable_episodes_this_run == 0:
+                    retry_quarantine = _quarantine_zero_durable_retry_manifest(
+                        str(config["dataset"]),
+                        manifest_path,
+                        reason=(
+                            "record retry failed before saving a durable episode; "
+                            f"exit code {exit_code}"
+                        ),
+                    ) if manifest_path else None
+                    if retry_quarantine:
+                        self._append_log(
+                            "WARN",
+                            "Failed zero-save retry manifest quarantined; existing durable "
+                            f"episodes and raw attempt archive are unchanged: {retry_quarantine}",
+                        )
             except (OSError, RuntimeError) as exc:
                 self._append_log("ERROR", f"Zero-frame quarantine failed: {exc}")
         with self._lock:
@@ -1995,6 +2095,16 @@ class TrainingManager:
             raise RuntimeError("Resume requires an existing LeRobot dataset with meta/info.json")
         contract = collection_contract_lock(config)
         if config["resume"]:
+            quarantined_retries = _quarantine_zero_durable_retry_manifests(
+                config["dataset"],
+                reason="resume cleanup of failed retry with zero durable episodes",
+            )
+            for destination in quarantined_retries:
+                self._append_log(
+                    "WARN",
+                    "Failed zero-save retry manifest quarantined before Resume; dataset and "
+                    f"raw attempts are unchanged: {destination}",
+                )
             sidecar_status = _dataset_profile_sidecar(
                 root,
                 profile_status["profile_digest"],

@@ -349,7 +349,43 @@ class SessionHomeReturnTest(unittest.TestCase):
         robot = SimpleNamespace(cameras={"front": camera})
         observation = controlled_record.read_latest_camera_observation(robot)
         self.assertIs(observation["front"], frame)
-        camera.read_latest.assert_called_once_with(max_age_ms=250)
+        camera.read_latest.assert_called_once_with(max_age_ms=500)
+        camera.async_read.assert_not_called()
+
+    def test_256_8ms_camera_jitter_is_accepted_and_reported(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            latest_timestamp=0.0,
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        telemetry: dict[str, object] = {}
+        with patch.object(controlled_record.time, "perf_counter", return_value=0.2568):
+            observation = controlled_record.read_latest_camera_observation(
+                SimpleNamespace(cameras={"side": camera}), telemetry
+            )
+        self.assertIs(observation["side"], frame)
+        self.assertEqual(telemetry["side"]["status"], "transient_jitter_accepted")
+        self.assertAlmostEqual(telemetry["side"]["last_age_ms"], 256.8)
+        camera.read_latest.assert_called_once_with(max_age_ms=500)
+        camera.async_read.assert_not_called()
+
+    def test_persistent_camera_staleness_fails_without_blocking_motor_loop(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            latest_timestamp=0.0,
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        telemetry: dict[str, object] = {}
+        robot = SimpleNamespace(cameras={"side": camera})
+        with patch.object(controlled_record.time, "perf_counter", return_value=0.300):
+            controlled_record.read_latest_camera_observation(robot, telemetry)
+            controlled_record.read_latest_camera_observation(robot, telemetry)
+            with self.assertRaisesRegex(TimeoutError, "3 consecutive samples"):
+                controlled_record.read_latest_camera_observation(robot, telemetry)
+        self.assertEqual(telemetry["side"]["status"], "sustained_stale")
+        self.assertEqual(camera.read_latest.call_count, 3)
         camera.async_read.assert_not_called()
 
     def test_capture_inverts_driver_directions_and_reset_returns_home(self) -> None:
@@ -648,6 +684,38 @@ class ZeroFrameQuarantineTest(unittest.TestCase):
         self.assertIsNone(destination)
         self.assertTrue(root.is_dir())
         self.assertTrue(manifest.is_file())
+
+    def test_failed_zero_durable_retry_moves_only_manifest(self) -> None:
+        name = "keep-one-retry"
+        root = self.write_info(name, 1, 30)
+        raw_attempt = self.run_root / "attempts" / name / "attempt-raw"
+        raw_attempt.mkdir(parents=True)
+        (raw_attempt / "metadata.json").write_text("{}")
+        manifest = self.write_manifest(name, "FAILED", 1)
+        value = json.loads(manifest.read_text())
+        value["lifecycle"]["durable_episodes_this_run"] = 0
+        manifest.write_text(json.dumps(value))
+
+        destination = workspace._quarantine_zero_durable_retry_manifest(
+            name,
+            manifest,
+            reason="camera jitter retry",
+        )
+
+        self.assertIsNotNone(destination)
+        assert destination is not None
+        self.assertTrue(root.is_dir())
+        self.assertEqual(
+            json.loads((root / "meta" / "info.json").read_text())["total_episodes"],
+            1,
+        )
+        self.assertTrue((raw_attempt / "metadata.json").is_file())
+        self.assertFalse(manifest.exists())
+        self.assertTrue((destination / "manifests" / manifest.name).is_file())
+        audit = json.loads((destination / "quarantine.json").read_text())
+        self.assertFalse(audit["dataset_root_moved"])
+        self.assertFalse(audit["raw_attempt_archive_moved"])
+        self.assertEqual(audit["durable_episodes_in_failed_retry"], 0)
 
 
 class PartialRunManifestTest(unittest.TestCase):

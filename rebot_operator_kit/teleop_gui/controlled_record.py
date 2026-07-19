@@ -74,6 +74,16 @@ from lerobot_teleoperator_rebot_arm_102 import (
 )
 
 
+# Camera buffers are sampled without waiting so the 30 FPS image clock cannot
+# throttle the motor loop. A frame up to 250 ms old is normally fresh. macOS
+# scheduling/USB jitter may briefly exceed that, so at most two consecutive
+# samples may use a frame up to 500 ms old. A third consecutive jitter sample,
+# or any frame older than 500 ms, fails closed as a stale/frozen camera.
+CAMERA_FRESH_AGE_MS = 250.0
+CAMERA_JITTER_MAX_AGE_MS = 500
+CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES = 2
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--follower-port", required=True)
@@ -1396,13 +1406,114 @@ def read_follower_joint_observation(robot: SeeedB601DMFollower) -> dict[str, flo
     return observation
 
 
-def read_latest_camera_observation(robot: SeeedB601DMFollower) -> dict[str, np.ndarray]:
-    """Peek at camera buffers without clearing/waiting on their frame events."""
+def _camera_frame_age_ms(camera: Any) -> float | None:
+    timestamp = getattr(camera, "latest_timestamp", None)
+    if not isinstance(timestamp, numbers.Real) or isinstance(timestamp, bool):
+        return None
+    return max(0.0, (time.perf_counter() - float(timestamp)) * 1e3)
 
-    return {
-        camera_key: camera.read_latest(max_age_ms=250)
-        for camera_key, camera in robot.cameras.items()
-    }
+
+def _camera_freshness_entry(telemetry: dict[str, Any], camera_key: str) -> dict[str, Any]:
+    return telemetry.setdefault(
+        camera_key,
+        {
+            "fresh_limit_ms": CAMERA_FRESH_AGE_MS,
+            "jitter_limit_ms": CAMERA_JITTER_MAX_AGE_MS,
+            "max_consecutive_jitter_samples": CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES,
+            "sample_attempts": 0,
+            "fresh_samples": 0,
+            "transient_jitter_samples": 0,
+            "consecutive_jitter_samples": 0,
+            "max_consecutive_jitter_seen": 0,
+            "last_age_ms": None,
+            "max_age_ms_seen": 0.0,
+            "status": "waiting_for_sample",
+        },
+    )
+
+
+def read_latest_camera_observation(
+    robot: SeeedB601DMFollower,
+    freshness_telemetry: dict[str, Any] | None = None,
+) -> dict[str, np.ndarray]:
+    """Peek at camera buffers with bounded jitter tolerance and no frame wait."""
+
+    telemetry = freshness_telemetry if freshness_telemetry is not None else {}
+    observation: dict[str, np.ndarray] = {}
+    for camera_key, camera in robot.cameras.items():
+        entry = _camera_freshness_entry(telemetry, camera_key)
+        entry["sample_attempts"] += 1
+        try:
+            # read_latest only copies the current buffer. It never clears the
+            # new-frame event or waits for camera hardware.
+            frame = camera.read_latest(max_age_ms=CAMERA_JITTER_MAX_AGE_MS)
+        except Exception as exc:
+            age_ms = _camera_frame_age_ms(camera)
+            if age_ms is not None:
+                entry["last_age_ms"] = round(age_ms, 3)
+                entry["max_age_ms_seen"] = round(
+                    max(float(entry["max_age_ms_seen"]), age_ms), 3
+                )
+            entry["status"] = "hard_stale_or_unavailable"
+            entry["error"] = str(exc)
+            print(
+                f"CAMERA_FRESHNESS key={camera_key} status=hard_stale_or_unavailable "
+                f"age_ms={age_ms if age_ms is not None else 'unknown'}",
+                flush=True,
+            )
+            raise
+
+        age_ms = _camera_frame_age_ms(camera)
+        if age_ms is None:
+            # Test doubles and non-OpenCV cameras may not expose a timestamp;
+            # the camera's own bounded read_latest contract remains authoritative.
+            entry["fresh_samples"] += 1
+            entry["consecutive_jitter_samples"] = 0
+            entry["status"] = "fresh_age_reported_by_camera"
+            observation[camera_key] = frame
+            continue
+
+        entry["last_age_ms"] = round(age_ms, 3)
+        entry["max_age_ms_seen"] = round(
+            max(float(entry["max_age_ms_seen"]), age_ms), 3
+        )
+        if age_ms <= CAMERA_FRESH_AGE_MS:
+            entry["fresh_samples"] += 1
+            entry["consecutive_jitter_samples"] = 0
+            entry["status"] = "fresh"
+            entry.pop("error", None)
+        else:
+            entry["transient_jitter_samples"] += 1
+            entry["consecutive_jitter_samples"] += 1
+            entry["max_consecutive_jitter_seen"] = max(
+                int(entry["max_consecutive_jitter_seen"]),
+                int(entry["consecutive_jitter_samples"]),
+            )
+            if (
+                entry["consecutive_jitter_samples"]
+                > CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES
+            ):
+                entry["status"] = "sustained_stale"
+                entry["error"] = (
+                    f"{camera_key} stayed older than {CAMERA_FRESH_AGE_MS:g} ms for "
+                    f"{entry['consecutive_jitter_samples']} consecutive samples"
+                )
+                print(
+                    f"CAMERA_FRESHNESS key={camera_key} status=sustained_stale "
+                    f"age_ms={age_ms:.1f} consecutive="
+                    f"{entry['consecutive_jitter_samples']}",
+                    flush=True,
+                )
+                raise TimeoutError(entry["error"])
+            entry["status"] = "transient_jitter_accepted"
+            print(
+                f"CAMERA_FRESHNESS key={camera_key} status=transient_jitter_accepted "
+                f"age_ms={age_ms:.1f} consecutive={entry['consecutive_jitter_samples']} "
+                f"limit={CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES}",
+                flush=True,
+            )
+        observation[camera_key] = frame
+    return observation
 
 
 def _physical_positions_to_follower_input(
@@ -1600,6 +1711,7 @@ def control_segment(
     task: str,
     rerun_writer: AttemptRerunWriter | None = None,
     sample_offset: int = 0,
+    camera_freshness: dict[str, Any] | None = None,
 ) -> tuple[int, float]:
     control_period = 1.0 / args.control_hz
     sample_period = 1.0 / args.dataset_fps
@@ -1646,7 +1758,7 @@ def control_segment(
         if record and now + 1e-9 >= next_sample:
             observation = {
                 **joint_observation,
-                **read_latest_camera_observation(robot),
+                **read_latest_camera_observation(robot, camera_freshness),
             }
             # The learning target is the exact follower-space action after directions,
             # limits, and per-tick clipping—not the raw leader command.
@@ -1757,6 +1869,8 @@ def main() -> int:
                     },
                 )
                 rerun_writer = AttemptRerunWriter(attempt_recording, args.dataset_fps)
+                camera_freshness: dict[str, Any] = {}
+                metadata["camera_freshness"] = camera_freshness
                 attempt_started = time.perf_counter()
                 samples = 0
                 measured_rates: list[float] = []
@@ -1778,6 +1892,7 @@ def main() -> int:
                         task=args.task,
                         rerun_writer=rerun_writer,
                         sample_offset=samples,
+                        camera_freshness=camera_freshness,
                     )
                     samples += segment_samples
                     measured_rates.append(actual_hz)

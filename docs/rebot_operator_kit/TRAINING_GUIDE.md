@@ -87,6 +87,15 @@ The collector uses two independent clocks:
   from that control tick. Training FPS remains stable even if the motor loop
   runs faster.
 
+Camera sampling is nonblocking and has a bounded freshness policy. Frames up
+to 250 ms old are normally fresh. To tolerate brief macOS scheduling or USB
+jitter, at most two consecutive samples may use a frame up to 500 ms old; a
+third consecutive over-250 ms sample, any frame over 500 ms old, a stopped read
+thread, or a disconnected camera stops the take and excludes it from training.
+Every attempt records per-camera freshness counts and maximum observed age in
+its metadata. This tolerance never waits for a camera and therefore cannot
+reduce the motor-loop rate to camera FPS.
+
 Do not use DeskPartner's old P4 batch recorder for new data. It does not append
 episodes correctly and would save the wrong action coordinate frame for this
 ReBot runtime.
