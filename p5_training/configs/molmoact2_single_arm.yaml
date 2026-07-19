@@ -1,37 +1,51 @@
-# MolmoAct 2 — single-arm LoRA fine-tune (hackathon scope)
-# Confirm checkpoint + entrypoint with organizers (newt vs Ai2 scripts).
+# MolmoAct2 single-arm fine-tune (hackathon scope) — LeRobot lerobot-train path.
+# Docs: https://huggingface.co/docs/lerobot/main/en/molmoact2
+# Consumed by p5_training/modal_finetune.py -> build_train_argv().
 
-exp_name: deskpartner_rebot_b601_lora
-policy: molmoact2
-embodiment: single_arm
-base_checkpoint: allenai/MolmoAct2   # FILL if organizers give better start (NOT SO-101 newt zero-shot)
+exp_name: rebot_merged77_molmoact2
 
-# Modal
-gpu: A100-40GB                       # override via CLI / modal_finetune.GPU
-wall_clock_timeout_s: 21600          # 6h hard stop
-save_interval_steps: 500
-max_steps: 5000
+# Warm-start checkpoint:
+#   allenai/MolmoAct2                     -> generic base, fresh processor from our
+#                                            dataset (DEFAULT, most robust)
+#   lerobot/MolmoAct2-SO100_101-LeRobot   -> the published "SO-101 base" (closer
+#                                            embodiment; needs cam0/cam1 rename +
+#                                            SO-101 joint-frame handling)
+base_checkpoint: allenai/MolmoAct2
 
-dataset_repo_id: deskpartner/crumpled_paper_molmoact2
-# camera_keys filled by build_dataset_mixture from dataset meta
-camera_keys: [front, side]
-locked_cameras: true
+# Dataset — private HF repo, pulled on Modal via the 'huggingface' secret.
+# Keep the revision pinned so every run is reproducible.
+dataset_repo_id: Cornerf/rebot-cansort-recycle-merged
+dataset_revision: 9446607fe0815f810a0c8ad92a5d4cdf4c32ece3  # merged: 77 episodes / 51,207 frames (can-sort + two-can-recycle)
 
 finetune:
-  mode: lora                         # lora | action_expert_only
-  enable_lora_vlm: true
-  train_action_expert_only: false
-  enable_lora_action_expert: false   # keep action expert fully trainable (Ai2 rec)
-  full_finetune: false               # NEVER true this weekend
+  mode: action_expert_only    # action_expert_only | lora   (NEVER full)
+  full_finetune: false        # hard guard in build_train_argv()
 
-# Set at venue once confirmed:
-# train_entrypoint: ai2_train_lerobot | newt | lerobot_train
-# train_cmd: ["torchrun", "launch_scripts/train_lerobot.py", ...]
+policy:
+  control_mode: "absolute joint pose"   # reBot teleop records joint angles
+  setup_type: "single rebot b601 arm sorting and recycling cans on a desk"
+  image_keys: ["observation.images.front", "observation.images.side"]
+  chunk_size: 10
+  n_action_steps: 10
+  num_flow_timesteps: 8
 
-inference:
-  serve_on: modal
-  action_chunks: true
+train:
+  steps: 8000                 # 77 demos; raise once we see the loss curve
+  batch_size: 8               # safe for L4 (24GB) action-expert-only
+  num_workers: 4
+  save_freq: 1000
+
+normalization: mean_std       # mean_std (no preprocessing) | quantile (needs augment step)
+
+# Modal
+gpu: L4                       # 24GB, no payment method; override via DESKPARTNER_MODAL_GPU env
+wall_clock_timeout_s: 21600   # 6h hard stop
+
+wandb:
+  enable: true                # live loss dashboard (needs the 'wandb' Modal secret)
+  project: deskpartner-momo
 
 notes: |
-  No zero-shot DROID/SO-100 help for reBot. Demos carry embodiment learning.
-  If Sat night eval bad: one data fix retry, then cut B.
+  MolmoAct2 large model -> cloud A100/H100 only (never local GPU; that's SmolVLA's).
+  Memory (single GPU, bf16): action-expert-only ~16-21 GiB, LoRA-VLM ~20-41 GiB.
+  If A100-40GB OOMs on lora, drop batch_size or switch to action_expert_only.

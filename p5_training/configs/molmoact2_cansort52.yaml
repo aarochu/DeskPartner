@@ -1,0 +1,36 @@
+# MolmoAct2 fine-tune on ONLY the can-sort dataset (52 eps) — single-task hedge.
+# Runs in parallel to the merged 77-ep run; separate exp_name / checkpoints / wandb run.
+# Consumed by p5_training/modal_finetune.py -> build_train_argv().
+
+exp_name: rebot_cansort52_molmoact2
+base_checkpoint: allenai/MolmoAct2
+
+dataset_repo_id: Cornerf/rebot-can-sort-stage1-v1-smoke
+dataset_revision: 74d1f300786d58b4f6f55e1798cbb1a1a48f5409  # 52 episodes / 36,729 frames
+
+finetune:
+  mode: action_expert_only
+  full_finetune: false
+
+policy:
+  control_mode: "absolute joint pose"
+  setup_type: "single rebot b601 arm sorting cans on a desk"
+  image_keys: ["observation.images.front", "observation.images.side"]
+  chunk_size: 10
+  n_action_steps: 10
+  num_flow_timesteps: 8
+  normalize_gripper: true
+
+train:
+  steps: 8000
+  batch_size: 8
+  num_workers: 4
+  save_freq: 1000
+
+normalization: mean_std
+gpu: L4
+wall_clock_timeout_s: 21600
+
+wandb:
+  enable: true
+  project: deskpartner-momo
