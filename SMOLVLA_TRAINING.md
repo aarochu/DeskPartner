@@ -46,6 +46,26 @@ training command must therefore include:
 `pyav` is already installed and bundles its own FFmpeg, so no system install is
 needed. Leave this flag out and training fails at the first batch.
 
+## Important: camera names must match the base model
+
+`smolvla_base` was pretrained expecting **three** cameras named
+`observation.images.camera1`, `camera2`, `camera3`. Our dataset's cameras are
+named differently (`front`, `side`) and there are only two of them, so training
+stops with a "Feature mismatch" error unless you:
+
+1. **Rename** your camera keys to `camera1`/`camera2` with `--rename_map`, and
+2. **Pad** the missing third camera with `--policy.empty_cameras=1`.
+
+For our reBot dataset (`front` = overhead, `side` = 45°) that is:
+
+```
+--rename_map='{"observation.images.front": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}'
+--policy.empty_cameras=1
+```
+
+(Confirm the exact camera key names against the real dataset's `meta/info.json`
+before the first real run — adjust the map if they differ.)
+
 ## Train
 
 ```bash
@@ -53,6 +73,8 @@ HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
   --policy.path=lerobot/smolvla_base \
   --dataset.repo_id=<DATASET_REPO_ID> \
   --dataset.video_backend=pyav \
+  --rename_map='{"observation.images.front": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+  --policy.empty_cameras=1 \
   --policy.device=mps \
   --policy.push_to_hub=false \
   --batch_size=8 \
@@ -82,11 +104,15 @@ HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
   --dataset.repo_id=lerobot/svla_so101_pickplace \
   --dataset.episodes='[0, 1]' \
   --dataset.video_backend=pyav \
+  --rename_map='{"observation.images.side": "observation.images.camera1", "observation.images.up": "observation.images.camera2"}' \
+  --policy.empty_cameras=1 \
   --policy.device=mps \
   --batch_size=2 --steps=20 --save_freq=20 --eval_freq=0 \
   --output_dir=outputs/smolvla/smoke_test \
   --wandb.enable=false
 ```
 
-Success = loss prints and decreases, and a checkpoint appears under
-`outputs/smolvla/smoke_test/checkpoints/`.
+(This public dataset's cameras are `side`/`up`, hence the different rename map
+than our real reBot data.) Success = loss prints and decreases, and a checkpoint
+appears under `outputs/smolvla/smoke_test/checkpoints/`. Verified end-to-end on
+MPS 2026-07-18.
