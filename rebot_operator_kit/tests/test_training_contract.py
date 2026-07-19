@@ -316,6 +316,42 @@ class SessionHomeReturnTest(unittest.TestCase):
         def get_action(self) -> dict[str, float]:
             return dict(self.positions)
 
+    def test_locked_follower_joint_read_never_consumes_camera_frames(self) -> None:
+        class State:
+            pos = np.pi / 2
+            vel = np.pi
+            torq = 1.25
+
+        motor = SimpleNamespace(
+            request_feedback=Mock(),
+            get_state=Mock(return_value=State()),
+        )
+        bus = SimpleNamespace(poll_feedback_once=Mock())
+        robot = SimpleNamespace(
+            motors={"shoulder_pan": motor},
+            bus=bus,
+            get_observation=Mock(side_effect=AssertionError("camera path must not run")),
+        )
+        observation = controlled_record.read_follower_joint_observation(robot)
+        self.assertEqual(observation["shoulder_pan.pos"], 90.0)
+        self.assertEqual(observation["shoulder_pan.vel"], 180.0)
+        self.assertEqual(observation["shoulder_pan.torque"], 1.25)
+        motor.request_feedback.assert_called_once_with()
+        bus.poll_feedback_once.assert_called_once_with()
+        robot.get_observation.assert_not_called()
+
+    def test_camera_sampling_peeks_latest_frames_without_waiting(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        robot = SimpleNamespace(cameras={"front": camera})
+        observation = controlled_record.read_latest_camera_observation(robot)
+        self.assertIs(observation["front"], frame)
+        camera.read_latest.assert_called_once_with(max_age_ms=250)
+        camera.async_read.assert_not_called()
+
     def test_capture_inverts_driver_directions_and_reset_returns_home(self) -> None:
         robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
         expected_home = dict(robot.current)

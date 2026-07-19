@@ -1358,6 +1358,53 @@ def _joint_positions(
     return {name: float(values[name]) for name in feature_names}
 
 
+def read_follower_joint_observation(robot: SeeedB601DMFollower) -> dict[str, float]:
+    """Read follower motor state without waiting on either 30 FPS camera.
+
+    The follower driver's public ``get_observation`` also consumes a new frame
+    from every camera. Calling it in the control loop therefore caps teleop at
+    camera FPS. This motor-only read preserves the driver's feedback/error
+    contract while letting the requested control clock run independently.
+    """
+
+    # Preserve the generic Robot protocol for simulations/test doubles. The
+    # locked B601 runtime always takes the motor-only path below.
+    if not hasattr(robot, "motors") or not hasattr(robot, "bus"):
+        return {
+            key: float(value)
+            for key, value in robot.get_observation().items()
+            if key.endswith((".pos", ".vel", ".torque"))
+        }
+
+    for motor in robot.motors.values():
+        motor.request_feedback()
+    try:
+        robot.bus.poll_feedback_once()
+    except Exception as exc:
+        raise RuntimeError("Follower feedback poll failed; teleoperation stopped.") from exc
+
+    observation: dict[str, float] = {}
+    for motor_name, motor in robot.motors.items():
+        state = motor.get_state()
+        if state is None:
+            raise RuntimeError(
+                f"Follower motor {motor_name!r} has no feedback; teleoperation stopped."
+            )
+        observation[f"{motor_name}.pos"] = math.degrees(state.pos)
+        observation[f"{motor_name}.vel"] = math.degrees(state.vel)
+        observation[f"{motor_name}.torque"] = float(state.torq)
+    return observation
+
+
+def read_latest_camera_observation(robot: SeeedB601DMFollower) -> dict[str, np.ndarray]:
+    """Peek at camera buffers without clearing/waiting on their frame events."""
+
+    return {
+        camera_key: camera.read_latest(max_age_ms=250)
+        for camera_key, camera in robot.cameras.items()
+    }
+
+
 def _physical_positions_to_follower_input(
     robot: SeeedB601DMFollower,
     physical_positions: dict[str, float],
@@ -1379,7 +1426,10 @@ def capture_session_home(
     """Capture the stationary pose that this collection session returns to."""
 
     feature_names = list(robot.action_features)
-    follower_positions = _joint_positions(robot.get_observation(), feature_names)
+    follower_positions = _joint_positions(
+        read_follower_joint_observation(robot),
+        feature_names,
+    )
     leader_positions = _joint_positions(leader.get_action(), feature_names)
     follower_input = _physical_positions_to_follower_input(robot, follower_positions)
     leader_tolerances: dict[str, float] = {}
@@ -1457,7 +1507,10 @@ def automatic_reset_to_session_home(
             print("RESET auto_home interrupted_by_stop", flush=True)
             return None
 
-        observation = _joint_positions(robot.get_observation(), feature_names)
+        observation = _joint_positions(
+            read_follower_joint_observation(robot),
+            feature_names,
+        )
         intermediate_physical = {
             name: observation[name]
             + max(
@@ -1574,7 +1627,7 @@ def control_segment(
             break
         loop_started = time.perf_counter()
         try:
-            observation = robot.get_observation()
+            joint_observation = read_follower_joint_observation(robot)
             leader_action = leader.get_action()
             sent_action = robot.send_action(leader_action)
         except Exception:
@@ -1591,6 +1644,10 @@ def control_segment(
         status_loops += 1
 
         if record and now + 1e-9 >= next_sample:
+            observation = {
+                **joint_observation,
+                **read_latest_camera_observation(robot),
+            }
             # The learning target is the exact follower-space action after directions,
             # limits, and per-tick clipping—not the raw leader command.
             # LeRobot adds frame_index and the exact frame_index / dataset_fps
