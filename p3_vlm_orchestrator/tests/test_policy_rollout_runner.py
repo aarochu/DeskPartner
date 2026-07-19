@@ -326,6 +326,25 @@ class RolloutRunnerTest(unittest.TestCase):
         self.assertEqual(summary.actions_sent, 0)
         self.assertEqual(robot.sent_actions, [])
 
+    def test_public_run_rejects_unbounded_or_nonpositive_cycle_limits(self) -> None:
+        invalid_limits = (None, True, False, 0, -1, 1.0, "1")
+        for invalid in invalid_limits:
+            with self.subTest(max_cycles=invalid):
+                stop = Event()
+                stop.set()
+                robot = FakeRobot()
+                runner = self.make_runner(
+                    policy=HoldPositionPolicy(),
+                    robot=robot,
+                    stop_requested=stop,
+                )
+
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    runner.run(invalid)  # type: ignore[arg-type]
+
+                self.assertEqual(robot.connect_count, 0)
+                self.assertEqual(robot.disconnect_count, 0)
+
     def test_shadow_invokes_workspace_guard_on_copy_before_safety_and_never_sends(self) -> None:
         events: list[str] = []
         guard = RecordingActionGuard(events)

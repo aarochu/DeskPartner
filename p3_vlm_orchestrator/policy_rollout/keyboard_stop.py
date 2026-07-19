@@ -173,17 +173,21 @@ class KeyboardStop:
             except Exception as exc:
                 self._warn(f"WARNING: terminal keyboard reader stopped: {exc}")
                 return
+            if character == "":
+                return
             if character in STOP_KEYS:
                 self.stop()
                 return
             if character in SUCCESS_KEYS:
                 with self._verdict_lock:
-                    self._verdict = "success"
-                return
+                    if self._verdict is None:
+                        self._verdict = "success"
+                continue
             if character in FAILURE_KEYS:
                 with self._verdict_lock:
-                    self._verdict = "failure"
-                return
+                    if self._verdict is None:
+                        self._verdict = "failure"
+                continue
 
     def _restore_terminal(self) -> None:
         if self._terminal_fd is None or self._terminal_state is None:

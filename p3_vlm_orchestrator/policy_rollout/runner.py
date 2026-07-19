@@ -115,6 +115,12 @@ class RolloutRunner:
     def run(self, max_cycles: int) -> RunSummary:
         """Run until the cycle limit, a stop request, or a fail-closed fault."""
 
+        if (
+            isinstance(max_cycles, bool)
+            or not isinstance(max_cycles, int)
+            or max_cycles <= 0
+        ):
+            raise ValueError("Rollout max_cycles must be a positive integer")
         return self._run(max_cycles=max_cycles, episode=None)
 
     def run_episode(

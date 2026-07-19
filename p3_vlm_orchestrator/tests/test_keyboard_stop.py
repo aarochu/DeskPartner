@@ -158,6 +158,18 @@ class KeyboardStopTest(unittest.TestCase):
                     self.assertEqual(stop.verdict(), expected)
                     self.assertFalse(stop.event.is_set())
 
+    def test_queued_stop_after_verdict_still_sets_the_shared_stop_event(self) -> None:
+        for characters, expected in (("sq", "success"), ("f\x1b", "failure")):
+            with self.subTest(characters=repr(characters)):
+                stop, _signals, _termios, _tty, _warnings = self.make_stop(
+                    stdin=FakeInput(tty=True, characters=characters),
+                    thread_factory=ImmediateThread,
+                )
+
+                with stop:
+                    self.assertEqual(stop.verdict(), expected)
+                    self.assertTrue(stop.event.is_set())
+
     def test_sigint_and_sigterm_handlers_set_the_same_event(self) -> None:
         for signum in (FakeSignalAPI.SIGINT, FakeSignalAPI.SIGTERM):
             with self.subTest(signum=signum):
