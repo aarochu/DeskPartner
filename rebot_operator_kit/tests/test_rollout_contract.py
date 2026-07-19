@@ -20,6 +20,17 @@ from rebot_operator_kit.rollout.contracts import (
 FRONT_IMAGE_KEY = "observation.images.front"
 SIDE_IMAGE_KEY = "observation.images.side"
 TASK = "Pick up the crumpled paper ball and place it in the trash bin"
+COORDINATE_FRAME = "follower_degrees_after_direction_limits_and_step_cap"
+CONTROL_MODE = "absolute joint pose"
+JOINT_NAMES = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_yaw",
+    "wrist_roll",
+    "gripper",
+]
 
 
 def canonical_digest(value: object) -> str:
@@ -62,7 +73,12 @@ class CheckpointBundleTest(unittest.TestCase):
             "profile_id": "rebot-test-profile",
             "profile_version": 1,
             "collection_defaults": {"task": TASK},
-            "coordinate_contract": {"action_dimension": 7},
+            "coordinate_contract": {
+                "frame": COORDINATE_FRAME,
+                "control_mode": CONTROL_MODE,
+                "action_dimension": 7,
+                "joints": [{"name": name} for name in JOINT_NAMES],
+            },
             "training_defaults": {
                 "action_dimension": 7,
                 "chunk_size": 10,
@@ -158,6 +174,37 @@ class CheckpointBundleTest(unittest.TestCase):
         self._write_profile_sidecar()
 
         self.assert_rejected("action dimension.*7")
+
+    def test_rejects_reordered_joint_names(self) -> None:
+        joints = self.profile["coordinate_contract"]["joints"]
+        joints[0], joints[1] = joints[1], joints[0]
+        self._write_profile_sidecar()
+
+        self.assert_rejected("joint names.*order")
+
+    def test_rejects_missing_coordinate_frame(self) -> None:
+        self.profile["coordinate_contract"].pop("frame")
+        self._write_profile_sidecar()
+
+        self.assert_rejected("coordinate frame")
+
+    def test_rejects_wrong_coordinate_frame(self) -> None:
+        self.profile["coordinate_contract"]["frame"] = "leader_degrees"
+        self._write_profile_sidecar()
+
+        self.assert_rejected("coordinate frame")
+
+    def test_rejects_missing_control_mode(self) -> None:
+        self.profile["coordinate_contract"].pop("control_mode")
+        self._write_profile_sidecar()
+
+        self.assert_rejected("control mode")
+
+    def test_rejects_wrong_control_mode(self) -> None:
+        self.profile["coordinate_contract"]["control_mode"] = "velocity"
+        self._write_profile_sidecar()
+
+        self.assert_rejected("control mode")
 
     def test_rejects_nonpositive_chunk_size(self) -> None:
         self.profile["training_defaults"]["chunk_size"] = 0

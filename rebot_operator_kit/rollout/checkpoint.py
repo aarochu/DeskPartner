@@ -19,6 +19,17 @@ EXPECTED_IMAGE_ORDER = (
     "observation.images.front",
     "observation.images.side",
 )
+EXPECTED_COORDINATE_FRAME = "follower_degrees_after_direction_limits_and_step_cap"
+EXPECTED_CONTROL_MODE = "absolute joint pose"
+EXPECTED_JOINT_NAMES = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_yaw",
+    "wrist_roll",
+    "gripper",
+)
 
 
 class CheckpointError(ValueError):
@@ -114,6 +125,25 @@ class CheckpointBundle:
 
         coordinates = _required_object(profile, "coordinate_contract")
         training = _required_object(profile, "training_defaults")
+        if coordinates.get("frame") != EXPECTED_COORDINATE_FRAME:
+            raise CheckpointError(
+                f"Checkpoint coordinate frame must be {EXPECTED_COORDINATE_FRAME}"
+            )
+        if coordinates.get("control_mode") != EXPECTED_CONTROL_MODE:
+            raise CheckpointError(
+                f"Checkpoint control mode must be {EXPECTED_CONTROL_MODE}"
+            )
+        joints = coordinates.get("joints")
+        joint_names = (
+            [joint.get("name") for joint in joints]
+            if isinstance(joints, list)
+            and all(isinstance(joint, dict) for joint in joints)
+            else None
+        )
+        if joint_names != list(EXPECTED_JOINT_NAMES):
+            raise CheckpointError(
+                "Checkpoint joint names must match the seven-joint profile order"
+            )
         coordinate_dimension = coordinates.get("action_dimension")
         training_dimension = training.get("action_dimension")
         if (
