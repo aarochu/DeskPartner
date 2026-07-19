@@ -34,6 +34,14 @@ artifacts/
 *.rrd
 *.traj.npz
 
+# Training artifacts (SmolVLA / MolmoAct) — large weights & logs, never commit
+wandb/
+checkpoints/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+
 # OS / IDE
 .DS_Store
 Thumbs.db
