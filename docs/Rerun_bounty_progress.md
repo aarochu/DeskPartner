@@ -18,15 +18,25 @@
 | Slice B — calibrate docs | done | Documented in `p5_rerun_port/README.md` |
 | Slice C — `record_episode` → `.rrd` | done (dry-run) | Fake episode → catalog + `.traj.npz` + frames |
 | Slice D — `query_dataset` | done | Tag filter + entity inspect via traj sidecar |
+| Slice D2 — **Rerun Query API** | done (dry-run) | `query_api_cli`: Server + `reader()` + goal-vs-position; see `QUERY_API.md` |
 | Slice E — `export_lerobot` | done (dry-run) | `robot_type=seeed_b601_dm_follower`, 7 joints, front/side |
 | Slice F — `replay_episode` | done (dry-run) | Fake replay OK; live follower TODO on venue |
 | Live arm e2e (no `--fake`) | TODO | Venue: log → record → export → replay |
 | Demo video + 60s pitch | TODO | |
 | Off-site sync (RRDs / checkpoints) | TODO | |
 
-**Last updated:** 2026-07-18 — dry-run loop green on Windows; docs consolidated under `docs/`; awaiting venue hardware validation.
+**Last updated:** 2026-07-18 — Query API CLI added (`rr.server.Server` + dataframe reader); dry-run green; live arm still TODO.
 
-**Pipeline flowchart:** see [`p5_rerun_port/README.md`](./p5_rerun_port/README.md#how-it-connects-flowchart) (GUI track vs Rerun bounty loop vs training).
+**Pipeline flowchart:** see [`p5_rerun_port/README.md`](./p5_rerun_port/README.md#how-it-connects-flowchart) (GUI track vs Rerun bounty loop vs training).  
+**Query API docs:** [`p5_rerun_port/QUERY_API.md`](./p5_rerun_port/QUERY_API.md)
+
+### Other Rerun prizes (status)
+
+| Prize | Status |
+|-------|--------|
+| $1k non-SO-101 port | Code + dry-run; live e2e TODO |
+| $2k Query API | Implemented: `query_api_cli` + docs (dry-run on fake `.rrd`) |
+| $2k interesting Viewer | Not implemented (no custom blueprints/views yet) |
 
 ---
 
