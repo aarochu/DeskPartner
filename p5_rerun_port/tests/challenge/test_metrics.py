@@ -66,6 +66,7 @@ def test_exact_tracking_metrics_derivatives_and_units() -> None:
 
     assert metrics.per_joint["tracking_mae_deg"] == pytest.approx(offsets)
     assert metrics.per_joint["tracking_max_abs_error_deg"] == pytest.approx(offsets)
+    assert metrics.values["zero_lag_mae_deg"] == pytest.approx(np.mean(offsets))
     assert metrics.values["tracking_rms_deg"] == pytest.approx(math.sqrt(np.mean(offsets**2)))
     assert metrics.values["action_jerk_max_deg_s3"] == 0.0
     assert metrics.values["state_jerk_p95_deg_s3"] == 0.0
@@ -107,6 +108,27 @@ def test_lag_tie_prefers_smaller_magnitude_then_negative_sign() -> None:
     assert metrics.values["best_lag_frames"] == -1
 
 
+def test_zero_and_corrected_lag_scores_share_common_action_anchor_window() -> None:
+    config = ChallengeConfig.load(CONFIG)
+    n = 90
+    action = np.zeros((n, 7), dtype=np.float64)
+    action[:, 0] = 30 * np.sin(np.linspace(0, 10, n))
+    state = action.copy()
+    # Large-but-in-limit edge errors would inflate an all-row zero-lag score.
+    # They are outside the common action anchors used for every lag candidate.
+    state[:15, 0] = np.clip(state[:15, 0] + 80, -145, 145)
+    state[-15:, 0] = np.clip(state[-15:, 0] - 80, -145, 145)
+
+    metrics = measure_aligned(_episode(action, state), config)
+
+    assert metrics.values["lag_common_anchor_count"] == 60
+    assert metrics.values["best_lag_frames"] == 0
+    assert metrics.values["zero_lag_mae_deg"] == 0.0
+    assert metrics.values["zero_lag_rms_deg"] == 0.0
+    assert metrics.values["lag_corrected_rms_deg"] == 0.0
+    assert metrics.values["tracking_rms_deg"] > 0
+
+
 def test_stationary_and_saturation_boundaries_are_inclusive_and_units_are_total() -> None:
     config = ChallengeConfig.load(CONFIG)
     lower = np.asarray(config.robot_profile.action_limits_deg)[:, 0]
@@ -140,8 +162,32 @@ def test_hard_reason_order_camera_gaps_and_gripper_hysteresis() -> None:
         "CAMERA_FRONT_MISSING_OR_STALE",
     )
     assert metrics.values["camera_front_gap_count"] == 2
+    assert metrics.values["state_present_sample_count"] == 8
+    assert metrics.values["state_missing_sample_count"] == 0
+    assert metrics.values["state_coverage_fraction"] == 1.0
+    assert metrics.values["state_gap_count"] == 0
     assert metrics.values["gripper_close_transition_count"] == 2
     assert metrics.values["gripper_open_transition_count"] == 2
+
+
+def test_state_coverage_counts_missing_runs_in_action_anchor_order() -> None:
+    config = ChallengeConfig.load(CONFIG)
+    n = 6
+    action = np.tile(np.asarray([0, -80, -100, 0, 0, 0, -100.0]), (n, 1))
+    present = np.asarray([True, False, False, True, False, True])
+
+    metrics = measure_aligned(
+        _episode(action, action, state_present=present), config
+    )
+
+    assert metrics.values["state_present_sample_count"] == 3
+    assert metrics.values["state_missing_sample_count"] == 3
+    assert metrics.values["state_coverage_fraction"] == 0.5
+    assert metrics.values["state_gap_count"] == 2
+    assert metrics.metric_units["state_present_sample_count"] == "count"
+    assert metrics.metric_units["state_missing_sample_count"] == "count"
+    assert metrics.metric_units["state_coverage_fraction"] == "ratio"
+    assert metrics.metric_units["state_gap_count"] == "count"
 
 
 def test_action_limits_are_exact_and_state_has_separate_quarter_degree_tolerance() -> None:
@@ -170,7 +216,8 @@ def test_rejected_artifact_yields_one_zero_sample_row_without_open(monkeypatch) 
     metrics = measure_artifact(artifact, config)
     assert metrics.sample_count == 0
     assert metrics.hard_reasons == ("RRD_VERIFY_FAILED",)
-    assert metrics.values == {}
+    assert metrics.values == {"sample_count": 0}
+    assert metrics.metric_units == {"sample_count": "count"}
 
 
 def test_metric_types_are_label_blind() -> None:

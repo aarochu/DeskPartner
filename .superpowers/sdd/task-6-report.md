@@ -112,3 +112,34 @@ Additional checks: `compileall` passed for `p5_rerun_port/challenge`, and
 - The metadata-only pinned scan cannot prove decoded camera coverage for all 77
   successes. Full camera acceptance remains dependent on Task 4 materialization
   of each canonical episode, exactly as recorded in the feasibility probe.
+
+## Review fixes
+
+The Task 6 review identified an edge-window comparability defect and missing
+coverage/count outputs. The corrected lag implementation now computes exposed
+`zero_lag_mae_deg`, `zero_lag_rms_deg`, and normalized zero-lag RMS on the
+same fixed action anchors used by every lag candidate. The selected lag still
+uses the authenticated `+k` convention, span-normalized RMS, and deterministic
+rounded-score tie order. A regression places large errors only in the 15-frame
+edges and proves they neither inflate the common-window zero score nor create a
+false lag improvement.
+
+State alignment now exports present count, missing count, coverage fraction,
+and missing-run gap count in action-anchor order. Both accepted and rejected
+rows export `sample_count` with unit `count`; the complete metric schema test
+proves every scalar/status and per-joint key has a unit.
+
+Direct duplicate-source regressions prove repeated state timestamps reject as
+`STATE_MISSING_OR_STALE` and repeated camera timestamps reject as
+`CAMERA_FRONT_MISSING_OR_STALE` before `searchsorted` can depend on ambiguous
+row order.
+
+Review-fix verification:
+
+```text
+focused alignment + metrics: 16 passed
+all challenge tests:          126 passed
+all p5 tests:                 133 passed
+compileall:                   passed
+git diff --check:             clean
+```

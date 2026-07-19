@@ -9,6 +9,7 @@ import pytest
 from p5_rerun_port.challenge.alignment import (
     AlignmentError,
     _latest_at,
+    _require_unique_observation_times,
     extract_aligned_episode,
 )
 from p5_rerun_port.challenge.config import ChallengeConfig
@@ -43,6 +44,23 @@ def test_latest_at_camera_boundary_is_exact() -> None:
     )
     assert ages.tolist() == [66_666_667, -1]
     assert present.tolist() == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("reason", "name"),
+    [
+        ("STATE_MISSING_OR_STALE", "state"),
+        ("CAMERA_FRONT_MISSING_OR_STALE", "front camera"),
+    ],
+)
+def test_duplicate_observation_timestamps_reject_before_latest_at(
+    reason: str, name: str
+) -> None:
+    with pytest.raises(AlignmentError, match=f"duplicate {name} timestamps") as raised:
+        _require_unique_observation_times(
+            np.asarray([0, 33_333_333, 33_333_333], dtype=np.int64), reason, name
+        )
+    assert raised.value.reason_codes == (reason,)
 
 
 def _disconnect(recording: Any) -> None:

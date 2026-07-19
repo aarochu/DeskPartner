@@ -231,6 +231,15 @@ def _latest_at(
     return indexes, np.where(present, matched, -1), np.where(present, age, -1), present
 
 
+def _require_unique_observation_times(
+    observation_time_ns: np.ndarray, reason_code: str, stream_name: str
+) -> None:
+    """Reject ambiguous latest-at sources instead of depending on row order."""
+    times = np.asarray(observation_time_ns, dtype=np.int64)
+    if len(times) != len(np.unique(times)):
+        raise AlignmentError((reason_code,), f"duplicate {stream_name} timestamps")
+
+
 def _reason_for_exception(reason: str, message: str, error: Exception) -> AlignmentError:
     return AlignmentError((reason,), f"{message}: {error}")
 
@@ -324,8 +333,9 @@ def extract_aligned_episode(
         )
     except Exception as error:
         raise _reason_for_exception("STATE_MISSING_OR_STALE", "state query failed", error)
-    if len(state_rows.time_ns) != len(np.unique(state_rows.time_ns)):
-        raise AlignmentError(("STATE_MISSING_OR_STALE",), "duplicate state timestamps")
+    _require_unique_observation_times(
+        state_rows.time_ns, "STATE_MISSING_OR_STALE", "state"
+    )
     state_vectors = []
     state_source_dimension = []
     state_valid = []
@@ -369,9 +379,8 @@ def extract_aligned_episode(
         except Exception as error:
             reason = f"CAMERA_{key.upper()}_MISSING_OR_STALE"
             raise _reason_for_exception(reason, f"{key} camera query failed", error)
-        if len(rows.time_ns) != len(np.unique(rows.time_ns)):
-            reason = f"CAMERA_{key.upper()}_MISSING_OR_STALE"
-            raise AlignmentError((reason,), f"duplicate {key} camera timestamps")
+        reason = f"CAMERA_{key.upper()}_MISSING_OR_STALE"
+        _require_unique_observation_times(rows.time_ns, reason, f"{key} camera")
         indexes, matched, ages, present = _latest_at(
             action_rows.time_ns, rows.time_ns, config.quality.max_camera_age_ns
         )

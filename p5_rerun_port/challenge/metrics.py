@@ -161,20 +161,43 @@ def _lag(
     valid: np.ndarray,
     spans: np.ndarray,
     config: ChallengeConfig,
-    zero_raw: float,
-    zero_normalized: float,
-) -> tuple[int | None, str, float, float, tuple[float, ...]]:
+    full_zero_mae: float,
+    full_zero_raw: float,
+    full_zero_normalized: float,
+) -> tuple[
+    int | None,
+    str,
+    float,
+    float,
+    float,
+    int,
+    float,
+    float,
+    tuple[float, ...],
+]:
     finite_action = action[valid]
     if not len(finite_action):
-        return None, "insufficient_samples", zero_raw, zero_normalized, tuple([float("nan")] * 7)
+        return (
+            None, "insufficient_samples", full_zero_mae, full_zero_raw,
+            full_zero_normalized, 0, full_zero_raw, full_zero_normalized,
+            tuple([float("nan")] * 7),
+        )
     motion = np.ptp(finite_action, axis=0) / spans
     if float(np.sqrt(np.mean(motion**2))) < config.quality.lag_min_normalized_motion_range:
         error = action[valid] - state[valid]
         per_joint = tuple(np.sqrt(np.mean(error**2, axis=0))) if len(error) else tuple([float("nan")] * 7)
-        return None, "insufficient_motion", zero_raw, zero_normalized, per_joint
+        return (
+            None, "insufficient_motion", full_zero_mae, full_zero_raw,
+            full_zero_normalized, int(np.count_nonzero(valid)), full_zero_raw,
+            full_zero_normalized, per_joint,
+        )
     window = config.quality.lag_search_frames
     if len(action) < 2 * window + 1:
-        return None, "insufficient_samples", zero_raw, zero_normalized, tuple([float("nan")] * 7)
+        return (
+            None, "insufficient_samples", full_zero_mae, full_zero_raw,
+            full_zero_normalized, int(np.count_nonzero(valid)), full_zero_raw,
+            full_zero_normalized, tuple([float("nan")] * 7),
+        )
     anchors = np.arange(window, len(action) - window)
     # Every lag is scored on exactly the same valid action anchors.
     common = valid[anchors].copy()
@@ -182,7 +205,15 @@ def _lag(
         common &= valid[anchors + lag]
     anchors = anchors[common]
     if not len(anchors):
-        return None, "insufficient_samples", zero_raw, zero_normalized, tuple([float("nan")] * 7)
+        return (
+            None, "insufficient_samples", full_zero_mae, full_zero_raw,
+            full_zero_normalized, 0, full_zero_raw, full_zero_normalized,
+            tuple([float("nan")] * 7),
+        )
+    zero_error = action[anchors] - state[anchors]
+    zero_mae = float(np.mean(np.abs(zero_error)))
+    zero_raw = float(np.sqrt(np.mean(zero_error**2)))
+    zero_normalized = float(np.sqrt(np.mean((zero_error / spans) ** 2)))
     candidates: list[tuple[tuple[float, int, int], int, float, float, tuple[float, ...]]] = []
     for lag in range(-window, window + 1):
         error = action[anchors] - state[anchors + lag]
@@ -192,7 +223,10 @@ def _lag(
         key = (round(normalized_rms, config.quality.lag_score_round_decimals), abs(lag), lag)
         candidates.append((key, lag, raw_rms, normalized_rms, per_joint))
     _, lag, raw_rms, normalized_rms, per_joint = min(candidates, key=lambda item: item[0])
-    return lag, "ok", raw_rms, normalized_rms, per_joint
+    return (
+        lag, "ok", zero_mae, zero_raw, zero_normalized, len(anchors),
+        raw_rms, normalized_rms, per_joint,
+    )
 
 
 def _gripper_transitions(
@@ -215,7 +249,17 @@ def _gripper_transitions(
 
 
 def _empty(identity: str, reasons: tuple[str, ...], task_key: str | None = None) -> EpisodeMetrics:
-    return EpisodeMetrics(identity, None, task_key, METRIC_SCHEMA_VERSION, 0, {}, {}, {}, reasons)
+    return EpisodeMetrics(
+        identity,
+        None,
+        task_key,
+        METRIC_SCHEMA_VERSION,
+        0,
+        {"sample_count": 0},
+        {},
+        {"sample_count": "count"},
+        reasons,
+    )
 
 
 def measure_aligned(episode: AlignedEpisode, config: ChallengeConfig) -> EpisodeMetrics:
@@ -225,6 +269,8 @@ def measure_aligned(episode: AlignedEpisode, config: ChallengeConfig) -> Episode
     units: dict[str, str] = {}
     reasons: set[str] = set()
     n = len(episode.frame)
+    values["sample_count"] = n
+    units["sample_count"] = "count"
     if episode.joint_names != config.joint_names:
         reasons.add("JOINT_SCHEMA_MISMATCH")
     if n != episode.expected_sample_count:
@@ -296,26 +342,49 @@ def measure_aligned(episode: AlignedEpisode, config: ChallengeConfig) -> Episode
         per_joint["tracking_mae_deg"] = tuple(np.mean(absolute, axis=0))
         per_joint["tracking_rms_deg"] = tuple(np.sqrt(np.mean(error**2, axis=0)))
         per_joint["tracking_max_abs_error_deg"] = tuple(np.max(absolute, axis=0))
-        zero_raw = float(np.sqrt(np.mean(error**2)))
-        zero_normalized = float(np.sqrt(np.mean((error / spans) ** 2)))
+        full_zero_mae = float(np.mean(absolute))
+        full_zero_raw = float(np.sqrt(np.mean(error**2)))
+        full_zero_normalized = float(np.sqrt(np.mean((error / spans) ** 2)))
         values["tracking_mae_deg"] = float(np.mean(absolute))
-        values["tracking_rms_deg"] = zero_raw
+        values["tracking_rms_deg"] = full_zero_raw
         values["tracking_max_abs_error_deg"] = float(np.max(absolute))
     else:
         nan7 = tuple([float("nan")] * 7)
         per_joint.update({"tracking_mae_deg": nan7, "tracking_rms_deg": nan7, "tracking_max_abs_error_deg": nan7})
-        zero_raw = zero_normalized = float("nan")
+        full_zero_mae = full_zero_raw = full_zero_normalized = float("nan")
         values.update({"tracking_mae_deg": float("nan"), "tracking_rms_deg": float("nan"), "tracking_max_abs_error_deg": float("nan")})
     for name in ("tracking_mae_deg", "tracking_rms_deg", "tracking_max_abs_error_deg"):
         units[name] = "deg"
-    values["zero_lag_rms_deg"] = zero_raw
-    units["zero_lag_rms_deg"] = "deg"
-    values["zero_lag_normalized_rms"] = zero_normalized
-    units["zero_lag_normalized_rms"] = "range"
-
-    lag, lag_status, lag_raw, lag_normalized, lag_per_joint = _lag(
-        episode.action, episode.state, paired, spans, config, zero_raw, zero_normalized
+    (
+        lag,
+        lag_status,
+        zero_mae,
+        zero_raw,
+        zero_normalized,
+        lag_anchor_count,
+        lag_raw,
+        lag_normalized,
+        lag_per_joint,
+    ) = _lag(
+        episode.action,
+        episode.state,
+        paired,
+        spans,
+        config,
+        full_zero_mae,
+        full_zero_raw,
+        full_zero_normalized,
     )
+    values["zero_lag_mae_deg"] = zero_mae
+    values["zero_lag_rms_deg"] = zero_raw
+    values["zero_lag_normalized_rms"] = zero_normalized
+    values["lag_common_anchor_count"] = lag_anchor_count
+    units.update({
+        "zero_lag_mae_deg": "deg",
+        "zero_lag_rms_deg": "deg",
+        "zero_lag_normalized_rms": "range",
+        "lag_common_anchor_count": "count",
+    })
     values["best_lag_frames"] = lag
     values["best_lag_seconds"] = lag * config.quality.sample_period_s if lag is not None else None
     values["lag_status"] = lag_status
@@ -365,6 +434,17 @@ def measure_aligned(episode: AlignedEpisode, config: ChallengeConfig) -> Episode
     values.update({"gripper_open_transition_count": opens, "gripper_close_transition_count": closes, "gripper_transition_count": opens + closes, "gripper_total_travel_deg": float(np.sum(gripper_delta)) if len(gripper_delta) else 0.0, "gripper_range_deg": float(np.ptp(gripper[valid_action])) if np.any(valid_action) else float("nan")})
     units.update({"gripper_open_transition_count": "count", "gripper_close_transition_count": "count", "gripper_transition_count": "count", "gripper_total_travel_deg": "deg", "gripper_range_deg": "deg"})
 
+    state_count = int(np.count_nonzero(state_present))
+    values["state_present_sample_count"] = state_count
+    values["state_missing_sample_count"] = n - state_count
+    values["state_coverage_fraction"] = state_count / n if n else 0.0
+    values["state_gap_count"] = _missing_run_count(state_present)
+    units.update({
+        "state_present_sample_count": "count",
+        "state_missing_sample_count": "count",
+        "state_coverage_fraction": "ratio",
+        "state_gap_count": "count",
+    })
     _age_metrics(values, units, "state", episode.state_age_ns, state_present)
     for key in config.camera_keys:
         present = np.asarray(episode.camera_present.get(key, np.zeros(n)), dtype=bool)
