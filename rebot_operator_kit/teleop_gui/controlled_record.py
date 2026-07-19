@@ -23,17 +23,20 @@ from __future__ import annotations
 
 import argparse
 import av
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
 import math
 import numbers
+import os
 from pathlib import Path
 import queue
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -665,6 +668,101 @@ def archive_attempt_videos(
     return artifacts
 
 
+@contextmanager
+def reuse_attempt_videos_for_lerobot(
+    dataset: LeRobotDataset,
+    directory: Path,
+):
+    """Hand verified attempt MP4s to LeRobot instead of encoding them twice.
+
+    ``finalize_attempt_archive`` has already encoded and frame-checked one MP4
+    per camera.  LeRobot normally encodes the same PNG directories again in
+    ``save_episode``.  Temporarily replace that encoder with a hard-link (or a
+    copy when links are unavailable) to the verified archive video.  LeRobot
+    is then free to move/concatenate its private link while the replay archive
+    remains immutable beside ``attempt.rrd``.
+    """
+
+    original_encoder = dataset._encode_temporary_episode_video
+    expected_keys = set(dataset.meta.video_keys)
+    handed_off: set[str] = set()
+
+    def archived_video(video_key: str, episode_index: int) -> Path:
+        if video_key not in expected_keys:
+            raise RuntimeError(f"Unexpected LeRobot video key: {video_key}")
+        source = directory / _camera_artifact_name(video_key)
+        if not source.is_file() or source.stat().st_size <= 0:
+            raise RuntimeError(f"Verified attempt video is missing: {source}")
+
+        temporary_dir = Path(
+            tempfile.mkdtemp(prefix=".rebot-video-handoff-", dir=dataset.root)
+        )
+        temporary_video = temporary_dir / f"episode-{episode_index:06d}.mp4"
+        try:
+            os.link(source, temporary_video)
+        except OSError:
+            shutil.copy2(source, temporary_video)
+
+        # This mirrors LeRobot's normal encoder worker: after the encoded
+        # video exists, its temporary source PNGs are no longer needed.
+        frame_directory = dataset._get_image_file_dir(episode_index, video_key)
+        if frame_directory.is_dir():
+            shutil.rmtree(frame_directory)
+        handed_off.add(video_key)
+        return temporary_video
+
+    dataset._encode_temporary_episode_video = archived_video  # type: ignore[method-assign]
+    try:
+        yield
+        if handed_off != expected_keys:
+            missing = sorted(expected_keys - handed_off)
+            raise RuntimeError(f"LeRobot did not consume archived camera videos: {missing}")
+    finally:
+        dataset._encode_temporary_episode_video = original_encoder  # type: ignore[method-assign]
+
+
+def checkpoint_and_reopen_dataset(
+    dataset: LeRobotDataset,
+    *,
+    expected_episode_index: int,
+) -> LeRobotDataset:
+    """Finalize one episode and prove a fresh LeRobot loader can read it.
+
+    Reusing a finalized dataset object would reopen and overwrite its last
+    parquet file.  A fresh object intentionally advances to new parquet/video
+    files, so every subsequent attempt stays independently durable.
+    """
+
+    expected_episodes = expected_episode_index + 1
+    expected_frames = int(dataset.meta.total_frames)
+    expected_fps = int(dataset.fps)
+    expected_video_keys = set(dataset.meta.video_keys)
+    dataset._wait_image_writer()
+    dataset.stop_image_writer()
+    dataset.finalize()
+
+    reopened = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        batch_encoding_size=1,
+        vcodec=dataset.vcodec,
+    )
+    if reopened.num_episodes != expected_episodes:
+        raise RuntimeError(
+            "LeRobot durability check failed: "
+            f"fresh loader sees {reopened.num_episodes} episodes, expected {expected_episodes}"
+        )
+    if reopened.num_frames != expected_frames:
+        raise RuntimeError(
+            "LeRobot durability check failed: "
+            f"fresh loader sees {reopened.num_frames} frames, expected {expected_frames}"
+        )
+    if reopened.fps != expected_fps or set(reopened.meta.video_keys) != expected_video_keys:
+        raise RuntimeError("LeRobot durability check failed: reopened schema does not match")
+    reopened.start_image_writer(num_processes=0, num_threads=8)
+    return reopened
+
+
 def verify_and_commit_rerun(directory: Path) -> Path:
     partial = directory / "attempt.partial.rrd"
     final = directory / "attempt.rrd"
@@ -858,6 +956,8 @@ def mark_attempt_in_training(directory: Path, episode_index: int) -> None:
     metadata["training_included"] = True
     metadata["training_episode_index"] = episode_index
     metadata["training_saved_at"] = utc_now()
+    metadata["training_commit_state"] = "durable"
+    metadata["lerobot_fresh_load_verified"] = True
     atomic_write_json(path, metadata)
 
 
@@ -1485,7 +1585,7 @@ def main() -> int:
 
         completed_this_run = 0
         attempt_number = 0
-        with RecoverySafeVideoEncodingManager(dataset):
+        with RecoverySafeVideoEncodingManager(dataset) as encoding_manager:
             while completed_this_run < args.episodes and not events["stop"]:
                 episode_index = dataset.num_episodes
                 attempt_number += 1
@@ -1651,6 +1751,11 @@ def main() -> int:
                             "archived but excluded from training"
                         )
 
+                    print(
+                        f"ATTEMPT save_started id={metadata['attempt_id']} "
+                        "phase=rerun_and_attempt_videos",
+                        flush=True,
+                    )
                     finalize_attempt_archive(
                         dataset=dataset,
                         directory=directory,
@@ -1662,10 +1767,25 @@ def main() -> int:
                         duration_s=duration_s,
                         actual_hz=mean_hz,
                     )
-                    dataset.save_episode(parallel_encoding=False)
+                    print(
+                        f"ATTEMPT save_phase id={metadata['attempt_id']} phase=lerobot",
+                        flush=True,
+                    )
+                    with reuse_attempt_videos_for_lerobot(dataset, directory):
+                        dataset.save_episode(parallel_encoding=False)
+                    dataset = checkpoint_and_reopen_dataset(
+                        dataset,
+                        expected_episode_index=episode_index,
+                    )
+                    encoding_manager.dataset = dataset
                     dataset_save_completed = True
                     mark_attempt_in_training(directory, episode_index)
                     completed_this_run += 1
+                    print(
+                        f"ATTEMPT lerobot_durable id={metadata['attempt_id']} "
+                        f"episode={episode_index} total_episodes={dataset.num_episodes}",
+                        flush=True,
+                    )
                     print(
                         f"ATTEMPT archived_kept id={metadata['attempt_id']} "
                         f"episode={episode_index} samples={samples} control_hz={mean_hz:.1f} "

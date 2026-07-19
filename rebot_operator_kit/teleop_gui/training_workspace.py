@@ -443,6 +443,8 @@ def collection_contract_lock(config: dict[str, Any]) -> dict[str, Any]:
 
 def runtime_env() -> dict[str, str]:
     env = os.environ.copy()
+    hf_home = KIT_ROOT / ".state" / "huggingface"
+    hf_home.mkdir(parents=True, exist_ok=True)
     paths = [
         RUNTIME_ROOT / "lerobot" / "src",
         RUNTIME_ROOT / "lerobot-robot-seeed-b601",
@@ -454,6 +456,11 @@ def runtime_env() -> dict[str, str]:
         [str(path) for path in paths] + ([inherited] if inherited else [])
     )
     env["HF_LEROBOT_HOME"] = str(HF_LEROBOT_HOME)
+    # Keep every dataset-loader cache inside the isolated Operator Kit instead
+    # of modifying the user's shared ~/.cache/huggingface state.
+    env["HF_HOME"] = str(hf_home)
+    env["HF_DATASETS_CACHE"] = str(hf_home / "datasets")
+    env["HUGGINGFACE_HUB_CACHE"] = str(hf_home / "hub")
     env["PATH"] = str(VENV / "bin") + os.pathsep + env.get("PATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
@@ -1280,6 +1287,7 @@ class TrainingManager:
         self._fault: str | None = None
         self._record_control_file: Path | None = None
         self._record_decision_pending = False
+        self._record_phase: str | None = None
         self._seq = 0
         self._logs: deque[dict[str, Any]] = deque(maxlen=2500)
         self._append_log("INFO", "ReBot data and training workspace ready")
@@ -1371,6 +1379,7 @@ class TrainingManager:
             self._fault = None
             self._record_control_file = record_control_file if kind == "record" else None
             self._record_decision_pending = kind == "record"
+            self._record_phase = "starting" if kind == "record" else None
         self._append_log("INFO", f"Starting {kind}")
         owner_read_fd, owner_write_fd = os.pipe()
         owner_stop_signal = "SIGHUP" if kind == "record" else "SIGINT"
@@ -1435,6 +1444,7 @@ class TrainingManager:
                 self._fault = str(exc)
                 self._record_control_file = None
                 self._record_decision_pending = False
+                self._record_phase = None
             self._append_log("ERROR", f"{kind} failed to start: {exc}")
             raise
         os.close(owner_read_fd)
@@ -1486,6 +1496,7 @@ class TrainingManager:
                 self._fault = str(exc)
                 self._record_control_file = None
                 self._record_decision_pending = False
+                self._record_phase = None
             self._append_log("ERROR", str(exc))
             raise
         reader.start()
@@ -1504,9 +1515,21 @@ class TrainingManager:
             if not line:
                 continue
             lower = line.lower()
-            if kind == "record" and line.startswith("ATTEMPT recording"):
+            if kind == "record":
                 with self._lock:
-                    self._record_decision_pending = False
+                    if line.startswith("ATTEMPT recording"):
+                        self._record_decision_pending = False
+                        self._record_phase = "recording"
+                    elif line.startswith("AWAITING_DECISION"):
+                        self._record_phase = "awaiting_decision"
+                    elif line.startswith("ATTEMPT save_started"):
+                        self._record_phase = "saving_rerun"
+                    elif line.startswith("ATTEMPT save_phase") and "phase=lerobot" in line:
+                        self._record_phase = "saving_lerobot"
+                    elif line.startswith("ATTEMPT lerobot_durable"):
+                        self._record_phase = "returning_home"
+                    elif line.startswith("RESET auto_home"):
+                        self._record_phase = "returning_home"
             level = "INFO"
             if line.startswith("ATTEMPT archived_failed"):
                 level = "INFO"
@@ -1552,6 +1575,7 @@ class TrainingManager:
             if kind == "record":
                 self._record_control_file = None
                 self._record_decision_pending = False
+                self._record_phase = None
             if exit_code == 0:
                 self._state = "COMPLETE"
                 self._fault = None
@@ -2026,6 +2050,7 @@ class TrainingManager:
                 "config": self._config,
                 "fault": self._fault,
                 "decision_pending": self._record_decision_pending if running and self._kind == "record" else False,
+                "record_phase": self._record_phase if running and self._kind == "record" else None,
                 "last_exit_code": self._last_exit_code,
                 "latest_seq": self._seq,
                 "simulate": self.simulate,

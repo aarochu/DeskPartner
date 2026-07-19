@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
+from datasets import config as datasets_config
 
 
 KIT_ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,28 @@ class TrainingDefaultsTest(unittest.TestCase):
         self.assertIn('id="control-hz-input" type="number" value="240"', training_html)
         self.assertIn('id="velocity-input" type="number" value="2000"', training_html)
         self.assertIn('id="max-step-input" type="number" value="8.4"', training_html)
+
+    def test_stage_one_can_smoke_defaults_and_finish_notice_are_explicit(self) -> None:
+        status = workspace.require_training_profile()
+        defaults = status["defaults"]
+        self.assertEqual(
+            defaults["task"],
+            "Pick up one can and place it in the taped sorting zone",
+        )
+        self.assertEqual(defaults["dataset"], "rebot-can-sort-stage1-v1-smoke")
+        self.assertEqual(defaults["episodes"], 10)
+
+        training_html = (GUI_ROOT / "static" / "training.html").read_text()
+        self.assertIn(
+            'value="Pick up one can and place it in the taped sorting zone"',
+            training_html,
+        )
+        self.assertIn('value="rebot-can-sort-stage1-v1-smoke"', training_html)
+        self.assertIn('id="episodes-input" type="number" value="10"', training_html)
+
+        training_js = (GUI_ROOT / "static" / "training.js").read_text()
+        self.assertIn("Save accepted. Writing this episode to Rerun and LeRobot now.", training_js)
+        self.assertIn("Do not press Stop; wait until the next attempt is ready.", training_js)
 
     def test_manual_gui_default_matches_collection_profile(self) -> None:
         preset = server.PRESETS["hand_tracking"]
@@ -639,6 +662,263 @@ class AttemptArchiveTest(unittest.TestCase):
                     raise RuntimeError("simulated ENOSPC")
             self.assertTrue(dataset.finalized)
             self.assertEqual((image_dir / "frame-000000.png").read_bytes(), b"recover me")
+
+    def test_verified_attempt_videos_are_handed_to_lerobot_without_reencoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "attempt"
+            dataset_root = root / "dataset"
+            archive.mkdir()
+            dataset_root.mkdir()
+            sources = {
+                "observation.images.front": archive / "overhead.mp4",
+                "observation.images.side": archive / "wrist.mp4",
+            }
+            sources["observation.images.front"].write_bytes(b"overhead-video")
+            sources["observation.images.side"].write_bytes(b"wrist-video")
+
+            frame_directories: dict[str, Path] = {}
+            for key in sources:
+                frame_directory = dataset_root / "images" / key / "episode-000000"
+                frame_directory.mkdir(parents=True)
+                (frame_directory / "frame-000000.png").write_bytes(b"frame")
+                frame_directories[key] = frame_directory
+
+            original_encoder = Mock(side_effect=AssertionError("must not re-encode"))
+
+            class FakeDataset:
+                root = dataset_root
+                meta = SimpleNamespace(video_keys=list(sources))
+                _encode_temporary_episode_video = original_encoder
+
+                @staticmethod
+                def _get_image_file_dir(_episode_index: int, video_key: str) -> Path:
+                    return frame_directories[video_key]
+
+            dataset = FakeDataset()
+            original_bound_encoder = dataset._encode_temporary_episode_video
+            handed_off: dict[str, Path] = {}
+            with controlled_record.reuse_attempt_videos_for_lerobot(dataset, archive):
+                for key, source in sources.items():
+                    temporary_video = dataset._encode_temporary_episode_video(key, 0)
+                    handed_off[key] = temporary_video
+                    self.assertEqual(temporary_video.read_bytes(), source.read_bytes())
+                    self.assertTrue(source.is_file())
+                    self.assertFalse(frame_directories[key].exists())
+
+            original_encoder.assert_not_called()
+            self.assertIs(dataset._encode_temporary_episode_video, original_bound_encoder)
+            for key, source in sources.items():
+                self.assertEqual(source.read_bytes(), handed_off[key].read_bytes())
+
+    def test_checkpoint_is_fresh_loadable_after_each_of_two_no_video_episodes(self) -> None:
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            cache = Path(temporary) / "huggingface-cache"
+            with patch.object(datasets_config, "HF_DATASETS_CACHE", cache):
+                dataset = LeRobotDataset.create(
+                    "local/two-episode-durability-test",
+                    30,
+                    features,
+                    root=root,
+                    use_videos=False,
+                    batch_encoding_size=1,
+                )
+
+                for episode_index in range(2):
+                    for frame_index in range(3):
+                        offset = float(episode_index * 10 + frame_index)
+                        dataset.add_frame(
+                            {
+                                "observation.state": np.array(
+                                    [offset, offset + 0.5], dtype=np.float32
+                                ),
+                                "action": np.array(
+                                    [offset + 1.0, offset + 1.5], dtype=np.float32
+                                ),
+                                "task": "durability test",
+                            }
+                        )
+                    dataset.save_episode(parallel_encoding=False)
+                    dataset = controlled_record.checkpoint_and_reopen_dataset(
+                        dataset,
+                        expected_episode_index=episode_index,
+                    )
+
+                    fresh = LeRobotDataset(
+                        "local/two-episode-durability-test",
+                        root=root,
+                        batch_encoding_size=1,
+                        vcodec=dataset.vcodec,
+                    )
+                    self.assertEqual(fresh.num_episodes, episode_index + 1)
+                    self.assertEqual(fresh.num_frames, (episode_index + 1) * 3)
+
+                self.assertEqual(dataset.num_episodes, 2)
+                self.assertEqual(dataset.num_frames, 6)
+                dataset.stop_image_writer()
+                dataset.finalize()
+
+                final = LeRobotDataset(
+                    "local/two-episode-durability-test",
+                    root=root,
+                    batch_encoding_size=1,
+                    vcodec=dataset.vcodec,
+                )
+                self.assertEqual(final.num_episodes, 2)
+                self.assertEqual(final.num_frames, 6)
+
+    def test_two_camera_episodes_are_durable_separate_videos_without_reencoding(self) -> None:
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": ["joint_a", "joint_b"],
+            },
+            "observation.images.front": {
+                "dtype": "video",
+                "shape": (16, 16, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.images.side": {
+                "dtype": "video",
+                "shape": (16, 16, 3),
+                "names": ["height", "width", "channels"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            cache = Path(temporary) / "huggingface-cache"
+            with patch.object(datasets_config, "HF_DATASETS_CACHE", cache):
+                dataset = LeRobotDataset.create(
+                    "local/two-camera-durability-test",
+                    30,
+                    features,
+                    root=root,
+                    use_videos=True,
+                    image_writer_threads=2,
+                    batch_encoding_size=1,
+                    vcodec="h264",
+                )
+                archived_paths: list[tuple[Path, Path]] = []
+                for episode_index in range(2):
+                    for frame_index in range(3):
+                        value = episode_index * 40 + frame_index * 10
+                        image = np.full((16, 16, 3), value, dtype=np.uint8)
+                        dataset.add_frame(
+                            {
+                                "observation.state": np.array(
+                                    [value, value + 0.5], dtype=np.float32
+                                ),
+                                "action": np.array(
+                                    [value + 1.0, value + 1.5], dtype=np.float32
+                                ),
+                                "observation.images.front": image,
+                                "observation.images.side": 255 - image,
+                                "task": "video durability test",
+                            }
+                        )
+
+                    archive = Path(temporary) / f"attempt-{episode_index}"
+                    archive.mkdir()
+                    artifacts = controlled_record.archive_attempt_videos(
+                        dataset,
+                        archive,
+                        samples=3,
+                    )
+                    self.assertEqual(artifacts["overhead"]["frames"], 3)
+                    self.assertEqual(artifacts["wrist"]["frames"], 3)
+                    archived_paths.append((archive / "overhead.mp4", archive / "wrist.mp4"))
+
+                    with controlled_record.reuse_attempt_videos_for_lerobot(dataset, archive):
+                        dataset.save_episode(parallel_encoding=False)
+                    dataset = controlled_record.checkpoint_and_reopen_dataset(
+                        dataset,
+                        expected_episode_index=episode_index,
+                    )
+
+                    for camera_key in (
+                        "observation.images.front",
+                        "observation.images.side",
+                    ):
+                        video_files = sorted((root / "videos" / camera_key).rglob("*.mp4"))
+                        self.assertEqual(len(video_files), episode_index + 1)
+                    for overhead, wrist in archived_paths:
+                        self.assertGreater(overhead.stat().st_size, 0)
+                        self.assertGreater(wrist.stat().st_size, 0)
+
+                fresh = LeRobotDataset(
+                    "local/two-camera-durability-test",
+                    root=root,
+                    batch_encoding_size=1,
+                    vcodec="h264",
+                )
+                self.assertEqual(fresh.num_episodes, 2)
+                self.assertEqual(fresh.num_frames, 6)
+                dataset.stop_image_writer()
+                dataset.finalize()
+
+    def test_record_save_log_lines_drive_visible_workspace_phases(self) -> None:
+        manager = workspace.TrainingManager()
+        observed: list[str | None] = []
+
+        def output_lines():
+            yield "ATTEMPT recording id=attempt-1\n"
+            observed.append(manager._record_phase)
+            yield "AWAITING_DECISION id=attempt-1\n"
+            observed.append(manager._record_phase)
+            yield "ATTEMPT save_started id=attempt-1 phase=rerun_and_attempt_videos\n"
+            observed.append(manager._record_phase)
+            yield "ATTEMPT save_phase id=attempt-1 phase=lerobot\n"
+            observed.append(manager._record_phase)
+            yield "ATTEMPT lerobot_durable id=attempt-1 episode=0 total_episodes=1\n"
+            observed.append(manager._record_phase)
+
+        class FakeProcess:
+            pid = 31337
+            stdout = output_lines()
+
+            @staticmethod
+            def wait() -> int:
+                return 0
+
+            @staticmethod
+            def poll() -> int:
+                return 0
+
+        process = FakeProcess()
+        manager._kind = "record"
+        manager._process = process
+        manager._reader_thread = threading.current_thread()
+        manager._read_process(process, "record", None, None)
+        self.assertEqual(
+            observed,
+            [
+                "recording",
+                "awaiting_decision",
+                "saving_rerun",
+                "saving_lerobot",
+                "returning_home",
+            ],
+        )
+        self.assertIsNone(manager._record_phase)
 
     def test_record_control_writes_label_before_signalling(self) -> None:
         class FakeProcess:

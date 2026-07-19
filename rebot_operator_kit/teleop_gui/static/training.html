@@ -80,7 +80,7 @@
             <div class="camera-title"><div><span>LOGITECH / OVERHEAD</span><strong>Camera <b id="front-index-label">0</b></strong></div><i id="front-camera-dot"></i></div>
             <div class="camera-frame"><img id="front-preview" src="/camera/front.png" alt="Latest Logitech overhead-camera preflight frame"></div>
             <dl><div><dt>Actual frame</dt><dd id="front-shape">—</dd></div><div><dt>Measured</dt><dd id="front-fps">—</dd></div><div><dt>Brightness</dt><dd id="front-brightness">—</dd></div></dl>
-            <p>Mount 60–75 cm above the table, as perpendicular as possible. Center the entire pickup-to-bin path; remove laptop edges, cables, the leader arm, and unrelated tools from the frame.</p>
+            <p>Mount 60–75 cm above the table, as perpendicular as possible. Center the full reachable pickup area, taped sorting zone, and transport path; remove laptop edges, cables, the leader arm, and unrelated tools from the frame.</p>
           </article>
           <article class="camera-card">
             <div class="camera-title"><div><span>INNOMAKER / WRIST</span><strong>Camera <b id="side-index-label">1</b></strong></div><i id="side-camera-dot"></i></div>
@@ -94,12 +94,12 @@
 
       <section class="section">
         <div class="section-head">
-          <div><span class="step">03</span><h2>Define one dataset</h2><p>The first inferred skill is crumpled paper → trash. Change the sentence only if you are intentionally creating a different dataset.</p></div>
+          <div><span class="step">03</span><h2>Define one dataset</h2><p>Stage 1 is one can → taped sorting zone. Keep this exact instruction for every episode in this dataset.</p></div>
         </div>
         <form id="collection-form" class="form-grid">
-          <label class="wide"><span>Task instruction</span><input id="task-input" name="task" value="Pick up the crumpled paper ball and place it in the trash bin" maxlength="220"><small>Use the same imperative sentence in every episode and later at inference.</small></label>
-          <label class="wide"><span>Dataset name</span><input id="dataset-input" name="dataset" value="rebot-paper-trash-v1-smoke" pattern="[a-z0-9][a-z0-9_-]{2,47}"><small>Smoke and production data stay separate. Existing folders are never overwritten.</small></label>
-          <label><span>Episodes this run</span><input id="episodes-input" type="number" value="5" min="1" max="500"></label>
+          <label class="wide"><span>Task instruction</span><input id="task-input" name="task" value="Pick up one can and place it in the taped sorting zone" maxlength="220"><small>Use the same imperative sentence in every episode and later at inference.</small></label>
+          <label class="wide"><span>Dataset name</span><input id="dataset-input" name="dataset" value="rebot-can-sort-stage1-v1-smoke" pattern="[a-z0-9][a-z0-9_-]{2,47}"><small>The first 10 episodes are the conversion/training smoke set. Existing folders are never overwritten.</small></label>
+          <label><span>Episodes this run</span><input id="episodes-input" type="number" value="10" min="1" max="500"></label>
           <label><span>Episode seconds</span><input id="episode-time-input" type="number" value="30" min="5" max="300" step="1"></label>
           <label><span>Auto-return / reset seconds</span><input id="reset-time-input" type="number" value="20" min="3" max="180" step="1"><small>Minimum time for scene reset</small></label>
           <label class="check-label"><input id="resume-input" type="checkbox"><span>Resume an existing dataset</span></label>
@@ -127,7 +127,7 @@
           <div><span class="step">04</span><h2>Record demonstrations</h2><p>Rerun opens automatically. Browser controls finish, redo, and finalize without global keyboard shortcuts.</p></div>
           <div class="phase"><span>Phase</span><strong id="job-kind">Idle</strong><small id="job-runtime">00:00</small></div>
         </div>
-        <label class="readiness"><input id="ready-checkbox" type="checkbox"><span>I confirmed both mounts are locked, both images are useful, the task zone is clear, manual teleop is stopped, and I am ready to support the ReBot arm when the session ends.</span></label>
+        <label class="readiness"><input id="ready-checkbox" type="checkbox"><span>I confirmed both camera mounts and lighting are fixed, both images are useful, the taped zone is clear, manual teleop is stopped, and I am ready to support the ReBot arm when the session ends.</span></label>
         <div class="failure-controls">
           <label><span>Failure reason (required only for a failed take)</span><select id="failure-label-input"><option value="">Choose after a failed attempt…</option></select></label>
           <label><span>Failure note (required for “Other”)</span><input id="failure-note-input" maxlength="500" placeholder="Optional detail for review"></label>
@@ -140,9 +140,9 @@
           <button class="button danger" id="stop-record-button" type="button" disabled>Stop & finalize</button>
         </div>
         <div class="quality-grid">
-          <article><strong>KEEP</strong><p>One smooth attempt, successful grasp and drop, no collision, no hand in either frame, no major hesitation.</p></article>
+          <article><strong>KEEP</strong><p>Exactly one can, one smooth grasp-and-place action, no collision, no hand in either frame, no major hesitation or correction.</p></article>
           <article><strong>MARK FAILED</strong><p>Choose one reason, then re-record. The two videos and Rerun timeline remain available for failure analysis but are excluded from training.</p></article>
-          <article><strong>AUTO-RETURN</strong><p>The follower returns to the pose captured when collection connected. Put the passive leader back in its captured pose and reset the paper/bin; reset frames are not stored.</p></article>
+          <article><strong>AUTO-RETURN</strong><p>The follower returns to the pose captured when collection connected. Put the passive leader back in its captured pose, then scatter the can to a new random reachable position; reset frames are not stored.</p></article>
         </div>
         <div class="hard-rule"><strong>Session home:</strong> place both arms in the exact home pose before Start collection. Their current poses are captured when the process connects. After every kept or failed take, the follower returns automatically and the next take stays blocked until the leader is manually returned and the reset timer finishes.</div>
         <div class="hard-rule"><strong>No silent acceptance:</strong> the timer never auto-keeps. At the time limit, motion and recording pause on the last pose until you explicitly keep, mark failed, or stop the current attempt.</div>
@@ -162,7 +162,7 @@
           <div class="section-head compact"><div><span class="step">05</span><h2>Dataset gate</h2><p>Validate schema, task, cameras, finite values, joint order, and action/state alignment.</p></div></div>
           <div id="dataset-list" class="dataset-list"><p class="empty">No recorded datasets yet.</p></div>
           <div class="validate-row">
-            <label><span>Minimum episodes</span><input id="minimum-episodes-input" type="number" value="5" min="1" max="500"></label>
+            <label><span>Minimum episodes</span><input id="minimum-episodes-input" type="number" value="10" min="1" max="500"></label>
             <button class="button secondary" id="validate-button" type="button">Validate selected dataset</button>
           </div>
         </div>
@@ -181,7 +181,7 @@
             <div class="route-top"><span>RECOMMENDED</span><b>Compatible after clean data</b></div>
             <h3>Official MolmoAct2 · native ReBot 7D</h3>
             <p>Fine-tune <code>allenai/MolmoAct2</code> through the official LeRobot policy on an NVIDIA GPU. The action expert supports padded action dimensions and can learn the seven-axis ReBot contract.</p>
-            <ul><li>Inputs: follower state + Logitech overhead + Innomaker wrist + language</li><li>Output: 10-step continuous 7D action chunk</li><li>First run: action-expert-only, 5,000 steps</li><li>Suggested clean data: 50–100 demonstrations</li></ul>
+            <ul><li>Inputs: follower state + Logitech overhead + Innomaker wrist + language</li><li>Output: 10-step continuous 7D action chunk</li><li>First run: action-expert-only, 5,000 steps</li><li>Stage-1 target: 150 clean demonstrations</li></ul>
             <button class="button secondary" id="recipe-button" type="button">Generate command for selected dataset</button>
           </article>
           <article class="route blocked">
@@ -202,17 +202,17 @@
       </section>
 
       <section class="section instructions">
-        <div class="section-head"><div><span class="step">07</span><h2>Exact operating sequence</h2><p>Follow this order for the five-episode smoke set, then repeat with a new production name.</p></div></div>
+        <div class="section-head"><div><span class="step">07</span><h2>Exact operating sequence</h2><p>Get 10 clean episodes into the conversion/training pipeline first, then continue the same fixed-camera dataset through 50, 100, and 150.</p></div></div>
         <ol>
           <li><b>Stop manual teleop.</b><span>The collector needs exclusive access to both serial ports. The preflight must say Free.</span></li>
           <li><b>Lock the two training cameras.</b><span>Logitech overhead sees the whole task path; the Innomaker claw camera sees the gripper contact. Mac webcam index 3 remains excluded.</span></li>
           <li><b>Run the camera check.</b><span>Inspect both new snapshots yourself. Do not accept a technically bright image with a bad crop, clutter, or occlusion.</span></li>
-          <li><b>Stage the smoke task.</b><span>Use one paper ball, one fixed bin, stable lighting, and the exact instruction shown above.</span></li>
+          <li><b>Stage one can.</b><span>For the first 150 clean episodes, keep exactly one can visible; pick it once and place it in the fixed taped sorting zone. Keep cameras, mounts, taped zone, and lighting fixed.</span></li>
           <li><b>Capture session home and start.</b><span>Put both arms in the exact start pose, then Start collection. Keep them still until the connection captures that pose; afterward move the teleop arm smoothly and naturally.</span></li>
-          <li><b>Judge every take immediately.</b><span>Finish & keep only a clean success. For a failed take, choose a failure reason and use Mark failed & re-record.</span></li>
-          <li><b>Reset after every take.</b><span>The ReBot follower returns home automatically. Manually return the passive leader and reset the paper/bin; the next recording waits for both arms and the reset timer.</span></li>
+          <li><b>Judge every take immediately.</b><span>Finish & keep only one smooth, clean success. Delete jerky-but-successful takes too; for any bad take, choose a failure reason and use Mark failed & re-record.</span></li>
+          <li><b>Reset to a new can position.</b><span>The ReBot follower returns home automatically. Manually return the passive leader, then scatter the can to a new random reachable position across corners, edges, and center; the next recording waits for both arms and the reset timer.</span></li>
           <li><b>Review and validate.</b><span>Replay any archived take in Rerun. Stop archives the partial take as aborted; validation must PASS all 7D follower-coordinate checks.</span></li>
-          <li><b>Create production v1.</b><span>Choose a new name without “smoke”; collect 50–100 clean episodes. First 20 use a consistent placement, then vary paper position about ±5 cm.</span></li>
+          <li><b>Hit the Stage-1 milestones.</b><span>Hand off the first 10 episodes for a throwaway train immediately; keep collecting and checkpoint at 50, 100, and 150 clean episodes. Only after 150 add random extra cans in frame while still picking exactly one.</span></li>
           <li><b>Train only the approved route.</b><span>Use native 7D MolmoAct2, or get explicit approval for a 6D fixed-wrist-yaw adapter before using Newt.</span></li>
         </ol>
       </section>
@@ -220,7 +220,7 @@
       <section class="section decisions">
         <div><span class="step">A</span><h2>Assumptions made</h2></div>
         <ul>
-          <li>The first skill is <b>crumpled paper → trash bin</b>, inferred from DeskPartner’s P4/P5 plan.</li>
+          <li>The confirmed Stage-1 skill is <b>one can → taped sorting zone</b>; each episode contains one picked can and one complete place action.</li>
           <li>Raw immutable collection should remain seven-axis and use <b>front</b>/<b>side</b> keys to match DeskPartner; any Newt adapter will create a separate prepared copy.</li>
           <li>The verified high-response recording profile is 240 Hz control, 30 FPS samples, 2000°/s motor velocity, 8.4°/tick cap, and 0.05 gripper force.</li>
         </ul>

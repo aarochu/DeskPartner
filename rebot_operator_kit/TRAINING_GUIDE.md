@@ -98,9 +98,9 @@ ReBot runtime.
 1. Use a rigid boom, super-clamp, or tripod; never hand-hold the camera.
 2. Put the lens 60–75 cm above the work surface and point it almost
    perpendicular to the table.
-3. Frame the complete path: starting gripper pose, every allowed paper
-   position, the grasp area, the entire drop bin, and the path between them.
-4. Crop out the laptop, leader arm, loose adapters, tools, cups/cans, and cable
+3. Frame the complete path: starting gripper pose, the whole reachable can
+   scatter area, the taped sorting zone, and the path between them.
+4. Crop out the laptop, leader arm, loose adapters, tools, and cable
    piles visible in the current saved frame.
 5. Tape the mount feet and boom height. If the mount moves, create a new
    dataset version.
@@ -143,38 +143,38 @@ ReBot runtime.
 
 ## 4. First task and assumptions
 
-The first task was inferred from DeskPartner as:
+The confirmed Stage-1 task is:
 
-`Pick up the crumpled paper ball and place it in the trash bin`
+`Pick up one can and place it in the taped sorting zone`
 
-Use that exact sentence for every episode and later for inference. Do not mix
-pens, cans, blocks, cups, or general desk cleaning into this dataset. Each
-additional behavior should get a deliberate task sentence and dataset plan.
+Use that exact sentence for every episode and later for inference. Each episode
+contains exactly one can pick and one placement in the fixed taped zone. Extra
+cans enter the scene only after the first 150 clean episodes, and even then the
+demonstrated action still picks exactly one can.
 
-Two decisions remain:
+One hosted-training decision remains:
 
-1. Is paper-to-bin the intended first policy, or is the first policy supposed
-   to manipulate another object?
-2. For Mission-hosted training, can Mission provision a native seven-action
+1. For Mission-hosted training, can Mission provision a native seven-action
    ReBot base? If not, may `wrist_yaw` be held at a fixed pose and removed only
    in a separate reviewed 6D adapter dataset?
 
 Neither answer blocks raw seven-action collection. Do not transform or discard
 the raw seventh joint during recording.
 
-## 5. Record the five-episode smoke dataset
+## 5. Record the first 10-episode Stage-1 checkpoint
 
 1. Stop manual teleop. On the training page, **Serial ownership** must read
    **Free**.
-2. Place one paper ball and one bin in the intended scene. Remove every object
-   not part of this task.
+2. Place one can in a random reachable location and keep the taped sorting zone
+   fixed. For the first 150 episodes, remove extra cans and every unrelated
+   object.
 3. Click **Run 6-second camera check**.
 4. Wait for the job to finish. Confirm both camera cards show the requested
    dimensions, at least 27 FPS, usable brightness, and useful new images.
 5. Leave the task instruction unchanged.
-6. Use dataset name `rebot-paper-trash-v1-smoke`.
+6. Use dataset name `rebot-can-sort-stage1-v1-smoke`.
 7. Use these initial settings:
-   - Episodes: `5`
+   - Episodes: `10`
    - Episode time: `30 s`
    - Reset time: `20 s`
    - Control: `240 Hz`
@@ -187,16 +187,20 @@ the raw seventh joint during recording.
    captures both current poses when it connects after you click Start.
 9. Check the readiness confirmation and click **Start collection** once.
 10. Wait until both arms connect. Then move the leader smoothly and decisively.
-11. After a clean, visible drop, click **Finish & keep episode**.
+11. After one smooth pick and a clean, visible release in the taped zone, click
+    **Finish & keep episode**. The browser immediately confirms that Rerun and
+    LeRobot saving has started; do not press Stop while saving. Wait until the
+    next attempt is ready.
 12. After every kept or failed take, the follower automatically returns to the
     captured session-home pose at a capped 120 deg/s. Manually put the passive
-    leader back in its own captured pose and restore the paper/bin. The next
-    attempt stays blocked until both arms are aligned and the reset timer has
-    completed; reset frames are not saved.
+    leader back in its own captured pose, then scatter the can to a new random
+    reachable position. Cover corners, edges, and center across the dataset.
+    The next attempt stays blocked until both arms are aligned and the reset
+    timer has completed; reset frames are not saved.
 13. For a miss, collision, occlusion, dropped object, wrong destination, large
-    correction, or awkward hesitation, choose a failure reason and click
-    **Mark failed & re-record**. The take is excluded from training, but its
-    videos and Rerun recording are preserved.
+    correction, awkward hesitation, or any jerky-but-successful motion, choose
+    a failure reason and click **Mark failed & re-record**. The take is excluded
+    from training, but its videos and Rerun recording are preserved.
 14. The 30-second episode time is a target, not automatic acceptance. Recording
     pauses motion and recording at the configured limit, then waits until you
     explicitly keep, mark failed, or stop the attempt. It never auto-keeps and
@@ -204,12 +208,13 @@ the raw seventh joint during recording.
 15. Use **Review every attempt** to open the separate overhead/wrist MP4 files,
     replay the synchronized take in Rerun, or correct a failed take's label.
     Successful takes deliberately have no label.
-16. After five clean saved episodes, click **Stop & finalize** only if a new
+16. After 10 clean saved episodes, click **Stop & finalize** only if a new
     episode has already begun; the partial take is archived as `aborted` and
     excluded while all saved episodes remain. Stop/abort disconnects without
     initiating an automatic return; support the follower when stopping.
 17. Select the smoke dataset and click **Validate selected dataset** with a
-    minimum of `5` episodes. Continue only after the log prints `PASS`.
+    minimum of `10` episodes. Continue only after the log prints `PASS`, then
+    hand this checkpoint to the conversion/training owner immediately.
 
 The browser controls send signals directly to the collector. They do not use
 global keyboard shortcuts or require macOS Accessibility permission.
@@ -220,27 +225,30 @@ Every physical attempt has an independent review directory under
 attempts become LeRobot episodes. Only manually failed attempts receive a
 failure label; stopped or collector-error attempts remain system outcomes.
 
-## 6. Record production data
+## 6. Grow the Stage-1 dataset
 
-After the smoke dataset passes, choose a new immutable name:
+After the first 10 episodes pass conversion and a throwaway train starts,
+resume the same fixed-camera dataset. Do not move the cameras, taped zone, or
+lighting, and do not change the task sentence.
 
-`rebot-paper-trash-v1-production`
+Stage-1 target: **150 clean successful episodes**.
 
-Recommended first production batch: **60 clean successful episodes**.
-
-| Episodes | Purpose |
+| Checkpoint | Purpose |
 | ---: | --- |
-| 1–20 | Locked scene, same bin, paper near the center; establish a consistent core behavior |
-| 21–40 | Move paper across the allowed pickup region, roughly ±5 cm; keep cameras and bin fixed |
-| 41–60 | Use 3–5 different crumpled paper balls and natural orientations, still within the same pickup region |
+| 10 | Prove LeRobot conversion and start the first throwaway train immediately |
+| 50 | First comparison checkpoint; keep collecting while multiple models train |
+| 100 | Retrain and compare again; verify both camera views and joint logs have not drifted |
+| 150 | Complete the clean single-can Stage-1 dataset and evaluate the best checkpoint |
+| After 150 | Add random extra cans in frame while still picking exactly one can per episode |
 
-Keep 8–10 additional paper placements aside as physical evaluation cases; do
-not demonstrate those exact placements. If performance is weak, add targeted
-successful demonstrations in a new dataset version rather than inserting
-failures into the clean v1 dataset.
+Use the whole reachable workspace: scatter the can to a new random location
+after every episode and balance corners, edges, and center. Spot-check both
+camera views and joint logs in Rerun about every 25 episodes. If performance is
+weak, add targeted clean demonstrations rather than inserting failures into the
+policy-training dataset.
 
 Episode acceptance rule: keep only a complete success with smooth intent,
-visible grasp, controlled transport, and visible release inside the bin.
+visible grasp, controlled transport, and visible release inside the taped zone.
 Natural path variation is useful; fumbling and recovery after a failed grasp
 are not useful in this first clean imitation dataset.
 
@@ -308,8 +316,8 @@ Run from this Mac, replacing the GPU login and path:
 
 ```bash
 rsync -av --progress \
-  ./data/rebot-paper-trash-v1-production/ \
-  <gpu-user>@<gpu-host>:<lerobot-directory>/rebot-training/data/rebot-paper-trash-v1-production/
+  ./data/rebot-can-sort-stage1-v1-smoke/ \
+  <gpu-user>@<gpu-host>:<lerobot-directory>/rebot-training/data/rebot-can-sort-stage1-v1-smoke/
 ```
 
 Copy the whole dataset directory, including `meta`, `data`, and `videos`.
@@ -317,7 +325,7 @@ Never copy only the MP4 files.
 
 ### Generate and run the exact command
 
-1. In the local GUI, select the validated production dataset.
+1. In the local GUI, select the validated Stage-1 dataset checkpoint.
 2. Click **Generate command for selected dataset**.
 3. Confirm the command card shows the same profile ID and digest prefix as
    **Default training profile**, then copy the command.
@@ -338,7 +346,7 @@ The generated first run uses:
 
 Outputs are written under:
 
-`rebot-training/models/rebot-paper-trash-v1-production-molmoact2-rebot`
+`rebot-training/models/rebot-can-sort-stage1-v1-smoke-molmoact2-rebot`
 
 Do not launch training until local validation passes. Do not run this model
 directly on the physical arm after loss decreases: first inspect the held-out
