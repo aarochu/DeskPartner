@@ -87,6 +87,11 @@ class PassiveThread(ImmediateThread):
         self.started = True
 
 
+class RaisingThreadFactory:
+    def __call__(self, **kwargs):
+        raise RuntimeError("thread construction exploded")
+
+
 class KeyboardStopTest(unittest.TestCase):
     def make_stop(
         self,
@@ -155,14 +160,36 @@ class KeyboardStopTest(unittest.TestCase):
         self.assertEqual(termios.get_calls, [])
         self.assertEqual(tty.calls, [])
 
-    def test_signal_handlers_are_never_installed_off_the_main_thread(self) -> None:
+    def test_non_main_thread_fails_closed_before_installing_anything(self) -> None:
         stop, signals, _termios, _tty, _warnings = self.make_stop(
             stdin=FakeInput(tty=False),
             is_main_thread=lambda: False,
         )
 
-        with stop:
-            self.assertEqual(signals.installs, [])
+        with self.assertRaisesRegex(RuntimeError, "main thread"):
+            with stop:
+                self.fail("non-main context entered")
+
+        self.assertEqual(signals.installs, [])
+        self.assertEqual(_termios.get_calls, [])
+        self.assertEqual(_warnings.getvalue(), "")
+
+    def test_thread_factory_construction_failure_restores_entry_side_effects(self) -> None:
+        stop, signals, termios, tty, _warnings = self.make_stop(
+            stdin=FakeInput(tty=True),
+            thread_factory=RaisingThreadFactory(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "thread construction exploded"):
+            stop.__enter__()
+
+        self.assertEqual(tty.calls, [42])
+        self.assertEqual(
+            termios.set_calls,
+            [(42, termios.TCSADRAIN, termios.saved)],
+        )
+        self.assertEqual(signals.current[signals.SIGINT], "old-int")
+        self.assertEqual(signals.current[signals.SIGTERM], "old-term")
 
     def test_stop_and_context_exit_are_idempotent_and_restore_on_error(self) -> None:
         stop, signals, termios, _tty, _warnings = self.make_stop(

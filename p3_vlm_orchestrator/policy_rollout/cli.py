@@ -100,6 +100,7 @@ class CliDependencies:
     runner_factory: Callable[..., object] | None = None
     keyboard_stop_factory: Callable[[], object] | None = None
     serial_port_is_free: Callable[[str], bool] | None = None
+    repo_root: Path | None = None
 
     def output(self) -> IO[str]:
         return self.stdout if self.stdout is not None else sys.stdout
@@ -119,6 +120,20 @@ class CliDependencies:
     def monotonic(self) -> Callable[[], float]:
         return self.monotonic_clock or time.monotonic
 
+    def repository_root(self) -> Path:
+        return self.repo_root if self.repo_root is not None else _repo_root()
+
+
+@dataclass(frozen=True)
+class _TerminalSummary:
+    cycles_completed: int
+    actions_attempted: int
+    actions_confirmed: int
+    terminal_reason: str
+    primary_fault_reason: str | None
+    cleanup_fault_reason: str | None
+    audit_fault_reason: str | None
+
 
 class PreflightRobotAdapter:
     """Connect once, validate one discarded preflight, then delegate fresh reads."""
@@ -136,6 +151,7 @@ class PreflightRobotAdapter:
         self._connect_attempted = False
         self._connected = False
         self._disconnected = False
+        self.cleanup_fault_reason: str | None = None
 
     def connect(self) -> None:
         if self._connect_attempted:
@@ -150,11 +166,11 @@ class PreflightRobotAdapter:
                 expected_task=self.expected_task,
                 profile_snapshot=self.profile_snapshot,
             )
-        except Exception as primary_error:
+        except Exception:
             try:
                 self._disconnect_once()
-            except Exception as cleanup_error:
-                raise primary_error from cleanup_error
+            except Exception:
+                pass
             raise
 
     def observe(self) -> object:
@@ -175,7 +191,11 @@ class PreflightRobotAdapter:
             return
         self._disconnected = True
         self._connected = False
-        self.robot.disconnect()
+        try:
+            self.robot.disconnect()
+        except Exception as exc:
+            self.cleanup_fault_reason = _exception_text(exc)
+            raise
 
 
 def canonical_profile_digest(profile: object) -> str:
@@ -373,6 +393,11 @@ def _run_inspect(args: argparse.Namespace, deps: CliDependencies) -> int:
         f"frame={coordinates.get('frame')} control_mode={coordinates.get('control_mode')}",
         file=deps.output(),
     )
+    joints = coordinates.get("joints", [])
+    joint_names = [
+        joint.get("name") for joint in joints if isinstance(joint, Mapping)
+    ]
+    print("joint_order=" + ",".join(joint_names), file=deps.output())
     print("image_order=" + ",".join(bundle.image_order), file=deps.output())
     print(
         "processor_artifacts=" + ",".join(processor_artifacts),
@@ -414,6 +439,11 @@ def _run_hardware(
     cycles = args.cycles
     if not 1 <= cycles <= MAX_CLI_CYCLES:
         raise ValueError(f"cycles must be within [1, {MAX_CLI_CYCLES}]")
+    log_path = _resolve_log_path(
+        args.log_path,
+        deps.now_utc(),
+        repo_root=deps.repository_root(),
+    )
 
     bundle: object | None = None
     if mode == "shadow" and args.dummy_hold:
@@ -430,6 +460,11 @@ def _run_hardware(
         profile_digest = bundle.profile_digest
         profile_authentication = "checkpoint-sidecar-verified"
         task = bundle.task
+        processor_artifacts = _processor_artifact_report(Path(bundle.path))
+        print(
+            "processor_artifacts=" + ",".join(processor_artifacts),
+            file=deps.output(),
+        )
         policy = _policy_factory(deps)(bundle, args.device)
 
     safety = _safety_factory(deps)(profile_snapshot, mode=mode)
@@ -458,7 +493,6 @@ def _run_hardware(
     if mode == "live":
         _require_live_phrases(deps.read_input())
 
-    log_path = _resolve_log_path(args.log_path, deps.now_utc())
     _write_rollout_metadata(
         log_path,
         now=deps.now_utc(),
@@ -480,6 +514,7 @@ def _run_hardware(
         profile_snapshot=profile_snapshot,
     )
     keyboard = _keyboard_stop_factory(deps)()
+    summary: object
     try:
         with keyboard:
             try:
@@ -493,21 +528,26 @@ def _run_hardware(
                     stop_requested=keyboard.event,
                     action_guard=guard,
                 )
-            except Exception as runner_error:
+            except Exception as exc:
+                summary = _fault_summary(
+                    primary=f"runner construction failed: {_exception_text(exc)}",
+                    cleanup=preflight_robot.cleanup_fault_reason,
+                )
+            else:
                 try:
-                    robot.disconnect()
-                except Exception as cleanup_error:
-                    raise runner_error from cleanup_error
-                raise
-            summary = runner.run(cycles)
-    except Exception:
-        # Approved RolloutRunner and PreflightRobotAdapter own normal lifecycle.
-        # This idempotent call covers injected or partially constructed runners.
-        try:
-            preflight_robot.disconnect()
-        except Exception:
-            pass
-        raise
+                    summary = runner.run(cycles)
+                except Exception as exc:
+                    summary = _fault_summary(
+                        primary=f"runner execution failed: {_exception_text(exc)}",
+                        cleanup=preflight_robot.cleanup_fault_reason,
+                    )
+    except Exception as exc:
+        summary = _fault_summary(
+            primary=f"keyboard stop setup failed: {_exception_text(exc)}",
+            cleanup=preflight_robot.cleanup_fault_reason,
+        )
+
+    summary = _with_cleanup_fault(summary, preflight_robot.cleanup_fault_reason)
 
     _print_summary(summary, deps.output())
     has_fault = any(
@@ -666,9 +706,10 @@ def _validate_preflight_image(
     ):
         raise ValueError(f"Profile {label} camera dimensions are invalid")
     array = np.asarray(image)
-    if array.ndim != 3 or array.shape[:2] != (expected_height, expected_width):
+    expected_shape = (expected_height, expected_width, 3)
+    if array.shape != expected_shape:
         raise ValueError(
-            f"Preflight {label} image must be HWC {expected_height}x{expected_width}; "
+            f"Preflight {label} image must be HWC RGB {expected_shape}; "
             f"received {array.shape}"
         )
 
@@ -880,7 +921,7 @@ def _processor_artifact_report(checkpoint: Path) -> tuple[str, ...]:
     for filename in ("preprocessor_config.json", "postprocessor_config.json"):
         document = _load_json_object(checkpoint / filename, "saved processor config")
         report.append(filename)
-        steps = document.get("steps", [])
+        steps = document.get("steps")
         if not isinstance(steps, list):
             raise ValueError(f"Saved processor config {filename} steps must be a list")
         for index, step in enumerate(steps):
@@ -902,11 +943,70 @@ def _processor_artifact_report(checkpoint: Path) -> tuple[str, ...]:
     return tuple(report)
 
 
-def _resolve_log_path(requested: Path | None, now: datetime) -> Path:
-    if requested is not None:
-        return requested.expanduser().resolve()
-    timestamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return (_repo_root() / "runs" / "policy" / f"{timestamp}.jsonl").resolve()
+def _resolve_log_path(
+    requested: Path | None,
+    now: datetime,
+    *,
+    repo_root: Path,
+) -> Path:
+    """Resolve an audit path while confining it to the rollout log root."""
+
+    repository = Path(os.path.abspath(Path(repo_root).expanduser()))
+    allowed = repository / "runs" / "policy"
+    if requested is None:
+        timestamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        raw_target = allowed / f"{timestamp}.jsonl"
+    else:
+        supplied = Path(requested).expanduser()
+        if ".." in supplied.parts:
+            raise ValueError(
+                "Explicit log path must not traverse outside repo runs/policy/"
+            )
+        raw_target = (
+            supplied
+            if supplied.is_absolute()
+            else Path(os.path.abspath(supplied))
+        )
+
+    raw_target = Path(os.path.abspath(raw_target))
+    try:
+        relative = raw_target.relative_to(allowed)
+    except ValueError as exc:
+        raise ValueError(
+            "Explicit log path must be under repo runs/policy/; protected data, "
+            "models/checkpoints, config/calibration, env, and credential paths are forbidden"
+        ) from exc
+    if not relative.parts or raw_target.suffix != ".jsonl":
+        raise ValueError("Rollout log path under runs/policy/ must name a .jsonl file")
+    protected_names = (".env", "credential", "secret", "calibration", "checkpoint")
+    if any(
+        any(marker in part.lower() for marker in protected_names)
+        for part in relative.parts
+    ):
+        raise ValueError(
+            "Rollout log path under runs/policy/ cannot name protected env, "
+            "credential, calibration, or checkpoint files"
+        )
+
+    for directory in (repository / "runs", allowed):
+        if directory.is_symlink():
+            raise ValueError("Rollout log path under runs/policy/ must not use symlinks")
+    candidate = allowed
+    for part in relative.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise ValueError("Rollout log path under runs/policy/ must not use symlinks")
+    resolved_allowed = allowed.resolve(strict=False)
+    resolved_target = raw_target.resolve(strict=False)
+    try:
+        resolved_target.relative_to(resolved_allowed)
+    except ValueError as exc:
+        raise ValueError(
+            "Resolved rollout log path must remain under repo runs/policy/"
+        ) from exc
+    if resolved_target.exists() and not resolved_target.is_file():
+        raise ValueError("Rollout log path under runs/policy/ must be a regular file")
+    return resolved_target
 
 
 def _write_rollout_metadata(
@@ -933,6 +1033,37 @@ def _write_rollout_metadata(
             handle.flush()
     except Exception as exc:
         raise RuntimeError(f"Rollout metadata log could not be written: {exc}") from exc
+
+
+def _fault_summary(
+    *,
+    primary: str,
+    cleanup: str | None = None,
+    audit: str | None = None,
+) -> _TerminalSummary:
+    return _TerminalSummary(
+        cycles_completed=0,
+        actions_attempted=0,
+        actions_confirmed=0,
+        terminal_reason="fault",
+        primary_fault_reason=primary,
+        cleanup_fault_reason=cleanup,
+        audit_fault_reason=audit,
+    )
+
+
+def _with_cleanup_fault(summary: object, cleanup: str | None) -> object:
+    if cleanup is None or getattr(summary, "cleanup_fault_reason", None) is not None:
+        return summary
+    return _TerminalSummary(
+        cycles_completed=getattr(summary, "cycles_completed"),
+        actions_attempted=getattr(summary, "actions_attempted"),
+        actions_confirmed=getattr(summary, "actions_confirmed"),
+        terminal_reason="fault",
+        primary_fault_reason=getattr(summary, "primary_fault_reason", None),
+        cleanup_fault_reason=cleanup,
+        audit_fault_reason=getattr(summary, "audit_fault_reason", None),
+    )
 
 
 def _print_summary(summary: object, output: IO[str]) -> None:

@@ -60,18 +60,29 @@ class KeyboardStop:
         self._closing = False
 
     def __enter__(self) -> KeyboardStop:
+        if not self.is_main_thread():
+            raise RuntimeError("KeyboardStop must be entered on the main thread")
         if self._entered and not self._closed:
             raise RuntimeError("KeyboardStop is already active")
         if self._closed:
             raise RuntimeError("KeyboardStop contexts cannot be reused")
         self._entered = True
-        self._install_signal_handlers()
-        self._start_terminal_reader()
+        try:
+            self._install_signal_handlers()
+            self._start_terminal_reader()
+        except Exception:
+            self._cleanup_entry()
+            raise
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         if self._closed:
             return
+        self._cleanup_entry()
+
+    def _cleanup_entry(self) -> None:
+        """Restore every entry side effect; safe after partial setup."""
+
         self._closed = True
         self._closing = True
         reader = self._reader_thread
@@ -93,18 +104,12 @@ class KeyboardStop:
         return self.event.is_set()
 
     def _install_signal_handlers(self) -> None:
-        if not self.is_main_thread():
-            return
         for name in ("SIGINT", "SIGTERM"):
             signum = getattr(self.signal_api, name, None)
             if signum is None:
                 continue
-            try:
-                previous = self.signal_api.getsignal(signum)
-                self.signal_api.signal(signum, self._handle_signal)
-            except Exception as exc:
-                self._warn(f"Could not install {name} stop handler: {exc}")
-                continue
+            previous = self.signal_api.getsignal(signum)
+            self.signal_api.signal(signum, self._handle_signal)
             self._prior_handlers[signum] = previous
 
     def _restore_signal_handlers(self) -> None:
@@ -134,36 +139,17 @@ class KeyboardStop:
             )
             return
 
-        try:
-            fd = self.stdin.fileno()
-            saved_state = self.termios_api.tcgetattr(fd)
-            self.tty_api.setcbreak(fd)
-        except Exception as exc:
-            self._warn(
-                "WARNING: terminal keyboard stop could not be enabled; "
-                f"SIGINT/SIGTERM and the physical e-stop remain available: {exc}"
-            )
-            if "fd" in locals() and "saved_state" in locals():
-                try:
-                    self.termios_api.tcsetattr(
-                        fd, self.termios_api.TCSADRAIN, saved_state
-                    )
-                except Exception:
-                    pass
-            return
-
+        fd = self.stdin.fileno()
+        saved_state = self.termios_api.tcgetattr(fd)
         self._terminal_fd = fd
         self._terminal_state = saved_state
+        self.tty_api.setcbreak(fd)
         self._reader_thread = self.thread_factory(
             target=self._read_terminal,
             name="policy-rollout-keyboard-stop",
             daemon=True,
         )
-        try:
-            self._reader_thread.start()
-        except Exception as exc:
-            self._warn(f"WARNING: terminal keyboard reader did not start: {exc}")
-            self._restore_terminal()
+        self._reader_thread.start()
 
     def _read_terminal(self) -> None:
         while not self._closing and not self.event.is_set():

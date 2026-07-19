@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from io import StringIO
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 import tempfile
 import threading
@@ -185,6 +187,33 @@ class FakeRobot:
         return np.asarray(action).copy()
 
 
+class FailingConnectRobot(FakeRobot):
+    def __init__(self, *, cleanup_error: Exception | None = None) -> None:
+        super().__init__()
+        self.cleanup_error = cleanup_error
+
+    def connect(self) -> None:
+        self.connect_count += 1
+        raise RuntimeError("connect exploded")
+
+    def disconnect(self) -> None:
+        self.disconnect_count += 1
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
+
+
+class StopOnSecondObservationRobot(FakeRobot):
+    def __init__(self, stop_event: threading.Event) -> None:
+        super().__init__()
+        self.stop_event = stop_event
+
+    def observe(self) -> RolloutObservation:
+        observation = super().observe()
+        if self.observe_count == 2:
+            self.stop_event.set()
+        return observation
+
+
 class FakeKeyboardStop:
     def __init__(self) -> None:
         self.event = threading.Event()
@@ -226,6 +255,16 @@ class ExercisingRunner:
         )
 
 
+class ConnectThenPropagateRunner:
+    def __init__(self, **kwargs) -> None:
+        self.robot = kwargs["robot"]
+
+    def run(self, cycles: int) -> Summary:
+        del cycles
+        self.robot.connect()
+        raise AssertionError("connect was expected to fail")
+
+
 class PolicyRolloutCliTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -244,6 +283,8 @@ class PolicyRolloutCliTest(unittest.TestCase):
             profile_digest=canonical_profile_digest(self.profile),
             profile_snapshot=self.profile,
         )
+        self.bundle.path.mkdir()
+        self.write_processor_configs(self.bundle.path)
 
     def dependencies(self, **overrides) -> CliDependencies:
         values = {
@@ -262,9 +303,19 @@ class PolicyRolloutCliTest(unittest.TestCase):
             "runner_factory": lambda **kwargs: ExercisingRunner(**kwargs),
             "keyboard_stop_factory": FakeKeyboardStop,
             "serial_port_is_free": lambda port: True,
+            "repo_root": self.root,
         }
         values.update(overrides)
         return CliDependencies(**values)
+
+    @staticmethod
+    def write_processor_configs(checkpoint: Path) -> None:
+        (checkpoint / "preprocessor_config.json").write_text(
+            json.dumps({"steps": []}), encoding="utf-8"
+        )
+        (checkpoint / "postprocessor_config.json").write_text(
+            json.dumps({"steps": []}), encoding="utf-8"
+        )
 
     def write_profile(self, profile: dict[str, object] | None = None) -> Path:
         path = self.root / "training_profile.json"
@@ -278,12 +329,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
             json.dumps({"type": "molmoact2", "device": "cuda"}),
             encoding="utf-8",
         )
-        (checkpoint / "preprocessor_config.json").write_text(
-            json.dumps({"steps": []}), encoding="utf-8"
-        )
-        (checkpoint / "postprocessor_config.json").write_text(
-            json.dumps({"steps": []}), encoding="utf-8"
-        )
+        self.write_processor_configs(checkpoint)
         (checkpoint / "model.safetensors").write_bytes(b"not-loaded-by-inspect")
         collection_contract = {"task": TASK}
         (checkpoint / "rebot_training_profile.json").write_text(
@@ -316,7 +362,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
             "--workspace-calibration",
             str(self.root / "calibration.json"),
             "--log-path",
-            str(self.root / "rollout.jsonl"),
+            str(self.root / "runs" / "policy" / "rollout.jsonl"),
         ]
 
     def test_help_documents_all_staged_gates_and_physical_estop_warning(self) -> None:
@@ -346,6 +392,11 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertIn(f"locked_task={TASK}", output)
         self.assertIn("policy_type=molmoact2", output)
         self.assertIn("dimension=7", output)
+        self.assertIn(
+            "joint_order=shoulder_pan,shoulder_lift,elbow_flex,wrist_flex,"
+            "wrist_yaw,wrist_roll,gripper",
+            output,
+        )
         self.assertIn("observation.images.front,observation.images.side", output)
         self.assertIn("preprocessor_config.json,postprocessor_config.json", output)
         self.assertIn(canonical_profile_digest(self.profile), output)
@@ -409,6 +460,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
         prompts: list[str] = []
         replies = iter(("I HAVE AN E-STOP OPERATOR", "WORKSPACE IS EMPTY"))
         robot = FakeRobot()
+        keyboard = FakeKeyboardStop()
         runner_calls: list[dict[str, object]] = []
 
         def make_runner(**kwargs):
@@ -419,6 +471,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
             input_fn=lambda prompt: prompts.append(prompt) or next(replies),
             robot_factory=lambda **kwargs: robot,
             runner_factory=make_runner,
+            keyboard_stop_factory=lambda: keyboard,
         )
         status = main(
             self.rollout_args()
@@ -438,7 +491,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertEqual(robot.disconnect_count, 1)
         self.assertEqual(robot.observe_count, 2)
         self.assertEqual(len(runner_calls), 1)
-        self.assertIs(runner_calls[0]["stop_requested"], runner_calls[0]["stop_requested"])
+        self.assertIs(runner_calls[0]["stop_requested"], keyboard.event)
         self.assertIn("actions_attempted=2", self.stdout.getvalue())
         self.assertIn("primary_fault=none", self.stdout.getvalue())
 
@@ -488,7 +541,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
             )
             or robot,
         )
-        log_path = self.root / "dummy.jsonl"
+        log_path = self.root / "runs" / "policy" / "dummy.jsonl"
 
         status = main(
             [
@@ -545,7 +598,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertEqual(called, [])
         self.assertIn("640x480", self.stderr.getvalue())
 
-    def test_runner_construction_failure_disconnects_robot(self) -> None:
+    def test_runner_construction_failure_is_balanced_and_prints_fault_summary(self) -> None:
         robot = FakeRobot()
         deps = self.dependencies(
             input_fn=lambda prompt: (
@@ -561,9 +614,255 @@ class PolicyRolloutCliTest(unittest.TestCase):
 
         status = main(self.rollout_args() + ["--live"], dependencies=deps)
 
-        self.assertEqual(status, 2)
+        self.assertEqual(status, 1)
+        self.assertEqual(robot.connect_count, 0)
+        self.assertEqual(robot.disconnect_count, 0)
+        self.assertEqual(robot.send_count, 0)
+        summary = self.stdout.getvalue()
+        self.assertIn("terminal_reason=fault", summary)
+        self.assertIn("primary_fault=runner construction failed: runner construction exploded", summary)
+        self.assertIn("cleanup_fault=none", summary)
+        self.assertIn("audit_fault=none", summary)
+
+    def test_runner_run_exception_prints_summary_without_motion(self) -> None:
+        robot = FakeRobot()
+        deps = self.dependencies(
+            input_fn=lambda prompt: (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            ),
+            robot_factory=lambda **kwargs: robot,
+            runner_factory=lambda **kwargs: SimpleNamespace(
+                run=lambda cycles: (_ for _ in ()).throw(
+                    RuntimeError("runner run exploded")
+                )
+            ),
+        )
+
+        status = main(self.rollout_args() + ["--live"], dependencies=deps)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(robot.connect_count, 0)
+        self.assertEqual(robot.disconnect_count, 0)
+        self.assertEqual(robot.send_count, 0)
+        self.assertIn(
+            "primary_fault=runner execution failed: runner run exploded",
+            self.stdout.getvalue(),
+        )
+
+    def test_preflight_connect_and_cleanup_faults_are_separated_in_summary(self) -> None:
+        robot = FailingConnectRobot(
+            cleanup_error=RuntimeError("disconnect exploded")
+        )
+        deps = self.dependencies(
+            input_fn=lambda prompt: (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            ),
+            robot_factory=lambda **kwargs: robot,
+            runner_factory=lambda **kwargs: ConnectThenPropagateRunner(**kwargs),
+        )
+
+        status = main(self.rollout_args() + ["--live"], dependencies=deps)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(robot.connect_count, 1)
         self.assertEqual(robot.disconnect_count, 1)
-        self.assertIn("runner construction exploded", self.stderr.getvalue())
+        self.assertEqual(robot.send_count, 0)
+        summary = self.stdout.getvalue()
+        self.assertIn("primary_fault=runner execution failed: connect exploded", summary)
+        self.assertIn("cleanup_fault=disconnect exploded", summary)
+        self.assertIn("audit_fault=none", summary)
+
+    def test_real_rollout_processor_artifacts_block_policy_and_hardware(self) -> None:
+        cases = ("missing_config", "missing_state")
+        for case in cases:
+            with self.subTest(case=case):
+                self.write_processor_configs(self.bundle.path)
+                if case == "missing_config":
+                    (self.bundle.path / "postprocessor_config.json").unlink()
+                else:
+                    (self.bundle.path / "preprocessor_config.json").write_text(
+                        json.dumps(
+                            {"steps": [{"state_file": "state/missing.bin"}]}
+                        ),
+                        encoding="utf-8",
+                    )
+                calls: list[str] = []
+                self.stderr.seek(0)
+                self.stderr.truncate()
+                deps = self.dependencies(
+                    input_fn=lambda prompt: self.fail("prompted after processor fault"),
+                    policy_factory=lambda bundle, device: calls.append("policy"),
+                    robot_factory=lambda **kwargs: calls.append("robot"),
+                )
+
+                status = main(
+                    self.rollout_args() + ["--live"], dependencies=deps
+                )
+
+                self.assertEqual(status, 2)
+                self.assertEqual(calls, [])
+                self.assertRegex(
+                    self.stderr.getvalue(),
+                    "postprocessor_config.json|state/missing.bin",
+                )
+
+    def test_explicit_log_path_rejects_traversal_protected_roots_and_symlinks(self) -> None:
+        allowed = self.root / "runs" / "policy"
+        allowed.mkdir(parents=True)
+        credential = self.root / "config" / "credentials.env"
+        credential.parent.mkdir()
+        credential.write_text("SECRET=unchanged", encoding="utf-8")
+        symlink = allowed / "linked.jsonl"
+        symlink.symlink_to(credential)
+        disallowed = (
+            self.root / "data" / "episodes.jsonl",
+            self.root / "models" / "checkpoint.jsonl",
+            self.root / "config" / "calibration.jsonl",
+            allowed / ".." / "escaped.jsonl",
+            symlink,
+            allowed / "credentials.jsonl",
+            allowed / ".env.jsonl",
+        )
+        for path in disallowed:
+            with self.subTest(path=path):
+                calls: list[str] = []
+                self.stderr.seek(0)
+                self.stderr.truncate()
+                args = self.rollout_args()
+                args[args.index("--log-path") + 1] = str(path)
+                deps = self.dependencies(
+                    policy_factory=lambda bundle, device: calls.append("policy"),
+                    robot_factory=lambda **kwargs: calls.append("robot"),
+                )
+
+                status = main(args + ["--live"], dependencies=deps)
+
+                self.assertEqual(status, 2)
+                self.assertEqual(calls, [])
+                self.assertIn("runs/policy", self.stderr.getvalue())
+                self.assertEqual(
+                    credential.read_text(encoding="utf-8"), "SECRET=unchanged"
+                )
+
+    def test_default_log_path_is_timestamped_under_injected_runs_policy(self) -> None:
+        args = self.rollout_args()
+        index = args.index("--log-path")
+        del args[index : index + 2]
+        deps = self.dependencies(
+            input_fn=lambda prompt: (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+        )
+
+        status = main(args + ["--live"], dependencies=deps)
+
+        expected = (
+            self.root / "runs" / "policy" / "20260718T212223Z.jsonl"
+        ).resolve()
+        self.assertEqual(status, 0)
+        self.assertTrue(expected.is_file())
+        self.assertIn(f"jsonl_path={expected}", self.stdout.getvalue())
+
+    def test_shared_stop_event_set_after_preflight_prevents_policy_and_send(self) -> None:
+        from p3_vlm_orchestrator.policy_rollout.runner import RolloutRunner
+
+        keyboard = FakeKeyboardStop()
+        robot = StopOnSecondObservationRobot(keyboard.event)
+        policy_calls: list[str] = []
+
+        class Policy:
+            def predict(self, observation):
+                policy_calls.append("predict")
+                return np.zeros((10, 7))
+
+        runner_calls: list[dict[str, object]] = []
+
+        def make_runner(**kwargs):
+            runner_calls.append(kwargs)
+            return RolloutRunner(**kwargs)
+
+        deps = self.dependencies(
+            input_fn=lambda prompt: (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            ),
+            policy_factory=lambda bundle, device: Policy(),
+            robot_factory=lambda **kwargs: robot,
+            runner_factory=make_runner,
+            keyboard_stop_factory=lambda: keyboard,
+        )
+
+        status = main(self.rollout_args() + ["--live"], dependencies=deps)
+
+        self.assertEqual(status, 0)
+        self.assertIs(runner_calls[0]["stop_requested"], keyboard.event)
+        self.assertTrue(keyboard.event.is_set())
+        self.assertEqual(policy_calls, [])
+        self.assertEqual(robot.send_count, 0)
+        self.assertEqual(robot.connect_count, 1)
+        self.assertEqual(robot.disconnect_count, 1)
+        self.assertIn("terminal_reason=stop_requested", self.stdout.getvalue())
+
+    def test_fresh_process_inspect_and_offline_keep_hardware_modules_unloaded(self) -> None:
+        checkpoint = self.write_checkpoint()
+        repo_root = Path(__file__).resolve().parents[2]
+        commands = (
+            (["inspect", "--checkpoint", str(checkpoint)], 0),
+            (
+                [
+                    "offline",
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--dataset",
+                    str(self.root / "missing-dataset"),
+                    "--episodes",
+                    "1",
+                ],
+                2,
+            ),
+        )
+        for argv, expected_status in commands:
+            with self.subTest(command=argv[0]):
+                script = f"""
+import sys
+from p3_vlm_orchestrator.policy_rollout.cli import main
+status = main({argv!r})
+assert status == {expected_status}, status
+forbidden = []
+for name in sys.modules:
+    lower = name.lower()
+    if (
+        name == 'serial' or name.startswith('serial.')
+        or name == 'cv2' or name.startswith('cv2.')
+        or name == 'pinocchio' or name.startswith('pinocchio.')
+        or name == 'lerobot' or name.startswith('lerobot.')
+        or name == 'torch' or name.startswith('torch.')
+        or 'rebot_robot' in lower
+        or lower.startswith('rebotarm_control_py')
+        or lower.startswith('p1_arm_motion')
+    ):
+        forbidden.append(name)
+assert not forbidden, forbidden
+"""
+                completed = subprocess.run(
+                    [sys.executable, "-c", script],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stdout + completed.stderr,
+                )
 
 
 class PreflightRobotAdapterTest(unittest.TestCase):
@@ -594,6 +893,12 @@ class PreflightRobotAdapterTest(unittest.TestCase):
             make_observation(front_shape=(640, 480, 3)),
             make_observation(side_shape=(1280, 720, 3)),
             make_observation(front_shape=(480, 640)),
+            make_observation(front_shape=(480, 640, 1)),
+            make_observation(front_shape=(480, 640, 4)),
+            make_observation(front_shape=(480, 640, 0)),
+            make_observation(side_shape=(720, 1280, 1)),
+            make_observation(side_shape=(720, 1280, 4)),
+            make_observation(side_shape=(720, 1280, 0)),
         )
         for observation in malformed:
             with self.subTest(
