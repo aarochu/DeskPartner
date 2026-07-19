@@ -27,10 +27,24 @@ fps: 30
 joint_names: [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_yaw, wrist_roll, gripper]
 camera_keys: [front, side]
 destination_repo: Cornerf/rebot-cansort-rerun-curated
+robot_profile:
+  path: rebot_operator_kit/config/training_profile.json
+  file_sha256: 82363ef023de870db5b22173837fc95fef2f8adb426bb1d65ed46eb96ace31b6
+  semantic_sha256: 9370a9fc5d90df7ffb0174c0a035fcf043911c04bbef6820c9bf36ab04131208
 quality:
-  max_state_age_ms: 100.0
-  max_camera_age_ms: 66.666667
+  position_unit: degree
+  sample_period_s: 0.03333333333333333
+  max_state_age_ns: 100000000
+  max_camera_age_ns: 66666667
+  observed_state_limit_tolerance_deg: 0.25
+  stationary_epsilon_deg_per_frame: 0.25
+  saturation_band_deg: 0.25
+  derivative_normalization_span_deg: [290, 170, 200, 170, 180, 180, 270]
+  gripper_open_threshold_deg: -67.5
+  gripper_closed_threshold_deg: -202.5
   lag_search_frames: 15
+  lag_min_normalized_motion_range: 0.01
+  lag_score_round_decimals: 12
   calibration_fraction: 0.8
   upper_quantile: 0.99
   lower_quantile: 0.01
