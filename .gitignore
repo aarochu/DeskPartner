@@ -25,6 +25,12 @@ data/teach_replay/
 data/recording/
 p5_training/configs/mixture_deskpartner.yaml
 
+# Rerun / LeRobot export artifacts (Person 5 bounty port)
+recordings/
+datasets/
+*.rrd
+*.traj.npz
+
 # OS / IDE
 .DS_Store
 Thumbs.db

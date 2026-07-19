@@ -22,8 +22,12 @@ DeskPartner/
 ├── p2_vision_calibration/   # Track A — ArUco, CV, pixel→arm
 ├── p3_vlm_orchestrator/     # Track A — VLM + closed-loop state machine
 ├── p4_data_collection/      # Track B — teleop demos (LeRobot, single-arm only)
-└── p5_training/             # Track B — MolmoAct 2 LoRA + bake-off
+├── p5_training/             # Track B — MolmoAct 2 LoRA + bake-off
+├── p5_rerun_port/           # Rerun bounty — log/record/query/export/replay on reBot
+└── Rerun_bounty_progress.md # Person 5 bounty progress + SO→reBot map
 ```
+
+**Rerun non-SO-101 port (Person 5):** [`p5_rerun_port/README.md`](./p5_rerun_port/README.md) · progress: [`Rerun_bounty_progress.md`](./Rerun_bounty_progress.md)
 
 ---
 
