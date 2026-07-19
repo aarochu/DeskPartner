@@ -8,8 +8,10 @@ physical runtime installed.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import fields, is_dataclass
 from hashlib import sha256
 import math
+from numbers import Real
 from pathlib import Path
 import sys
 import time
@@ -31,10 +33,32 @@ FOLLOWER_RUNTIME_CONTRACTS = (
     "follower_dm_implementation",
 )
 EXPECTED_CAMERA_KEYS = ("front", "side")
+ALLOWED_CAMERA_METADATA_KEYS = (
+    "excluded_screen_index",
+    "excluded_screen_name",
+    "minimum_measured_fps",
+)
 EXPECTED_RECORDING_KEYS = (
     "observation.images.front",
     "observation.images.side",
 )
+CALIBRATION_FIELDS = (
+    "id",
+    "drive_mode",
+    "homing_offset",
+    "range_min",
+    "range_max",
+)
+
+
+class FollowerCleanupError(RuntimeError):
+    """Aggregates best-effort follower resource cleanup failures."""
+
+    def __init__(self, errors: Sequence[Exception]) -> None:
+        self.errors = tuple(errors)
+        super().__init__(
+            f"Follower cleanup encountered {len(self.errors)} resource error(s)"
+        )
 
 
 class _Backend(Protocol):
@@ -184,10 +208,16 @@ class ReBotPolicyRobot:
         collection = _required_mapping(
             profile_snapshot, "collection_defaults", "profile"
         )
-        base_velocity = _positive_finite(
-            collection.get("motor_velocity", 2000.0),
-            "Profile motor velocity",
-        )
+        profile_velocity = collection.get("motor_velocity")
+        if (
+            isinstance(profile_velocity, bool)
+            or not isinstance(profile_velocity, (int, float))
+            or not math.isfinite(float(profile_velocity))
+            or float(profile_velocity) != 2000.0
+        ):
+            raise ValueError(
+                "Profile motor velocity must equal exactly 2000.0 degrees/s"
+            )
         gripper_force = _finite_float(
             collection.get("gripper_force", 0.05),
             "Profile gripper force",
@@ -195,7 +225,7 @@ class ReBotPolicyRobot:
         if not 0.0 <= gripper_force <= 1.0:
             raise ValueError("Profile gripper force must be in [0, 1]")
 
-        expected_velocity = [base_velocity * checked_speed] * JOINT_COUNT
+        expected_velocity = [2000.0 * checked_speed] * JOINT_COUNT
         follower_config = checked_backend.make_follower_config(
             port=device,
             id=follower_id,
@@ -235,23 +265,31 @@ class ReBotPolicyRobot:
             raise RuntimeError("ReBot policy follower is already connected")
         try:
             self.follower.connect(calibrate=False)
-        except TypeError as exc:
-            raise RuntimeError(
-                "Follower plugin does not support fail-closed calibrate=False connection"
-            ) from exc
-        if not bool(getattr(self.follower, "is_connected", False)):
-            raise RuntimeError("Follower plugin did not report a connected state")
+            if not bool(getattr(self.follower, "is_connected", False)):
+                raise RuntimeError("Follower plugin did not report a connected state")
+        except Exception as connect_error:
+            cleanup_error = _cleanup_follower_resources(self.follower)
+            self._connected = False
+            if cleanup_error is not None:
+                raise connect_error from cleanup_error
+            raise
         self._connected = True
 
     def disconnect(self) -> None:
-        if not self._connected and not bool(
-            getattr(self.follower, "is_connected", False)
-        ):
+        aggregate_connected = bool(getattr(self.follower, "is_connected", False))
+        if aggregate_connected:
+            try:
+                self.follower.disconnect()
+            finally:
+                self._connected = False
             return
-        try:
-            self.follower.disconnect()
-        finally:
-            self._connected = False
+        if not self._connected and not _follower_has_resources(self.follower):
+            return
+
+        cleanup_error = _cleanup_follower_resources(self.follower)
+        self._connected = False
+        if cleanup_error is not None:
+            raise cleanup_error from cleanup_error.errors[0]
 
     def observe(self) -> RolloutObservation:
         self._require_connected()
@@ -430,6 +468,89 @@ def _default_serial_ports() -> Iterable[object]:
     return list_ports.comports()
 
 
+def _follower_has_resources(follower: object) -> bool:
+    if getattr(follower, "bus", None) is not None:
+        return True
+    motors = getattr(follower, "motors", None)
+    if isinstance(motors, Mapping) and bool(motors):
+        return True
+    cameras = getattr(follower, "cameras", None)
+    if isinstance(cameras, Mapping):
+        for camera in cameras.values():
+            try:
+                if bool(getattr(camera, "is_connected", False)):
+                    return True
+            except Exception:
+                return True
+    return False
+
+
+def _cleanup_follower_resources(
+    follower: object,
+) -> FollowerCleanupError | None:
+    """Best-effort cleanup that does not depend on aggregate connection state."""
+
+    errors: list[Exception] = []
+    bus = getattr(follower, "bus", None)
+    if bus is not None:
+        disable_all = getattr(bus, "disable_all", None)
+        if callable(disable_all):
+            try:
+                disable_all()
+            except Exception as exc:
+                errors.append(exc)
+
+    motors = getattr(follower, "motors", None)
+    if isinstance(motors, Mapping):
+        for motor in motors.values():
+            disable = getattr(motor, "disable", None)
+            if callable(disable):
+                try:
+                    disable()
+                except Exception as exc:
+                    errors.append(exc)
+            close = getattr(motor, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    errors.append(exc)
+        try:
+            setattr(follower, "motors", {})
+        except Exception as exc:
+            errors.append(exc)
+
+    if bus is not None:
+        close_bus = getattr(bus, "close", None)
+        if callable(close_bus):
+            try:
+                close_bus()
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            setattr(follower, "bus", None)
+        except Exception as exc:
+            errors.append(exc)
+
+    cameras = getattr(follower, "cameras", None)
+    if isinstance(cameras, Mapping):
+        for camera in cameras.values():
+            try:
+                connected = bool(getattr(camera, "is_connected", False))
+            except Exception as exc:
+                errors.append(exc)
+                connected = True
+            if connected:
+                disconnect = getattr(camera, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        disconnect()
+                    except Exception as exc:
+                        errors.append(exc)
+
+    return FollowerCleanupError(errors) if errors else None
+
+
 def _required_mapping(
     parent: Mapping[str, Any], key: str, label: str
 ) -> Mapping[str, Any]:
@@ -452,13 +573,6 @@ def _finite_float(value: object, label: str) -> float:
         raise ValueError(f"{label} must be finite") from exc
     if not math.isfinite(result):
         raise ValueError(f"{label} must be finite")
-    return result
-
-
-def _positive_finite(value: object, label: str) -> float:
-    result = _finite_float(value, label)
-    if result <= 0:
-        raise ValueError(f"{label} must be positive")
     return result
 
 
@@ -531,38 +645,106 @@ def _profile_joints(coordinates: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _load_calibration(
     path: Path, joint_names: Sequence[str]
-) -> Mapping[str, object]:
+) -> dict[str, dict[str, float]]:
     import json
 
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("Follower calibration is not valid JSON") from exc
-    if not isinstance(value, dict) or list(value) != list(joint_names):
+    return _normalize_calibration(
+        value,
+        joint_names,
+        label="Follower calibration file",
+    )
+
+
+def _normalize_calibration(
+    calibration: object,
+    joint_names: Sequence[str],
+    *,
+    label: str,
+) -> dict[str, dict[str, float]]:
+    if not isinstance(calibration, Mapping) or list(calibration) != list(joint_names):
         raise ValueError(
-            "Follower calibration joint order does not match the authenticated profile"
+            f"{label} joint order does not match the authenticated profile"
         )
-    for joint_name in joint_names:
-        entry = value[joint_name]
-        if not isinstance(entry, Mapping):
-            raise ValueError(f"Follower calibration entry {joint_name} is malformed")
-        for field in ("id", "drive_mode", "homing_offset", "range_min", "range_max"):
-            if isinstance(entry.get(field), bool):
-                raise ValueError(
-                    f"Follower calibration {joint_name}.{field} must not be boolean"
-                )
-            _finite_float(entry.get(field), f"Follower calibration {joint_name}.{field}")
-    return value
+    return {
+        joint_name: _normalize_calibration_entry(
+            calibration[joint_name],
+            label=f"{label} entry {joint_name}",
+        )
+        for joint_name in joint_names
+    }
+
+
+def _normalize_calibration_entry(
+    entry: object,
+    *,
+    label: str,
+) -> dict[str, float]:
+    if isinstance(entry, Mapping):
+        values = dict(entry)
+    elif hasattr(entry, "__dict__"):
+        values = {
+            name: value
+            for name, value in vars(entry).items()
+            if not name.startswith("_")
+        }
+    elif is_dataclass(entry):
+        values = {field.name: getattr(entry, field.name) for field in fields(entry)}
+    else:
+        slots = getattr(type(entry), "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        values = {
+            name: getattr(entry, name)
+            for name in slots
+            if isinstance(name, str) and not name.startswith("_")
+        }
+
+    actual_fields = set(values)
+    expected_fields = set(CALIBRATION_FIELDS)
+    if actual_fields != expected_fields:
+        missing = sorted(expected_fields - actual_fields)
+        extra = sorted(actual_fields - expected_fields)
+        raise ValueError(
+            f"{label} calibration fields mismatch; missing={missing}, extra={extra}"
+        )
+
+    normalized: dict[str, float] = {}
+    for field_name in CALIBRATION_FIELDS:
+        value = values[field_name]
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(
+                f"{label} calibration field {field_name} must be a finite number"
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(
+                f"{label} calibration field {field_name} must be a finite number"
+            )
+        normalized[field_name] = numeric
+    return normalized
 
 
 def _camera_contract(
     profile: Mapping[str, Any],
 ) -> dict[str, dict[str, int | str]]:
     cameras = _required_mapping(profile, "camera_defaults", "profile")
-    if tuple(cameras)[:2] != EXPECTED_CAMERA_KEYS or set(cameras).intersection(
-        EXPECTED_CAMERA_KEYS
-    ) != set(EXPECTED_CAMERA_KEYS):
-        raise ValueError("Profile camera contract must contain front then side")
+    extra_entries = set(cameras) - set(EXPECTED_CAMERA_KEYS) - set(
+        ALLOWED_CAMERA_METADATA_KEYS
+    )
+    if extra_entries:
+        raise ValueError(
+            "Profile camera contract must contain exactly front and side; "
+            f"extra entries: {sorted(extra_entries)}"
+        )
+    camera_entries = {
+        key for key, value in cameras.items() if isinstance(value, Mapping)
+    }
+    if camera_entries != set(EXPECTED_CAMERA_KEYS):
+        raise ValueError("Profile camera contract must contain exactly front and side")
     result: dict[str, dict[str, int | str]] = {}
     for key, expected_recording_key in zip(
         EXPECTED_CAMERA_KEYS, EXPECTED_RECORDING_KEYS, strict=True
@@ -582,6 +764,8 @@ def _camera_contract(
             "height": _positive_integer(raw.get("height"), f"{key} camera height"),
             "fps": _positive_integer(raw.get("fps"), f"{key} camera FPS"),
         }
+    if result["front"]["index"] == result["side"]["index"]:
+        raise ValueError("Profile front and side camera indices must be distinct")
     return result
 
 
@@ -624,6 +808,14 @@ def _verify_plugin_binding(
         raise ValueError("Instantiated follower plugin directions do not match the profile")
     if actual_limits != dict(expected_limits):
         raise ValueError("Instantiated follower plugin limits do not match the profile")
+    if getattr(plugin_config, "max_relative_target", None) != MAX_RELATIVE_TARGET_DEG:
+        raise ValueError(
+            "Instantiated follower plugin relative target does not match 1.5 degrees"
+        )
+    if getattr(plugin_config, "disable_torque_on_disconnect", None) is not True:
+        raise ValueError(
+            "Instantiated follower plugin torque-off disconnect flag must be exactly True"
+        )
     try:
         actual_velocity = np.asarray(
             getattr(plugin_config, "pos_vel_velocity"), dtype=float
@@ -642,11 +834,15 @@ def _verify_plugin_binding(
     ).expanduser().resolve()
     if actual_calibration != calibration_path:
         raise ValueError("Follower plugin calibration path does not match the profile")
-    loaded_calibration = getattr(follower, "calibration", None)
-    if not isinstance(loaded_calibration, Mapping) or list(loaded_calibration) != list(
-        calibration_values
-    ):
-        raise ValueError("Follower plugin calibration did not load the verified joint order")
+    loaded_calibration = _normalize_calibration(
+        getattr(follower, "calibration", None),
+        joint_names,
+        label="Follower plugin calibration",
+    )
+    if loaded_calibration != calibration_values:
+        raise ValueError(
+            "Follower plugin calibration values do not match the verified calibration file"
+        )
 
     follower_cameras = getattr(follower, "cameras", None)
     config_cameras = getattr(plugin_config, "cameras", None)

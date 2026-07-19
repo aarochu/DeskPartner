@@ -157,6 +157,11 @@ class CalibratedWorkspaceGuardTest(unittest.TestCase):
     def test_default_sdk_fk_is_lazy_converts_first_six_degrees_and_returns_mm(self) -> None:
         sdk_repo = self.root / "sdk"
         sdk_repo.mkdir()
+        (sdk_repo / "config").mkdir()
+        (sdk_repo / "config" / "rebotarm.yaml").write_text(
+            json.dumps({"hardware_yaml": "rebotarm_dm.yaml"}),
+            encoding="utf-8",
+        )
         captured = []
         package = ModuleType("reBotArm_control_py")
         package.__path__ = []  # type: ignore[attr-defined]
@@ -188,6 +193,31 @@ class CalibratedWorkspaceGuardTest(unittest.TestCase):
             captured[0],
             np.radians([0.0, 90.0, -90.0, 45.0, -45.0, 180.0]),
         )
+
+    def test_default_sdk_fk_rejects_missing_or_mismatched_hardware_config(self) -> None:
+        sdk_repo = self.root / "sdk"
+        sdk_repo.mkdir()
+
+        with self.assertRaisesRegex(ValueError, "SDK.*hardware"):
+            CalibratedWorkspaceGuard.from_files(
+                arm_config_path=self.arm_path,
+                workspace_config_path=self.workspace_path,
+                calibration_path=self.calibration_path,
+                current_utc=NOW,
+            )
+
+        (sdk_repo / "config").mkdir()
+        (sdk_repo / "config" / "rebotarm.yaml").write_text(
+            json.dumps({"hardware_yaml": "rebotarm_rs.yaml"}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "SDK.*hardware"):
+            CalibratedWorkspaceGuard.from_files(
+                arm_config_path=self.arm_path,
+                workspace_config_path=self.workspace_path,
+                calibration_path=self.calibration_path,
+                current_utc=NOW,
+            )
 
     def test_rejects_malformed_action_or_fk_return(self) -> None:
         with self.assertRaisesRegex(WorkspaceViolation, "shape"):

@@ -34,6 +34,70 @@ LIMITS = (
 TASK = "Pick up one can and place it in the taped sorting zone"
 
 
+class FakeBusResource:
+    def __init__(
+        self,
+        *,
+        disable_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self.disable_error = disable_error
+        self.close_error = close_error
+        self.disable_count = 0
+        self.close_count = 0
+
+    def disable_all(self) -> None:
+        self.disable_count += 1
+        if self.disable_error is not None:
+            raise self.disable_error
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeMotorResource:
+    def __init__(
+        self,
+        *,
+        disable_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self.disable_error = disable_error
+        self.close_error = close_error
+        self.disable_count = 0
+        self.close_count = 0
+
+    def disable(self) -> None:
+        self.disable_count += 1
+        if self.disable_error is not None:
+            raise self.disable_error
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeCameraResource:
+    def __init__(
+        self,
+        *,
+        connected: bool,
+        disconnect_error: Exception | None = None,
+    ) -> None:
+        self.is_connected = connected
+        self.disconnect_error = disconnect_error
+        self.disconnect_count = 0
+
+    def disconnect(self) -> None:
+        self.disconnect_count += 1
+        self.is_connected = False
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
+
+
 class FakeFollower:
     name = "seeed_b601_dm_follower"
 
@@ -90,6 +154,10 @@ class FakeBackend:
         self.calibration_path_override = None
         self.velocity_override = None
         self.follower_direction_override = None
+        self.max_relative_target_override = None
+        self.disable_torque_override = None
+        self.loaded_calibration_as_objects = False
+        self.loaded_calibration_mutator = None
         self.follower = None
         self.config_kwargs = None
 
@@ -112,6 +180,10 @@ class FakeBackend:
         )
         if self.velocity_override is not None:
             config.pos_vel_velocity = self.velocity_override
+        if self.max_relative_target_override is not None:
+            config.max_relative_target = self.max_relative_target_override
+        if self.disable_torque_override is not None:
+            config.disable_torque_on_disconnect = self.disable_torque_override
         return config
 
     def make_follower(self, config):
@@ -125,6 +197,13 @@ class FakeBackend:
         if self.follower_direction_override is not None:
             follower.config = SimpleNamespace(**vars(config))
             follower.config.joint_directions = self.follower_direction_override
+        if self.loaded_calibration_as_objects:
+            follower.calibration = {
+                name: SimpleNamespace(**entry)
+                for name, entry in follower.calibration.items()
+            }
+        if self.loaded_calibration_mutator is not None:
+            self.loaded_calibration_mutator(follower.calibration)
         self.follower = follower
         return follower
 
@@ -291,6 +370,30 @@ class ReBotPolicyRobotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "width"):
             self._robot()
 
+    def test_rejects_an_extra_camera_mapping(self) -> None:
+        self.profile["camera_defaults"]["rear"] = {
+            "recording_key": "observation.images.rear",
+            "index": 2,
+            "width": 2,
+            "height": 2,
+            "fps": 30,
+        }
+
+        with self.assertRaisesRegex(ValueError, "exactly front and side"):
+            self._robot()
+
+    def test_rejects_unknown_scalar_camera_entry(self) -> None:
+        self.profile["camera_defaults"]["rear"] = 2
+
+        with self.assertRaisesRegex(ValueError, "extra entries"):
+            self._robot()
+
+    def test_rejects_duplicate_front_and_side_camera_indices(self) -> None:
+        self.profile["camera_defaults"]["side"]["index"] = 0
+
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            self._robot()
+
     def test_rejects_boolean_calibration_numbers_even_with_matching_fingerprint(self) -> None:
         entry = self.profile["calibration"]["follower"]
         path = self.runtime_root / entry["runtime_relative_path"]
@@ -311,6 +414,30 @@ class ReBotPolicyRobotTest(unittest.TestCase):
 
         self.assertEqual(self.backend.follower.connect_count, 0)
 
+    def test_rejects_authenticated_motor_velocity_other_than_literal_2000(self) -> None:
+        self.profile["collection_defaults"]["motor_velocity"] = 1999.0
+
+        with self.assertRaisesRegex(ValueError, "motor velocity.*2000"):
+            self._robot()
+
+        self.assertIsNone(self.backend.follower)
+
+    def test_rejects_instantiated_relative_target_mismatch_before_connect(self) -> None:
+        self.backend.max_relative_target_override = 1.6
+
+        with self.assertRaisesRegex(ValueError, "relative target"):
+            self._robot()
+
+        self.assertEqual(self.backend.follower.connect_count, 0)
+
+    def test_rejects_instantiated_torque_off_flag_mismatch_before_connect(self) -> None:
+        self.backend.disable_torque_override = 1
+
+        with self.assertRaisesRegex(ValueError, "torque"):
+            self._robot()
+
+        self.assertEqual(self.backend.follower.connect_count, 0)
+
     def test_rejects_direction_mismatch_on_follower_actual_config(self) -> None:
         directions = dict(zip(JOINTS, DIRECTIONS, strict=True))
         directions["wrist_yaw"] = -1.0
@@ -318,6 +445,49 @@ class ReBotPolicyRobotTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "plugin directions"):
             self._robot()
+
+    def test_rejects_changed_missing_extra_or_boolean_loaded_calibration_values(self) -> None:
+        def changed(values):
+            values["shoulder_pan"]["homing_offset"] = 1.0
+
+        def missing(values):
+            values["shoulder_pan"].pop("range_min")
+
+        def extra(values):
+            values["shoulder_pan"]["unexpected"] = 1.0
+
+        def boolean(values):
+            values["shoulder_pan"]["drive_mode"] = False
+
+        for mutate in (changed, missing, extra, boolean):
+            with self.subTest(mutate=mutate.__name__):
+                self.backend = FakeBackend()
+                self.backend.loaded_calibration_mutator = mutate
+
+                with self.assertRaisesRegex(ValueError, "calibration"):
+                    self._robot()
+
+                self.assertEqual(self.backend.follower.connect_count, 0)
+
+    def test_rejects_changed_object_backed_loaded_calibration_value(self) -> None:
+        def mutate(values):
+            values["shoulder_pan"].range_max = 181.0
+
+        self.backend.loaded_calibration_as_objects = True
+        self.backend.loaded_calibration_mutator = mutate
+
+        with self.assertRaisesRegex(ValueError, "calibration"):
+            self._robot()
+
+        self.assertEqual(self.backend.follower.connect_count, 0)
+
+    def test_accepts_exact_object_backed_loaded_calibration(self) -> None:
+        self.backend.loaded_calibration_as_objects = True
+
+        robot = self._robot()
+
+        self.assertEqual(robot.task, TASK)
+        self.assertEqual(self.backend.follower.connect_count, 0)
 
     def test_rejects_nonfinite_capture_clock(self) -> None:
         robot = ReBotPolicyRobot.from_profile(
@@ -332,6 +502,96 @@ class ReBotPolicyRobotTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "capture"):
             robot.observe()
+
+    def test_partial_connect_failure_cleans_bus_motors_and_connected_cameras(self) -> None:
+        robot = self._robot()
+        follower = self.backend.follower
+        bus = FakeBusResource()
+        motors = {
+            "shoulder_pan": FakeMotorResource(),
+            "gripper": FakeMotorResource(),
+        }
+        front = FakeCameraResource(connected=True)
+        side = FakeCameraResource(connected=False)
+
+        def fail_after_front_camera(*, calibrate=True):
+            follower.bus = bus
+            follower.motors = motors
+            follower.cameras = {"front": front, "side": side}
+            follower.is_connected = False
+            raise RuntimeError("side camera failed after bus open")
+
+        follower.connect = fail_after_front_camera
+
+        with self.assertRaisesRegex(RuntimeError, "side camera failed") as raised:
+            robot.connect()
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(bus.disable_count, 1)
+        self.assertEqual(bus.close_count, 1)
+        self.assertIsNone(follower.bus)
+        for motor in motors.values():
+            self.assertEqual(motor.disable_count, 1)
+            self.assertEqual(motor.close_count, 1)
+        self.assertEqual(front.disconnect_count, 1)
+        self.assertEqual(side.disconnect_count, 0)
+
+    def test_partial_connect_preserves_original_error_and_chains_cleanup_failure(self) -> None:
+        robot = self._robot()
+        follower = self.backend.follower
+        bus = FakeBusResource(disable_error=OSError("disable broadcast failed"))
+        motor = FakeMotorResource(close_error=OSError("motor close failed"))
+        front = FakeCameraResource(
+            connected=True,
+            disconnect_error=OSError("camera disconnect failed"),
+        )
+
+        def fail_after_front_camera(*, calibrate=True):
+            follower.bus = bus
+            follower.motors = {"shoulder_pan": motor}
+            follower.cameras = {
+                "front": front,
+                "side": FakeCameraResource(connected=False),
+            }
+            follower.is_connected = False
+            raise RuntimeError("original camera open failure")
+
+        follower.connect = fail_after_front_camera
+
+        with self.assertRaisesRegex(RuntimeError, "original camera open failure") as raised:
+            robot.connect()
+
+        self.assertIsNotNone(raised.exception.__cause__)
+        self.assertIn("cleanup", str(raised.exception.__cause__).lower())
+        self.assertEqual(bus.disable_count, 1)
+        self.assertEqual(bus.close_count, 1)
+        self.assertEqual(motor.disable_count, 1)
+        self.assertEqual(motor.close_count, 1)
+        self.assertEqual(front.disconnect_count, 1)
+
+    def test_disconnect_cleans_partial_resources_when_aggregate_state_is_false(self) -> None:
+        robot = self._robot()
+        robot.connect()
+        follower = self.backend.follower
+        bus = FakeBusResource()
+        motor = FakeMotorResource()
+        front = FakeCameraResource(connected=True)
+        follower.bus = bus
+        follower.motors = {"shoulder_pan": motor}
+        follower.cameras = {
+            "front": front,
+            "side": FakeCameraResource(connected=False),
+        }
+        follower.is_connected = False
+
+        robot.disconnect()
+
+        self.assertEqual(bus.disable_count, 1)
+        self.assertEqual(bus.close_count, 1)
+        self.assertEqual(motor.disable_count, 1)
+        self.assertEqual(motor.close_count, 1)
+        self.assertEqual(front.disconnect_count, 1)
+        self.assertIsNone(follower.bus)
 
     def test_plugin_binding_mismatch_rejects_before_connect(self) -> None:
         cases = ("direction", "limit", "order", "calibration", "camera")

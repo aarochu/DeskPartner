@@ -310,6 +310,17 @@ def _make_sdk_fk(arm_config: object) -> Callable[[np.ndarray], np.ndarray]:
     sdk_repo = Path(getattr(arm_config, "sdk_repo")).expanduser().resolve()
     if not sdk_repo.is_dir():
         raise FileNotFoundError(f"reBot SDK not found at {sdk_repo}")
+    sdk_config_path = sdk_repo / "config" / "rebotarm.yaml"
+    if not sdk_config_path.is_file():
+        raise ValueError(f"SDK hardware config is missing: {sdk_config_path}")
+    sdk_config = _load_mapping(sdk_config_path, "SDK hardware config")
+    configured_hardware = sdk_config.get("hardware_yaml")
+    expected_hardware = getattr(arm_config, "hardware_yaml", None)
+    if configured_hardware != expected_hardware:
+        raise ValueError(
+            "SDK hardware_yaml does not match ArmConfig.hardware_yaml: "
+            f"{configured_hardware!r} != {expected_hardware!r}"
+        )
     sdk_root = str(sdk_repo)
     if sdk_root not in sys.path:
         sys.path.insert(0, sdk_root)
