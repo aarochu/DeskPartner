@@ -9,7 +9,60 @@ Port of the [so100-hackathon](https://github.com/mission-robotics-ai/so100-hacka
 log_rebot → record_episode (.rrd) → query_dataset → export_lerobot → replay_episode
 ```
 
-Leaves `p4_data_collection` (native LeRobot record) untouched. This package is the **Rerun → catalog → LeRobot v3 → replay** product shape.
+Leaves `p4_data_collection` (native LeRobot record) and `rebot_operator_kit` untouched. This package is the **Rerun → catalog → LeRobot v3 → replay** product shape — a **parallel** bounty path that shares hardware/config with the operator GUI track.
+
+## How it connects (flowchart)
+
+![reBot pipeline: shared setup, GUI track, Rerun bounty loop, training](../assets/rebot_rerun_pipeline_flowchart.png)
+
+```mermaid
+flowchart TB
+  subgraph shared["Shared setup — SDK zero + config/"]
+    CAL["Calibrate<br/>SDK zero + leader calib"]
+    HW["reBot hardware<br/>Follower + leader + cams"]
+    CAL --> HW
+  end
+
+  HW --> GUI
+  HW --> RERUN
+
+  subgraph GUI["GUI track — unchanged"]
+    direction TB
+    G1["Teleop GUI<br/>07_teleop_gui.command"]
+    G2["LeRobot record<br/>p4_data_collection"]
+    G3["HF / share dataset"]
+    G1 --> G2 --> G3
+  end
+
+  subgraph RERUN["Rerun bounty loop — p5_rerun_port"]
+    direction TB
+    R0["log_rebot<br/>joints + cams + URDF"]
+    R1["record_episode<br/>.rrd + tag + frames"]
+    R2["Local catalog<br/>catalog.json · .meta · .traj.npz"]
+    R3["query_dataset<br/>list / filter / inspect"]
+    R4["export_lerobot<br/>LeRobot v3 reBot schema"]
+    R5["replay_episode<br/>follower/goal on arm"]
+    R0 --> R1 --> R2 --> R3 --> R4 --> R5
+  end
+
+  G3 -.->|"optional"| TRAIN
+  R4 -.->|"optional"| TRAIN
+  R5 -->|"close loop"| HW
+
+  subgraph TRAIN["p5_training — unchanged"]
+    T1["Fine-tune<br/>Modal / MolmoAct 2"]
+    T2["Deploy / bakeoff"]
+    T1 --> T2
+  end
+
+  T2 -.->|"stretch"| HW
+```
+
+| Path | Role |
+|------|------|
+| **GUI track** | Day-to-day collection (`rebot_operator_kit` → LeRobot → share) |
+| **Rerun loop** | Bounty product: Rerun recordings → curate → export → replay |
+| **Training** | Same `p5_training` for either dataset source (optional) |
 
 ## Install
 
