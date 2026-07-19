@@ -1,4 +1,4 @@
-"""Label-free threshold calibration and deterministic episode scoring."""
+"""Outcome-blind threshold calibration and deterministic episode scoring."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import numpy as np
 
 from .config import ChallengeConfig
 from .metrics import EpisodeMetrics, HARD_REASON_ORDER
-from .models import InventoryRow, Verdict
+from .models import TaskKey, Verdict
 
 
 class QualityError(ValueError):
@@ -31,6 +31,15 @@ class CalibratedMetricSpec:
     units: str
     direction: Literal["upper", "lower"]
     physical_bound: float | None
+
+
+@dataclass(frozen=True)
+class CalibrationCapture:
+    """Outcome-free source metadata used only for chronological calibration."""
+
+    identity: str
+    task_key: TaskKey
+    captured_at: str
 
 
 # Ordered explicitly so calibration rows and anomaly reasons never depend on maps.
@@ -84,6 +93,8 @@ class EpisodeVerdict:
     verdict: Verdict
     reason_codes: tuple[str, ...]
     metrics_digest: str
+    threshold_digest: str
+    verdict_digest: str
 
 
 def _canonical(value: Any) -> Any:
@@ -107,6 +118,32 @@ def _digest(value: Any) -> str:
         _canonical(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def threshold_snapshot_digest(snapshot: ThresholdSnapshot) -> str:
+    """Recompute the semantic digest over every frozen threshold field."""
+
+    return _digest(
+        {
+            "calibration_identities": snapshot.calibration_identities,
+            "held_out_success_identities": snapshot.held_out_success_identities,
+            "thresholds": [asdict(threshold) for threshold in snapshot.thresholds],
+        }
+    )
+
+
+def episode_verdict_digest(verdict: EpisodeVerdict) -> str:
+    """Recompute the complete frozen verdict payload digest."""
+
+    return _digest(
+        {
+            "identity": verdict.identity,
+            "verdict": verdict.verdict,
+            "reason_codes": verdict.reason_codes,
+            "metrics_digest": verdict.metrics_digest,
+            "threshold_digest": verdict.threshold_digest,
+        }
+    )
 
 
 def _parse_timestamp(value: str, identity: str) -> datetime:
@@ -147,56 +184,57 @@ def _numeric_metric(metrics: EpisodeMetrics, spec: CalibratedMetricSpec) -> floa
 
 def calibrate_thresholds(
     metrics: tuple[EpisodeMetrics, ...],
-    inventory: tuple[InventoryRow, ...],
+    captures: tuple[CalibrationCapture, ...],
     config: ChallengeConfig,
 ) -> ThresholdSnapshot:
-    """Freeze an exact time-ordered success split and label-free thresholds."""
+    """Freeze an exact time-ordered approved-source split and thresholds."""
 
-    inventory_by_identity = _unique_by_identity(
-        inventory, lambda row: row.identity.canonical, "inventory"
+    captures_by_identity = _unique_by_identity(
+        captures, lambda capture: capture.identity, "calibration captures"
     )
     metrics_by_identity = _unique_by_identity(metrics, lambda row: row.identity, "metrics")
-    success_rows = {
-        identity: row for identity, row in inventory_by_identity.items() if row.role == "success"
-    }
-    if set(metrics_by_identity) != set(success_rows):
-        missing = sorted(set(success_rows) - set(metrics_by_identity))
-        extra = sorted(set(metrics_by_identity) - set(success_rows))
+    if len(captures_by_identity) != 77:
+        raise CalibrationError("calibration captures must contain exactly 77 identities")
+    if set(metrics_by_identity) != set(captures_by_identity):
+        missing = sorted(set(captures_by_identity) - set(metrics_by_identity))
+        extra = sorted(set(metrics_by_identity) - set(captures_by_identity))
         raise CalibrationError(
-            f"metrics identities must equal successful inventory identities; missing={missing}, extra={extra}"
+            f"metrics identities must equal calibration capture identities; missing={missing}, extra={extra}"
         )
-    for identity, row in success_rows.items():
-        if metrics_by_identity[identity].task_key != row.task_key:
-            raise CalibrationError(f"metrics task for {identity} must match success inventory")
+    for identity, capture in captures_by_identity.items():
+        if capture.task_key not in ("single_can", "two_can"):
+            raise CalibrationError(f"calibration capture {identity} has unknown task")
+        if metrics_by_identity[identity].task_key != capture.task_key:
+            raise CalibrationError(f"metrics task for {identity} must match calibration capture")
 
-    configured_counts = {
-        task: sum(
-            source.expected_items
-            for source in config.sources
-            if source.role == "success" and source.task_key == task
-        )
-        for task in ("single_can", "two_can")
-    }
+    required_counts = {"single_can": 52, "two_can": 25}
     calibration: list[str] = []
     held_out: list[str] = []
     for task in ("single_can", "two_can"):
-        rows = [row for row in success_rows.values() if row.task_key == task]
-        if len(rows) != configured_counts[task]:
+        rows = [capture for capture in captures_by_identity.values() if capture.task_key == task]
+        if len(rows) != required_counts[task]:
             raise CalibrationError(
-                f"successful {task} inventory count {len(rows)} must equal {configured_counts[task]}"
+                f"{task} calibration capture count {len(rows)} must equal {required_counts[task]}"
             )
         ordered = sorted(
             rows,
-            key=lambda row: (_parse_timestamp(row.captured_at, row.identity.canonical), row.identity.canonical),
+            key=lambda capture: (
+                _parse_timestamp(capture.captured_at, capture.identity),
+                capture.identity,
+            ),
         )
         calibration_count = int(len(ordered) * config.quality.calibration_fraction)
         if calibration_count <= 0 or calibration_count >= len(ordered):
             raise CalibrationError(f"{task} must have both calibration and held-out successes")
-        calibration.extend(row.identity.canonical for row in ordered[:calibration_count])
-        held_out.extend(row.identity.canonical for row in ordered[calibration_count:])
+        calibration.extend(capture.identity for capture in ordered[:calibration_count])
+        held_out.extend(capture.identity for capture in ordered[calibration_count:])
 
     if len(calibration) != 61 or len(held_out) != 16:
         raise CalibrationError("locked split must contain exactly 61 calibration and 16 held-out successes")
+    if set(calibration) | set(held_out) != set(captures_by_identity):
+        raise CalibrationError("calibration and held-out split must cover every joined identity")
+    if set(calibration) & set(held_out):
+        raise CalibrationError("calibration and held-out split must be disjoint")
 
     thresholds: list[MetricThreshold] = []
     for spec in CALIBRATED_METRICS:
@@ -253,18 +291,13 @@ def calibrate_thresholds(
             raise CalibrationError(f"threshold {spec.metric} contains a non-finite statistic")
         thresholds.append(threshold)
 
-    payload = {
-        "calibration_identities": calibration,
-        "held_out_success_identities": held_out,
-        "thresholds": [asdict(threshold) for threshold in thresholds],
-        "quantiles": {
-            "lower": config.quality.lower_quantile,
-            "upper": config.quality.upper_quantile,
-            "method": "linear",
-        },
-        "mad_multiplier": config.quality.mad_multiplier,
-    }
-    return ThresholdSnapshot(tuple(calibration), tuple(held_out), tuple(thresholds), _digest(payload))
+    snapshot = ThresholdSnapshot(tuple(calibration), tuple(held_out), tuple(thresholds), "")
+    return ThresholdSnapshot(
+        snapshot.calibration_identities,
+        snapshot.held_out_success_identities,
+        snapshot.thresholds,
+        threshold_snapshot_digest(snapshot),
+    )
 
 
 def _ordered_hard_reasons(reasons: tuple[str, ...]) -> tuple[str, ...]:
@@ -283,14 +316,32 @@ def _metric_number(metrics: EpisodeMetrics, threshold: MetricThreshold) -> float
 
 
 def score_episode(metrics: EpisodeMetrics, thresholds: ThresholdSnapshot) -> EpisodeVerdict:
-    """Score one episode without accepting inventory metadata or outcome labels."""
+    """Score one episode using only metrics and a verified threshold snapshot."""
 
-    if not thresholds.payload_digest.strip():
-        raise QualityError("threshold snapshot digest must be non-blank")
+    if (
+        not thresholds.payload_digest.strip()
+        or threshold_snapshot_digest(thresholds) != thresholds.payload_digest
+    ):
+        raise CalibrationError("threshold snapshot digest does not match its frozen payload")
     metrics_digest = _digest(asdict(metrics))
     hard_reasons = _ordered_hard_reasons(metrics.hard_reasons)
     if hard_reasons:
-        return EpisodeVerdict(metrics.identity, "REJECT", hard_reasons, metrics_digest)
+        verdict = EpisodeVerdict(
+            metrics.identity,
+            "REJECT",
+            hard_reasons,
+            metrics_digest,
+            thresholds.payload_digest,
+            "",
+        )
+        return EpisodeVerdict(
+            verdict.identity,
+            verdict.verdict,
+            verdict.reason_codes,
+            verdict.metrics_digest,
+            verdict.threshold_digest,
+            episode_verdict_digest(verdict),
+        )
 
     reasons: list[str] = []
     for threshold in thresholds.thresholds:
@@ -301,4 +352,19 @@ def score_episode(metrics: EpisodeMetrics, thresholds: ThresholdSnapshot) -> Epi
         if anomalous:
             reasons.append(f"ANOMALY_{threshold.metric.upper()}")
     verdict = cast(Verdict, "REVIEW" if reasons else "PASS")
-    return EpisodeVerdict(metrics.identity, verdict, tuple(reasons), metrics_digest)
+    frozen = EpisodeVerdict(
+        metrics.identity,
+        verdict,
+        tuple(reasons),
+        metrics_digest,
+        thresholds.payload_digest,
+        "",
+    )
+    return EpisodeVerdict(
+        frozen.identity,
+        frozen.verdict,
+        frozen.reason_codes,
+        frozen.metrics_digest,
+        frozen.threshold_digest,
+        episode_verdict_digest(frozen),
+    )

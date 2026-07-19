@@ -307,12 +307,14 @@ class ChallengeConfig:
             raise ConfigError("quality gripper thresholds must match authenticated hysteresis")
         if lag_search_frames != 15 or lag_motion != 0.01 or lag_round != 12:
             raise ConfigError("quality lag settings must match the authenticated contract")
-        if mad_multiplier <= 0:
-            raise ConfigError("quality.mad_multiplier must be positive")
+        if mad_multiplier != 5.0:
+            raise ConfigError("quality.mad_multiplier must be 5.0")
         if not 0 < calibration_fraction <= 1:
             raise ConfigError("quality.calibration_fraction must be in (0, 1]")
-        if not 0 <= lower_quantile < upper_quantile <= 1:
-            raise ConfigError("quality quantiles must satisfy 0 <= lower < upper <= 1")
+        if lower_quantile != 0.01:
+            raise ConfigError("quality.lower_quantile must be 0.01")
+        if upper_quantile != 0.99:
+            raise ConfigError("quality.upper_quantile must be 0.99")
         return QualityConfig(
             position_unit=position_unit,
             sample_period_s=sample_period_s,

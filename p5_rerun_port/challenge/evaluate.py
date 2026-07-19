@@ -9,7 +9,12 @@ from typing import Any, Literal, cast
 
 from .hub import HubReader
 from .models import InventoryRow, SourceRole, TaskKey
-from .quality import EpisodeVerdict, ThresholdSnapshot
+from .quality import (
+    EpisodeVerdict,
+    ThresholdSnapshot,
+    episode_verdict_digest,
+    threshold_snapshot_digest,
+)
 
 
 Disposition = Literal["aborted", "collector_error", "failed"]
@@ -144,7 +149,11 @@ def build_evaluation_labels(
                 attempt.get("operator_disposition"),
                 f"{repo_id} attempt {row.attempt_id}.operator_disposition",
             )
-            failure_label = attempt.get("failure_label")
+            if "failure_label" not in attempt:
+                raise EvaluationError(
+                    f"{repo_id} attempt {row.attempt_id}.failure_label key must be present"
+                )
+            failure_label = attempt["failure_label"]
             if failure_label is not None:
                 failure_label = _nonblank(
                     failure_label, f"{repo_id} attempt {row.attempt_id}.failure_label"
@@ -218,8 +227,11 @@ def evaluate_verdicts(
 ) -> EvaluationReport:
     """Evaluate only held-out successes and every failure after scoring is frozen."""
 
-    if not snapshot.payload_digest.strip():
-        raise EvaluationError("threshold snapshot digest must be non-blank")
+    if (
+        not snapshot.payload_digest.strip()
+        or threshold_snapshot_digest(snapshot) != snapshot.payload_digest
+    ):
+        raise EvaluationError("threshold snapshot digest does not match its frozen payload")
     if len(set(snapshot.calibration_identities)) != len(snapshot.calibration_identities):
         raise EvaluationError("calibration identities must be unique")
     if len(set(snapshot.held_out_success_identities)) != len(snapshot.held_out_success_identities):
@@ -260,6 +272,9 @@ def evaluate_verdicts(
     ]
     failure_tasks = Counter(label.task_key for label in failure_labels)
     dispositions = Counter(label.disposition for label in failure_labels)
+    operator_dispositions = Counter(
+        label.operator_disposition for label in failure_labels
+    )
     semantic_labels = Counter(
         "__unlabeled__" if label.failure_label is None else label.failure_label
         for label in failure_labels
@@ -272,6 +287,8 @@ def evaluate_verdicts(
         raise EvaluationError("failure labels must preserve the locked 19/6 task split")
     if dispositions != {"aborted": 17, "collector_error": 5, "failed": 3}:
         raise EvaluationError("failure labels must preserve pinned disposition counts")
+    if operator_dispositions != {"aborted": 19, "collector_error": 3, "failed": 3}:
+        raise EvaluationError("failure labels must preserve pinned operator_disposition counts")
     if semantic_labels != {
         "__unlabeled__": 19,
         "dropped_object": 2,
@@ -282,6 +299,8 @@ def evaluate_verdicts(
 
     evaluated = set(snapshot.held_out_success_identities) | failure_identities
     verdicts_by_identity: dict[str, EpisodeVerdict] = {}
+    metrics_digests: set[str] = set()
+    verdict_digests: set[str] = set()
     for verdict in verdicts:
         if verdict.identity in verdicts_by_identity:
             raise EvaluationError(f"duplicate verdict identity {verdict.identity}")
@@ -289,6 +308,23 @@ def evaluate_verdicts(
             raise EvaluationError(f"verdict {verdict.identity} metrics digest must be non-blank")
         if verdict.verdict not in ("PASS", "REVIEW", "REJECT"):
             raise EvaluationError(f"verdict {verdict.identity} has an invalid value")
+        if verdict.threshold_digest != snapshot.payload_digest:
+            raise EvaluationError(
+                f"verdict {verdict.identity} threshold digest does not match snapshot"
+            )
+        if (
+            not verdict.verdict_digest.strip()
+            or episode_verdict_digest(verdict) != verdict.verdict_digest
+        ):
+            raise EvaluationError(
+                f"verdict {verdict.identity} digest does not match its frozen payload"
+            )
+        if verdict.metrics_digest in metrics_digests:
+            raise EvaluationError(f"verdict {verdict.identity} reuses a metrics digest")
+        if verdict.verdict_digest in verdict_digests:
+            raise EvaluationError(f"verdict {verdict.identity} reuses a verdict digest")
+        metrics_digests.add(verdict.metrics_digest)
+        verdict_digests.add(verdict.verdict_digest)
         verdicts_by_identity[verdict.identity] = verdict
     if set(verdicts_by_identity) != evaluated or len(evaluated) != 41:
         raise EvaluationError(

@@ -87,6 +87,22 @@ def test_config_rejects_duplicate_repo_or_non_sha_revision(tmp_path: Path) -> No
         ChallengeConfig.load(path)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("lower_quantile", 0.02), ("upper_quantile", 0.98), ("mad_multiplier", 4.0)],
+)
+def test_config_rejects_noncanonical_calibration_statistics(
+    field: str, value: float, tmp_path: Path
+) -> None:
+    document = _config_document()
+    quality = document["quality"]
+    assert isinstance(quality, dict)
+    quality[field] = value
+
+    with pytest.raises(ConfigError, match=field):
+        ChallengeConfig.load(_write_config(tmp_path, document))
+
+
 def _config_document() -> dict[str, object]:
     document = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     assert isinstance(document, dict)
