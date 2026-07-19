@@ -220,6 +220,8 @@ class FakeBackendFixture:
         self.policy_type_calls: list[str] = []
         self.processor_calls: list[dict[str, object]] = []
         self.prepare_calls: list[tuple[dict[str, np.ndarray], str, str]] = []
+        self.mutate_during_prepare = False
+        self.prepared_task_override: str | None = None
         self.inference_entries = 0
         FakePolicyClass.calls = []
         FakePolicyClass.policy = FakePolicy()
@@ -243,7 +245,16 @@ class FakeBackendFixture:
             observation: dict[str, np.ndarray], device: str, task: str
         ) -> dict[str, object]:
             self.prepare_calls.append((dict(observation), device, task))
-            return {**observation, "task": task}
+            if self.mutate_during_prepare:
+                for value in observation.values():
+                    value[...] = 99
+            observation["task"] = (
+                task
+                if self.prepared_task_override is None
+                else self.prepared_task_override
+            )
+            observation["robot_type"] = ""
+            return observation
 
         @contextmanager
         def inference_mode():
@@ -414,18 +425,29 @@ class AdapterInferenceTest(FakeBackendFixture, unittest.TestCase):
         self.assertEqual(len(self.prepare_calls), 1)
         raw, device, task = self.prepare_calls[0]
         self.assertEqual(
-            set(raw),
-            {
+            list(raw),
+            [
                 "observation.images.front",
                 "observation.images.side",
                 "observation.state",
-            },
+            ],
         )
-        self.assertIs(raw["observation.images.front"], observation.front)
-        self.assertIs(raw["observation.images.side"], observation.side)
-        self.assertIs(raw["observation.state"], observation.state_deg)
+        self.assertIsNot(raw["observation.images.front"], observation.front)
+        self.assertIsNot(raw["observation.images.side"], observation.side)
+        self.assertIsNot(raw["observation.state"], observation.state_deg)
         self.assertEqual(device, "cpu")
         self.assertEqual(task, TASK)
+        prepared = self.preprocessor.calls[0]
+        self.assertEqual(
+            list(prepared),
+            [
+                "observation.images.front",
+                "observation.images.side",
+                "observation.state",
+                "task",
+            ],
+        )
+        self.assertEqual(prepared["task"], TASK)
         self.assertEqual(FakePolicyClass.policy.predict_calls, [preprocessed])
         self.assertEqual(self.postprocessor.calls, [raw_prediction])
         self.assertEqual(self.inference_entries, 1)
@@ -436,6 +458,48 @@ class AdapterInferenceTest(FakeBackendFixture, unittest.TestCase):
         self.assertFalse(np.any(result == 999))
         self.assertEqual(postprocessed.detach_calls, 1)
         self.assertEqual(postprocessed.cpu_calls, 1)
+
+    def test_copies_images_and_coerces_copied_state_before_mutating_prepare(self) -> None:
+        adapter = self.make_adapter()
+        observation = self.observation()
+        object.__setattr__(
+            observation,
+            "state_deg",
+            np.arange(7, dtype=np.float64),
+        )
+        original_front = observation.front.copy()
+        original_side = observation.side.copy()
+        original_state = observation.state_deg.copy()
+        self.mutate_during_prepare = True
+        FakePolicyClass.policy.prediction = FakeTensor(
+            np.zeros((1, 2, 7), dtype=np.float32)
+        )
+
+        result = adapter.predict(observation)
+
+        raw, _, _ = self.prepare_calls[0]
+        self.assertIsNot(raw["observation.images.front"], observation.front)
+        self.assertIsNot(raw["observation.images.side"], observation.side)
+        self.assertIsNot(raw["observation.state"], observation.state_deg)
+        self.assertEqual(raw["observation.state"].dtype, np.float32)
+        np.testing.assert_array_equal(observation.front, original_front)
+        np.testing.assert_array_equal(observation.side, original_side)
+        np.testing.assert_array_equal(observation.state_deg, original_state)
+        self.assertEqual(observation.state_deg.dtype, np.float64)
+        self.assertEqual(result.dtype, np.float64)
+        self.assertEqual(result.shape, (2, 7))
+
+    def test_rejects_when_preparation_does_not_preserve_locked_task(self) -> None:
+        adapter = self.make_adapter()
+        self.prepared_task_override = "a different prepared task"
+        FakePolicyClass.policy.prediction = FakeTensor(
+            np.zeros((1, 2, 7), dtype=np.float32)
+        )
+
+        with self.assertRaisesRegex(ValueError, "prepared task.*checkpoint task"):
+            adapter.predict(self.observation())
+
+        self.assertEqual(self.preprocessor.calls, [])
 
     def test_rejects_a_non_seven_element_state_before_preprocessing(self) -> None:
         adapter = self.make_adapter()
@@ -518,7 +582,7 @@ class OfflineEvaluationTest(unittest.TestCase):
         self.bundle = checkpoint_bundle(self.dataset_root / "checkpoint")
         self.adapter = FakeOfflineAdapter()
 
-    def test_evaluates_every_sample_from_up_to_requested_distinct_episodes(self) -> None:
+    def test_evaluates_every_sample_from_exactly_requested_distinct_episodes(self) -> None:
         dataset = FakeDataset(
             [
                 dataset_sample(4, value=10),
@@ -564,6 +628,7 @@ class OfflineEvaluationTest(unittest.TestCase):
         self.assertEqual(first.side.shape, (4, 6, 3))
         self.assertTrue(np.all(first.side == 11))
         np.testing.assert_array_equal(first.state_deg, np.arange(7) + 10)
+        self.assertEqual(first.state_deg.dtype, np.float32)
         self.assertEqual(first.task, TASK)
         self.assertEqual(first.captured_monotonic_s, 1.0)
         printed = output.getvalue()
@@ -586,6 +651,27 @@ class OfflineEvaluationTest(unittest.TestCase):
             )
 
         self.assertEqual(self.adapter.observations, [])
+
+    def test_rejects_when_dataset_has_fewer_distinct_episodes_than_requested(self) -> None:
+        dataset = FakeDataset(
+            [
+                dataset_sample(4, value=10),
+                dataset_sample(4, value=20),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"requested 2 distinct episodes.*found 1",
+        ):
+            evaluate_checkpoint(
+                self.bundle,
+                self.dataset_root,
+                episodes=2,
+                dataset_loader=lambda root: dataset,
+                adapter_factory=lambda bundle, device: self.adapter,
+                output=StringIO(),
+            )
 
     def test_requires_a_positive_episode_count(self) -> None:
         with self.assertRaisesRegex(ValueError, "episodes must be a positive integer"):

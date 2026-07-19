@@ -86,7 +86,7 @@ def _camera_array(value: Any, *, key: str) -> np.ndarray:
 
 def _state_array(value: Any) -> np.ndarray:
     try:
-        state = np.array(_cpu_numpy(value), dtype=np.float64, copy=True)
+        state = np.array(_cpu_numpy(value), dtype=np.float32, copy=True)
     except (TypeError, ValueError) as exc:
         raise ValueError("dataset observation.state must be numeric") from exc
     if state.shape != (7,):
@@ -152,7 +152,7 @@ def evaluate_checkpoint(
     clock: Callable[[], float] = time.perf_counter,
     output: TextIO | None = None,
 ) -> list[OfflinePrediction]:
-    """Evaluate every sample belonging to the first N distinct episodes."""
+    """Evaluate every sample belonging to exactly N distinct episodes."""
 
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
         raise ValueError("episodes must be a positive integer")
@@ -240,6 +240,12 @@ def evaluate_checkpoint(
             f"shape={result.shape} min={result.minimum:.6f} "
             f"max={result.maximum:.6f} latency_ms={result.latency_s * 1000:.3f}",
             file=stream,
+        )
+
+    if len(selected_episodes) != episodes:
+        raise ValueError(
+            f"requested {episodes} distinct episodes but found "
+            f"{len(selected_episodes)} in the dataset"
         )
 
     return results

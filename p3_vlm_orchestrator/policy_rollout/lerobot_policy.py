@@ -309,7 +309,14 @@ class LeRobotPolicyAdapter:
         return cls(bundle=bundle, device=device, backend=backend)
 
     def predict(self, observation: RolloutObservation) -> np.ndarray:
-        state = np.asarray(observation.state_deg)
+        try:
+            state = np.array(
+                observation.state_deg,
+                dtype=np.float32,
+                copy=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("LeRobot observation state must be numeric") from exc
         expected_state_shape = (self.bundle.action_dimension,)
         if state.shape != expected_state_shape:
             raise ValueError(
@@ -318,9 +325,9 @@ class LeRobotPolicyAdapter:
             )
 
         raw_observation = {
-            "observation.images.front": observation.front,
-            "observation.images.side": observation.side,
-            "observation.state": observation.state_deg,
+            "observation.images.front": np.array(observation.front, copy=True),
+            "observation.images.side": np.array(observation.side, copy=True),
+            "observation.state": state,
         }
         with self._inference_mode():
             prepared = self._prepare_observation(
@@ -328,6 +335,22 @@ class LeRobotPolicyAdapter:
                 self.device,
                 self.bundle.task,
             )
+            prepared.pop("robot_type", None)
+            if prepared.get("task") != self.bundle.task:
+                raise ValueError(
+                    "LeRobot prepared task does not match the checkpoint task"
+                )
+            expected_keys = (
+                "observation.images.front",
+                "observation.images.side",
+                "observation.state",
+                "task",
+            )
+            if tuple(prepared) != expected_keys:
+                raise ValueError(
+                    "LeRobot prepared observation keys must be exactly "
+                    f"{expected_keys}; received {tuple(prepared)}"
+                )
             processed_observation = self.preprocessor(prepared)
             action_chunk = self.policy.predict_action_chunk(processed_observation)
             postprocessed = self.postprocessor(action_chunk)
