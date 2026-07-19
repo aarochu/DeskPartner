@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 from threading import Event
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -31,8 +32,13 @@ LOG_FIELDS = {
     "safety_result",
     "send_result_deg",
     "inference_latency_s",
+    "actions_attempted",
+    "actions_confirmed",
     "terminal_reason",
     "fault_reason",
+    "primary_fault_reason",
+    "cleanup_fault_reason",
+    "audit_fault_reason",
 }
 
 
@@ -47,6 +53,19 @@ class AdvancingClock:
         return value
 
 
+class SequenceClock:
+    def __init__(self, values: list[float]) -> None:
+        self.values = iter(values)
+        self.last = values[-1]
+
+    def __call__(self) -> float:
+        try:
+            self.last = next(self.values)
+        except StopIteration:
+            self.last += 0.01
+        return self.last
+
+
 class FakeRobot:
     """Stateful in-memory implementation of the complete robot boundary."""
 
@@ -56,6 +75,9 @@ class FakeRobot:
         state_deg: np.ndarray | None = None,
         captured_monotonic_s: float = 100.0,
         stop_after_observation: Event | None = None,
+        disconnect_error: Exception | None = None,
+        send_error_after_motion: Exception | None = None,
+        audit_path: Path | None = None,
     ) -> None:
         self.state_deg = (
             np.zeros(7, dtype=float)
@@ -64,11 +86,16 @@ class FakeRobot:
         )
         self.captured_monotonic_s = captured_monotonic_s
         self.stop_after_observation = stop_after_observation
+        self.disconnect_error = disconnect_error
+        self.send_error_after_motion = send_error_after_motion
+        self.audit_path = audit_path
         self.connected = False
         self.connect_count = 0
         self.disconnect_count = 0
         self.observation_states: list[np.ndarray] = []
         self.sent_actions: list[np.ndarray] = []
+        self.event_seen_before_send: str | None = None
+        self.events_seen_before_disconnect: list[str] = []
 
     def connect(self) -> None:
         if self.connected:
@@ -77,8 +104,15 @@ class FakeRobot:
         self.connect_count += 1
 
     def disconnect(self) -> None:
+        if self.audit_path is not None and self.audit_path.exists():
+            rows = [
+                json.loads(line) for line in self.audit_path.read_text().splitlines()
+            ]
+            self.events_seen_before_disconnect = [row["event"] for row in rows]
         self.connected = False
         self.disconnect_count += 1
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
 
     def observe(self) -> RolloutObservation:
         if not self.connected:
@@ -98,10 +132,70 @@ class FakeRobot:
     def send_action(self, action_deg: np.ndarray) -> np.ndarray:
         if not self.connected:
             raise RuntimeError("robot is disconnected")
+        if self.audit_path is not None:
+            rows = [
+                json.loads(line) for line in self.audit_path.read_text().splitlines()
+            ]
+            self.event_seen_before_send = rows[-1]["event"]
         actual = np.asarray(action_deg, dtype=float).copy()
         self.sent_actions.append(actual.copy())
         self.state_deg = actual.copy()
+        if self.send_error_after_motion is not None:
+            raise self.send_error_after_motion
         return actual
+
+
+class MalformedStateRobot(FakeRobot):
+    def observe(self) -> RolloutObservation:
+        observation = super().observe()
+        return RolloutObservation(
+            front=observation.front,
+            side=observation.side,
+            state_deg=np.array(["not-a-number"] * 7, dtype=object),
+            task=observation.task,
+            captured_monotonic_s=observation.captured_monotonic_s,
+        )
+
+
+class FailingAuditFile:
+    """File-like audit sink that fails one write or flush operation."""
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        self.failure_pending = True
+        self.pending: list[str] = []
+        self.durable: list[str] = []
+
+    def __enter__(self) -> FailingAuditFile:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def write(self, text: str) -> int:
+        if self.operation == "write" and self.failure_pending:
+            self.failure_pending = False
+            raise OSError("simulated audit write failure")
+        self.pending.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.operation == "flush" and self.failure_pending:
+            self.failure_pending = False
+            self.pending.clear()
+            raise OSError("simulated audit flush failure")
+        self.durable.extend(self.pending)
+        self.pending.clear()
+
+    def close(self) -> None:
+        self.flush()
+
+    def rows(self) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for chunk in self.durable
+            for line in chunk.splitlines()
+        ]
 
 
 class ArrayPolicy:
@@ -133,6 +227,12 @@ class RaisingPolicy:
         raise RuntimeError("inference exploded")
 
 
+class MutatingPolicy:
+    def predict(self, observation: RolloutObservation) -> np.ndarray:
+        observation.state_deg[:] = 100.0
+        return np.repeat(observation.state_deg[None, :], 10, axis=0)
+
+
 class RolloutRunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -146,7 +246,7 @@ class RolloutRunnerTest(unittest.TestCase):
         robot: FakeRobot,
         mode: str = "shadow",
         stop_requested: Event | None = None,
-        clock: AdvancingClock | None = None,
+        clock: AdvancingClock | SequenceClock | None = None,
     ) -> RolloutRunner:
         return RolloutRunner(
             policy=policy,
@@ -222,6 +322,63 @@ class RolloutRunnerTest(unittest.TestCase):
         self.assertIn("stale", summary.fault_reason or "")
         self.assertEqual(robot.sent_actions, [])
 
+    def test_policy_cannot_mutate_current_state_to_bypass_live_safety(self) -> None:
+        robot = FakeRobot()
+        runner = self.make_runner(
+            policy=MutatingPolicy(),
+            robot=robot,
+            mode="live",
+        )
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertEqual(summary.terminal_reason, "fault")
+        self.assertIn("delta", summary.primary_fault_reason or "")
+        self.assertEqual(summary.actions_attempted, 0)
+        self.assertEqual(robot.sent_actions, [])
+        observation_row = next(
+            row for row in self.read_log() if row["event"] == "observation"
+        )
+        self.assertEqual(observation_row["current_state_deg"], [0.0] * 7)
+
+    def test_freshness_is_sampled_immediately_before_initial_safety(self) -> None:
+        clock = SequenceClock([100.0, 100.0, 100.05, 100.30, 100.31])
+        robot = FakeRobot()
+        runner = self.make_runner(
+            policy=HoldPositionPolicy(),
+            robot=robot,
+            mode="live",
+            clock=clock,
+        )
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertIn("stale", summary.primary_fault_reason or "")
+        self.assertEqual(summary.actions_attempted, 0)
+        self.assertEqual(robot.sent_actions, [])
+
+    def test_live_send_boundary_rechecks_observation_freshness(self) -> None:
+        clock = SequenceClock(
+            [100.0, 100.0, 100.05, 100.10, 100.20, 100.30, 100.31]
+        )
+        robot = FakeRobot()
+        runner = self.make_runner(
+            policy=HoldPositionPolicy(),
+            robot=robot,
+            mode="live",
+            clock=clock,
+        )
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertIn("stale", summary.primary_fault_reason or "")
+        self.assertEqual(summary.actions_attempted, 0)
+        self.assertEqual(summary.actions_confirmed, 0)
+        self.assertEqual(robot.sent_actions, [])
+        events = [row["event"] for row in self.read_log()]
+        self.assertIn("send_intent", events)
+        self.assertIn("send_cancelled", events)
+
     def test_stop_event_exits_and_disconnects_cleanly(self) -> None:
         stop_requested = Event()
         stop_requested.set()
@@ -266,6 +423,8 @@ class RolloutRunnerTest(unittest.TestCase):
         summary = runner.run(max_cycles=2)
 
         self.assertEqual(summary.actions_sent, 1)
+        self.assertEqual(summary.actions_attempted, 1)
+        self.assertEqual(summary.actions_confirmed, 1)
         self.assertEqual(summary.cycles_completed, 1)
         self.assertIn("safety rejected", summary.fault_reason or "")
         self.assertEqual(len(robot.sent_actions), 1)
@@ -283,9 +442,32 @@ class RolloutRunnerTest(unittest.TestCase):
         self.assertIn("inference exploded", summary.fault_reason or "")
         self.assertEqual(robot.disconnect_count, 1)
         self.assertEqual(robot.sent_actions, [])
-        fault_row = self.read_log()[-1]
+        fault_row = next(row for row in self.read_log() if row["event"] == "fault")
         self.assertEqual(fault_row["event"], "fault")
         self.assertIsNotNone(fault_row["inference_latency_s"])
+
+    def test_send_intent_is_durable_before_adapter_failure_after_motion(self) -> None:
+        robot = FakeRobot(
+            send_error_after_motion=RuntimeError("transport acknowledgement lost"),
+            audit_path=self.log_path,
+        )
+        runner = self.make_runner(
+            policy=HoldPositionPolicy(),
+            robot=robot,
+            mode="live",
+        )
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertEqual(robot.event_seen_before_send, "send_intent")
+        self.assertEqual(len(robot.sent_actions), 1)
+        self.assertEqual(summary.actions_attempted, 1)
+        self.assertEqual(summary.actions_confirmed, 0)
+        self.assertEqual(summary.actions_sent, 0)
+        events = [row["event"] for row in self.read_log()]
+        self.assertLess(events.index("send_intent"), events.index("send_failed"))
+        self.assertEqual(events[-1], "terminal")
+        self.assertIn("acknowledgement lost", summary.primary_fault_reason or "")
 
     def test_jsonl_events_have_full_schema_and_do_not_mutate_arrays(self) -> None:
         state = np.zeros(7)
@@ -304,7 +486,15 @@ class RolloutRunnerTest(unittest.TestCase):
         rows = self.read_log()
         self.assertEqual(
             [row["event"] for row in rows],
-            ["observation", "prediction", "safety", "send", "stop"],
+            [
+                "observation",
+                "prediction",
+                "safety",
+                "send_intent",
+                "send_boundary_safety",
+                "send_confirmed",
+                "terminal",
+            ],
         )
         for row in rows:
             self.assertEqual(set(row), LOG_FIELDS)
@@ -312,7 +502,9 @@ class RolloutRunnerTest(unittest.TestCase):
             self.assertEqual(row["mode"], "live")
         self.assertEqual(rows[1]["predicted_first_action_deg"], [0.0] * 7)
         self.assertEqual(rows[2]["safety_result"]["accepted"], True)
-        self.assertEqual(rows[3]["send_result_deg"], [0.0] * 7)
+        self.assertEqual(rows[5]["send_result_deg"], [0.0] * 7)
+        self.assertEqual(rows[5]["actions_attempted"], 1)
+        self.assertEqual(rows[5]["actions_confirmed"], 1)
         self.assertEqual(rows[-1]["terminal_reason"], "max_cycles")
         np.testing.assert_array_equal(state, untouched_state)
         np.testing.assert_array_equal(prediction, untouched_prediction)
@@ -330,6 +522,69 @@ class RolloutRunnerTest(unittest.TestCase):
             row for row in self.read_log() if row["event"] == "prediction"
         )
         self.assertEqual(prediction_row["predicted_first_action_deg"], [None] * 7)
+
+    def test_malformed_observation_state_returns_a_structured_fault(self) -> None:
+        robot = MalformedStateRobot()
+        runner = self.make_runner(
+            policy=HoldPositionPolicy(),
+            robot=robot,
+            mode="live",
+        )
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertEqual(summary.terminal_reason, "fault")
+        self.assertIn("observation state", summary.primary_fault_reason or "")
+        self.assertEqual(robot.sent_actions, [])
+        self.assertEqual(robot.disconnect_count, 1)
+        rows = self.read_log()
+        self.assertEqual(rows[-1]["event"], "terminal")
+        self.assertEqual(rows[-1]["current_state_deg"], None)
+
+    def test_audit_write_or_flush_failure_uses_guarded_fallback(self) -> None:
+        for operation in ("write", "flush"):
+            with self.subTest(operation=operation):
+                audit_file = FailingAuditFile(operation)
+                robot = FakeRobot()
+                runner = self.make_runner(
+                    policy=HoldPositionPolicy(),
+                    robot=robot,
+                    mode="live",
+                )
+
+                with patch.object(Path, "open", return_value=audit_file):
+                    summary = runner.run(max_cycles=1)
+
+                self.assertEqual(summary.terminal_reason, "fault")
+                self.assertIn("audit log", summary.audit_fault_reason or "")
+                self.assertEqual(summary.actions_attempted, 0)
+                self.assertEqual(robot.sent_actions, [])
+                self.assertEqual(robot.disconnect_count, 1)
+                rows = audit_file.rows()
+                self.assertIn("fault_fallback", [row["event"] for row in rows])
+                self.assertEqual(rows[-1]["event"], "terminal")
+
+    def test_disconnect_fault_is_separate_and_terminal_is_after_cleanup(self) -> None:
+        robot = FakeRobot(
+            disconnect_error=RuntimeError("disconnect transport failed"),
+            audit_path=self.log_path,
+        )
+        runner = self.make_runner(policy=RaisingPolicy(), robot=robot)
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertIn("inference exploded", summary.primary_fault_reason or "")
+        self.assertIn("disconnect transport", summary.cleanup_fault_reason or "")
+        self.assertIn("inference exploded", summary.fault_reason or "")
+        self.assertEqual(robot.disconnect_count, 1)
+        self.assertNotIn("terminal", robot.events_seen_before_disconnect)
+        rows = self.read_log()
+        terminal_rows = [row for row in rows if row["event"] == "terminal"]
+        self.assertEqual(len(terminal_rows), 1)
+        self.assertIs(rows[-1], terminal_rows[0])
+        self.assertIn(
+            "disconnect transport", terminal_rows[0]["cleanup_fault_reason"]
+        )
 
 
 class DummyPolicyTest(unittest.TestCase):

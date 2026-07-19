@@ -32,15 +32,35 @@ class RunSummary:
 
     mode: str
     cycles_completed: int
-    actions_sent: int
+    actions_attempted: int
+    actions_confirmed: int
     terminal_reason: str
-    fault_reason: str | None
+    primary_fault_reason: str | None
+    cleanup_fault_reason: str | None
+    audit_fault_reason: str | None
+
+    @property
+    def actions_sent(self) -> int:
+        """Backward-compatible alias for confirmed sends."""
+
+        return self.actions_confirmed
+
+    @property
+    def fault_reason(self) -> str | None:
+        """Return the primary fault without hiding a cleanup-only fault."""
+
+        return (
+            self.primary_fault_reason
+            or self.audit_fault_reason
+            or self.cleanup_fault_reason
+        )
 
 
 @dataclass
 class _CycleContext:
     cycle: int = 0
     observation: RolloutObservation | None = None
+    current_state_deg: np.ndarray | None = None
     predicted_first_action: np.ndarray | None = None
     safety_result: SafetyDecision | None = None
     send_result: np.ndarray | None = None
@@ -80,60 +100,129 @@ class RolloutRunner:
         """Run until the cycle limit, a stop request, or a fail-closed fault."""
 
         cycles_completed = 0
-        actions_sent = 0
+        actions_attempted = 0
+        actions_confirmed = 0
         terminal_reason = "max_cycles"
-        fault_reason: str | None = None
-        phase = "connect"
+        primary_fault_reason: str | None = None
+        cleanup_fault_reason: str | None = None
+        audit_fault_reason: str | None = None
+        phase = "audit log open"
         context = _CycleContext()
+        log_file: IO[str] | None = None
 
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as log_file:
+        def emit(event: str, *, monotonic_s: float | None = None) -> bool:
+            nonlocal audit_fault_reason
+            nonlocal primary_fault_reason
+            nonlocal terminal_reason
 
-            def emit(event: str, *, monotonic_s: float | None = None) -> None:
-                self._write_event(
-                    log_file,
-                    event=event,
-                    context=context,
-                    terminal_reason=(
-                        terminal_reason if event in ("stop", "fault") else None
-                    ),
-                    fault_reason=fault_reason if event == "fault" else None,
-                    monotonic_s=monotonic_s,
-                )
+            if log_file is None:
+                return False
+            error = self._write_event_guarded(
+                log_file,
+                event=event,
+                context=context,
+                actions_attempted=actions_attempted,
+                actions_confirmed=actions_confirmed,
+                terminal_reason=(terminal_reason if event == "terminal" else None),
+                primary_fault_reason=primary_fault_reason,
+                cleanup_fault_reason=cleanup_fault_reason,
+                audit_fault_reason=audit_fault_reason,
+                monotonic_s=monotonic_s,
+            )
+            if error is None:
+                return True
 
+            audit_fault_reason = f"audit log {event} failed: {error}"
+            if primary_fault_reason is None:
+                primary_fault_reason = audit_fault_reason
+            terminal_reason = "fault"
+            self._write_fallback_fault(
+                log_file,
+                failed_event=event,
+                context=context,
+                actions_attempted=actions_attempted,
+                actions_confirmed=actions_confirmed,
+                fault_reason=audit_fault_reason,
+            )
+            return False
+
+        try:
             try:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_file = self.log_path.open("a", encoding="utf-8")
+            except Exception as exc:
+                audit_fault_reason = (
+                    "audit log open failed: " + self._exception_text(exc)
+                )
+                primary_fault_reason = audit_fault_reason
+                terminal_reason = "fault"
+
+            if log_file is not None:
+                phase = "connect"
                 self.robot.connect()
 
                 while cycles_completed < max_cycles:
-                    context.cycle = cycles_completed
+                    context = _CycleContext(cycle=cycles_completed)
                     phase = "stop check"
                     if self.stop_requested():
                         terminal_reason = "stop_requested"
-                        emit("stop")
+                        emit("stop_requested")
                         break
 
-                    context = _CycleContext(cycle=cycles_completed)
                     phase = "observation"
                     context.observation = self.robot.observe()
+                    try:
+                        current_state = np.asarray(
+                            context.observation.state_deg, dtype=float
+                        ).copy()
+                    except (TypeError, ValueError) as exc:
+                        primary_fault_reason = (
+                            "observation state must be numeric: "
+                            + self._exception_text(exc)
+                        )
+                        terminal_reason = "fault"
+                        observation_logged_at = self.monotonic_clock()
+                        if emit(
+                            "observation", monotonic_s=observation_logged_at
+                        ):
+                            emit("fault", monotonic_s=observation_logged_at)
+                        break
+
+                    current_state.setflags(write=False)
+                    context.current_state_deg = current_state
                     observation_logged_at = self.monotonic_clock()
-                    emit("observation", monotonic_s=observation_logged_at)
+                    if not emit(
+                        "observation", monotonic_s=observation_logged_at
+                    ):
+                        break
 
                     phase = "stop check"
                     if self.stop_requested():
                         terminal_reason = "stop_requested"
-                        emit("stop")
+                        emit("stop_requested")
                         break
 
+                    policy_observation = RolloutObservation(
+                        front=context.observation.front,
+                        side=context.observation.side,
+                        state_deg=current_state.copy(),
+                        task=context.observation.task,
+                        captured_monotonic_s=(
+                            context.observation.captured_monotonic_s
+                        ),
+                    )
                     phase = "inference"
                     inference_started_at = self.monotonic_clock()
                     try:
-                        raw_prediction = self.policy.predict(context.observation)
+                        raw_prediction = self.policy.predict(policy_observation)
                     except Exception as exc:
                         inference_finished_at = self.monotonic_clock()
                         context.inference_latency_s = max(
                             0.0, inference_finished_at - inference_started_at
                         )
-                        fault_reason = f"inference failed: {exc}"
+                        primary_fault_reason = (
+                            "inference failed: " + self._exception_text(exc)
+                        )
                         terminal_reason = "fault"
                         emit("fault", monotonic_s=inference_finished_at)
                         break
@@ -146,21 +235,27 @@ class RolloutRunner:
                     try:
                         prediction = np.asarray(raw_prediction, dtype=float)
                     except (TypeError, ValueError) as exc:
-                        fault_reason = f"prediction must be a numeric array: {exc}"
+                        primary_fault_reason = (
+                            "prediction must be a numeric array: "
+                            + self._exception_text(exc)
+                        )
                         terminal_reason = "fault"
                         emit("fault", monotonic_s=inference_finished_at)
                         break
 
                     if prediction.ndim == 2 and prediction.shape[0] >= 1:
                         context.predicted_first_action = prediction[0].copy()
-                    emit("prediction", monotonic_s=inference_finished_at)
+                    if not emit(
+                        "prediction", monotonic_s=inference_finished_at
+                    ):
+                        break
 
                     if (
                         prediction.ndim != 2
                         or prediction.shape[0] < 1
                         or prediction.shape[1] != EXPECTED_ACTION_DIMENSION
                     ):
-                        fault_reason = (
+                        primary_fault_reason = (
                             "prediction shape must be [steps, 7] with at least "
                             f"one step; received {prediction.shape}"
                         )
@@ -171,23 +266,25 @@ class RolloutRunner:
                     phase = "stop check"
                     if self.stop_requested():
                         terminal_reason = "stop_requested"
-                        emit("stop")
+                        emit("stop_requested")
                         break
 
                     phase = "safety validation"
+                    safety_checked_at = self.monotonic_clock()
                     context.safety_result = self.safety.validate(
-                        context.observation.state_deg,
+                        context.current_state_deg,
                         context.predicted_first_action,
-                        inference_finished_at,
+                        safety_checked_at,
                         context.observation.captured_monotonic_s,
                     )
-                    emit("safety", monotonic_s=inference_finished_at)
+                    if not emit("safety", monotonic_s=safety_checked_at):
+                        break
 
                     if (
                         not context.safety_result.accepted
                         or context.safety_result.action_deg is None
                     ):
-                        fault_reason = (
+                        primary_fault_reason = (
                             "safety rejected action: "
                             f"{context.safety_result.reason}"
                         )
@@ -198,44 +295,134 @@ class RolloutRunner:
                     phase = "stop check"
                     if self.stop_requested():
                         terminal_reason = "stop_requested"
-                        emit("stop")
+                        emit("stop_requested")
                         break
 
                     if self.mode == "live":
+                        if not emit("send_intent"):
+                            break
+                        if self.stop_requested():
+                            terminal_reason = "stop_requested"
+                            emit("send_cancelled")
+                            break
+
+                        phase = "send boundary safety validation"
+                        send_checked_at = self.monotonic_clock()
+                        context.safety_result = self.safety.validate(
+                            context.current_state_deg,
+                            context.safety_result.action_deg,
+                            send_checked_at,
+                            context.observation.captured_monotonic_s,
+                        )
+                        if (
+                            not context.safety_result.accepted
+                            or context.safety_result.action_deg is None
+                        ):
+                            emit(
+                                "send_boundary_safety",
+                                monotonic_s=send_checked_at,
+                            )
+                            primary_fault_reason = (
+                                "safety rejected action at live send boundary: "
+                                f"{context.safety_result.reason}"
+                            )
+                            terminal_reason = "fault"
+                            emit("send_cancelled")
+                            emit("fault")
+                            break
+
+                        actions_attempted += 1
                         phase = "send"
-                        context.send_result = np.asarray(
-                            self.robot.send_action(
+                        try:
+                            raw_send_result = self.robot.send_action(
                                 context.safety_result.action_deg.copy()
-                            ),
-                            dtype=float,
-                        ).copy()
-                        actions_sent += 1
-                        emit("send")
+                            )
+                        except Exception as exc:
+                            primary_fault_reason = (
+                                "send failed: " + self._exception_text(exc)
+                            )
+                            terminal_reason = "fault"
+                            emit(
+                                "send_boundary_safety",
+                                monotonic_s=send_checked_at,
+                            )
+                            emit("send_failed")
+                            emit("fault")
+                            break
+
+                        try:
+                            context.send_result = np.asarray(
+                                raw_send_result, dtype=float
+                            ).copy()
+                        except (TypeError, ValueError) as exc:
+                            primary_fault_reason = (
+                                "send result must be numeric: "
+                                + self._exception_text(exc)
+                            )
+                            terminal_reason = "fault"
+                            emit(
+                                "send_boundary_safety",
+                                monotonic_s=send_checked_at,
+                            )
+                            emit("send_failed")
+                            emit("fault")
+                            break
+
+                        actions_confirmed += 1
+                        if not emit(
+                            "send_boundary_safety",
+                            monotonic_s=send_checked_at,
+                        ):
+                            break
+                        if not emit("send_confirmed"):
+                            break
 
                     cycles_completed += 1
-                else:
-                    context.cycle = cycles_completed
-                    terminal_reason = "max_cycles"
-                    emit("stop")
+        except Exception as exc:
+            if primary_fault_reason is None:
+                primary_fault_reason = (
+                    f"{phase} failed: " + self._exception_text(exc)
+                )
+            terminal_reason = "fault"
+            emit("fault")
+        finally:
+            try:
+                self.robot.disconnect()
             except Exception as exc:
+                cleanup_fault_reason = (
+                    "disconnect failed: " + self._exception_text(exc)
+                )
                 terminal_reason = "fault"
-                fault_reason = f"{phase} failed: {exc}"
-                emit("fault")
-            finally:
+
+            if log_file is not None:
+                context.cycle = cycles_completed
+                emit("terminal")
                 try:
-                    self.robot.disconnect()
-                except Exception as exc:
-                    terminal_reason = "fault"
-                    fault_reason = f"disconnect failed: {exc}"
-                    emit("fault")
+                    log_file.close()
+                except Exception:
+                    pass
 
         return RunSummary(
             mode=self.mode,
             cycles_completed=cycles_completed,
-            actions_sent=actions_sent,
+            actions_attempted=actions_attempted,
+            actions_confirmed=actions_confirmed,
             terminal_reason=terminal_reason,
-            fault_reason=fault_reason,
+            primary_fault_reason=primary_fault_reason,
+            cleanup_fault_reason=cleanup_fault_reason,
+            audit_fault_reason=audit_fault_reason,
         )
+
+    def _write_event_guarded(
+        self,
+        log_file: IO[str],
+        **event_fields: object,
+    ) -> str | None:
+        try:
+            self._write_event(log_file, **event_fields)
+        except Exception as exc:
+            return self._exception_text(exc)
+        return None
 
     def _write_event(
         self,
@@ -243,37 +430,90 @@ class RolloutRunner:
         *,
         event: str,
         context: _CycleContext,
-        terminal_reason: str | None = None,
-        fault_reason: str | None = None,
+        actions_attempted: int,
+        actions_confirmed: int,
+        terminal_reason: str | None,
+        primary_fault_reason: str | None,
+        cleanup_fault_reason: str | None,
+        audit_fault_reason: str | None,
         monotonic_s: float | None = None,
     ) -> None:
         checked_monotonic_s = (
             self.monotonic_clock() if monotonic_s is None else monotonic_s
         )
-        observation = context.observation
+        fault_reason = (
+            primary_fault_reason or audit_fault_reason or cleanup_fault_reason
+        )
         row = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            ),
+            "timestamp_utc": self._utc_timestamp(),
             "monotonic_s": float(checked_monotonic_s),
             "event": event,
             "mode": self.mode,
             "cycle": context.cycle,
-            "task": None if observation is None else observation.task,
-            "current_state_deg": self._json_array(
-                None if observation is None else observation.state_deg
+            "task": (
+                None if context.observation is None else context.observation.task
             ),
+            "current_state_deg": self._json_array(context.current_state_deg),
             "predicted_first_action_deg": self._json_array(
                 context.predicted_first_action
             ),
             "safety_result": self._json_safety_result(context.safety_result),
             "send_result_deg": self._json_array(context.send_result),
             "inference_latency_s": context.inference_latency_s,
+            "actions_attempted": actions_attempted,
+            "actions_confirmed": actions_confirmed,
             "terminal_reason": terminal_reason,
             "fault_reason": fault_reason,
+            "primary_fault_reason": primary_fault_reason,
+            "cleanup_fault_reason": cleanup_fault_reason,
+            "audit_fault_reason": audit_fault_reason,
         }
         log_file.write(json.dumps(row, allow_nan=False, sort_keys=True) + "\n")
         log_file.flush()
+
+    def _write_fallback_fault(
+        self,
+        log_file: IO[str],
+        *,
+        failed_event: str,
+        context: _CycleContext,
+        actions_attempted: int,
+        actions_confirmed: int,
+        fault_reason: str,
+    ) -> None:
+        try:
+            row = {
+                "timestamp_utc": self._utc_timestamp(),
+                "event": (
+                    "terminal_fallback"
+                    if failed_event == "terminal"
+                    else "fault_fallback"
+                ),
+                "mode": self.mode,
+                "cycle": context.cycle,
+                "actions_attempted": actions_attempted,
+                "actions_confirmed": actions_confirmed,
+                "failed_event": failed_event,
+                "fault_reason": fault_reason,
+                "terminal_reason": (
+                    "fault" if failed_event == "terminal" else None
+                ),
+            }
+            log_file.write(json.dumps(row, allow_nan=False, sort_keys=True) + "\n")
+            log_file.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _exception_text(exc: Exception) -> str:
+        try:
+            return str(exc)
+        except Exception:
+            return type(exc).__name__
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     @staticmethod
     def _json_array(value: np.ndarray | None) -> list[float | None] | None:
