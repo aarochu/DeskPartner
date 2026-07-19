@@ -1,8 +1,9 @@
 # Rerun Query API — reBot refine step
 
 **Prize target:** Best example using the Rerun Query API  
-**Code:** [`p5_rerun_port/rerun_query.py`](../../p5_rerun_port/rerun_query.py), [`query_api_cli.py`](../../p5_rerun_port/query_api_cli.py)  
-**Runs:** after recording stops (read-only over `.rrd`). Does **not** open arms or the operator GUI.
+**Code:** [`p5_rerun_port/rerun_query.py`](../../p5_rerun_port/rerun_query.py), [`query_api_cli.py`](../../p5_rerun_port/query_api_cli.py)
+
+Post-recording only: read-only over `.rrd` files. Does **not** open arms or the operator GUI.
 
 ## Where this runs (important)
 
@@ -43,32 +44,117 @@ flowchart LR
   H --> I["export_lerobot<br/>Good episodes"]
 ```
 
-## Install
+## Prerequisites
+
+1. Repo root as cwd (so `python -m p5_rerun_port…` resolves):
+
+```bash
+cd /path/to/DeskPartner
+```
+
+2. Deps (includes Query API extras):
 
 ```bash
 pip install -r requirements.txt
 # pulls rerun-sdk[datafusion] + pandas
 ```
 
-## Commands
+3. At least one recorded episode under `recordings/<dataset>/` (e.g. `cans`). Dry-run if you have none yet:
 
 ```bash
-# Schema + entity paths (exercises Query API)
+python -m p5_rerun_port.record_episode \
+  --fake --dataset cans --task "Pick one can and place in taped zone" \
+  --tag "Good episode" --seconds 5 --no-viewer
+```
+
+That writes `recordings/cans/episode_XX.rrd` plus catalog sidecars. Query API reads the `.rrd` bodies; tags come from the local catalog.
+
+## How to run (step by step)
+
+All commands below are **terminal**. Replace `cans` if your dataset folder name differs.
+
+### 1) List catalog + print Query API schema
+
+```bash
 python -m p5_rerun_port.query_api_cli --dataset cans --schema
+```
 
-# Inspect joint state via reader().to_pandas()
+Expect: a catalog table (episode / tag / frames), then schema text with timelines, entities (`follower/position`, `follower/goal`, cameras), and component columns.
+
+### 2) Inspect one entity series
+
+```bash
 python -m p5_rerun_port.query_api_cli --dataset cans --entity follower/position
+```
 
-# Align follower/goal vs follower/position and score tracking error
+Optional filters:
+
+```bash
+# one episode only
+python -m p5_rerun_port.query_api_cli --dataset cans --episode episode_01 --entity follower/position
+
+# tag filter (catalog metadata)
+python -m p5_rerun_port.query_api_cli --dataset cans --tag "Good episode" --entity follower/position
+```
+
+Expect: row count, frame count, first/last/mean joint vectors.
+
+### 3) Compare goal vs position (tracking quality)
+
+```bash
 python -m p5_rerun_port.query_api_cli --dataset cans --compare goal-vs-position
+```
 
-# Markdown report for judges
+Expect: per-joint mean/max absolute error and RMS. High error → suspect lag or a bad take before export.
+
+### 4) Write a markdown report (for judges / demos)
+
+```bash
 python -m p5_rerun_port.query_api_cli --dataset cans --compare goal-vs-position \
   --report docs/p5_rerun_port/examples/cans_query_report.md
+```
 
-# Same path via the older CLI flag
+Sample output: [`examples/cans_query_report.md`](./examples/cans_query_report.md)
+
+### 5) Optional — same path via older CLI flag
+
+```bash
 python -m p5_rerun_port.query_dataset --dataset cans --rerun-api --entity follower/position
 ```
+
+Sidecar-only catalog listing (no Query API) remains:
+
+```bash
+python -m p5_rerun_port.query_dataset --dataset cans --tag "Good episode"
+```
+
+### 6) Optional — watch the same `.rrd` in the Viewer
+
+```bash
+rerun recordings/cans/episode_01.rrd
+```
+
+This is visualization only; it does not run Query API commands.
+
+### 7) After curating — export good episodes
+
+```bash
+python -m p5_rerun_port.export_lerobot --dataset cans --tag "Good episode" --fallback
+```
+
+## CLI flags (cheat sheet)
+
+| Flag | Purpose |
+|------|---------|
+| `--dataset` | Required. Folder name under `recordings/` |
+| `--schema` | Print schema via Query API |
+| `--entity` | Inspect series (e.g. `follower/position`) |
+| `--compare goal-vs-position` | Align goal vs position; print error metrics |
+| `--episode` | Limit to one episode id |
+| `--tag` | Filter catalog rows by tag |
+| `--report PATH` | Write markdown report |
+| `--timeline` | Override reader index/timeline name |
+| `--recordings-dir` / `--catalog` | Override default paths |
 
 ## What makes this the Query API (not just file listing)
 
@@ -81,12 +167,6 @@ python -m p5_rerun_port.query_dataset --dataset cans --rerun-api --entity follow
 | `.to_pandas()` | Inspect / aggregate / compare in Python |
 
 Catalog metadata (`catalog.json` tags) still lists episodes for curation; **series data** comes from the Rerun Query API over the `.rrd` bodies.
-
-## Useful demo: goal vs position
-
-`--compare goal-vs-position` pulls both series through the Query API, aligns rows, and prints per-joint mean/max absolute error plus RMS. High error → suspect lag or a bad take before export.
-
-Sample report: [`examples/cans_query_report.md`](./examples/cans_query_report.md)
 
 ## Relationship to other bounties
 

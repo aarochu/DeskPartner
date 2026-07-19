@@ -11,7 +11,7 @@ log_rebot → record_episode (.rrd) → Query API refine → export_lerobot → 
 
 Leaves `p4_data_collection` (native LeRobot record) and `rebot_operator_kit` untouched. This package is the **Rerun → catalog → LeRobot v3 → replay** product shape — a **parallel** bounty path that shares hardware/config with the operator GUI track.
 
-**Query API (post-record):** see [`QUERY_API.md`](./QUERY_API.md) — terminal CLI `python -m p5_rerun_port.query_api_cli` (not a panel inside the Rerun Viewer; Viewer is optional for watching `.rrd` files).
+**Query API (post-record):** step-by-step in [`QUERY_API.md`](./QUERY_API.md) — terminal CLI `python -m p5_rerun_port.query_api_cli` (not inside the Rerun Viewer; Viewer is optional for watching `.rrd` files).
 
 ## How it connects (flowchart)
 
