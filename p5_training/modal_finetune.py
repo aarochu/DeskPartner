@@ -187,17 +187,16 @@ if modal is not None:
         # wandb secret (WANDB_API_KEY) powers the live loss dashboard.
         secrets=[modal.Secret.from_name("hf-write"), modal.Secret.from_name("wandb")],
     )
-    def train(argv: list[str], exp_name: str) -> dict:
+    def train(argv: list[str], exp_name: str, resume: bool = False) -> dict:
         """Run `lerobot-train` for MolmoAct2; checkpoints land in /ckpts volume."""
         import shutil
         import subprocess
 
         start = time.time()
         out_dir = Path("/ckpts") / exp_name
-        # lerobot-train refuses a pre-existing output dir (resume=False). Each run is
-        # a fresh fine-tune, so clear a stale dir; use a distinct exp_name to keep old
-        # checkpoints. (lerobot creates the dir itself, so we don't pre-make it.)
-        if out_dir.exists():
+        # Fresh run: lerobot-train refuses a pre-existing output dir, so clear a stale
+        # one. RESUME run: keep the dir — lerobot loads the last checkpoint from it.
+        if out_dir.exists() and not resume:
             print(f"clearing existing output dir {out_dir}", flush=True)
             shutil.rmtree(out_dir)
 
@@ -227,6 +226,11 @@ def main() -> int:
         action="store_true",
         help="run detached on Modal: keeps training after this process/laptop disconnects",
     )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume from the last checkpoint of exp_name (keeps optimizer state + step)",
+    )
     args = ap.parse_args()
 
     cfg = _load_yaml(args.train_config) if args.train_config.exists() else {}
@@ -236,9 +240,23 @@ def main() -> int:
     exp = cfg.get("exp_name", "deskpartner_molmoact2")
     output_dir = f"/ckpts/{exp}"
 
-    argv = build_train_argv(cfg, repo_id, dataset_root, output_dir)
+    if args.resume:
+        # Resume: lerobot restores model + optimizer + step counter + config from the
+        # last checkpoint under output_dir and continues to --steps. Do NOT rebuild the
+        # full arg list (the saved config is authoritative).
+        steps = (cfg.get("train") or {}).get("steps", 8000)
+        argv = [
+            "accelerate", "launch", "--num_processes=1", "--mixed_precision=bf16",
+            "-m", "lerobot.scripts.lerobot_train",
+            f"--config_path={output_dir}/checkpoints/last/pretrained_model",
+            "--resume=true",
+            f"--steps={steps}",
+        ]
+    else:
+        argv = build_train_argv(cfg, repo_id, dataset_root, output_dir)
 
     print(f"GPU:             {GPU}")
+    print(f"mode:            {'RESUME from last checkpoint' if args.resume else 'fresh fine-tune'}")
     print(f"base_checkpoint: {cfg.get('base_checkpoint', BASE_CHECKPOINT)}")
     print(f"finetune mode:   {(cfg.get('finetune') or {}).get('mode', 'action_expert_only')}")
     print(f"dataset:         {repo_id}  (root {dataset_root})")
@@ -250,11 +268,26 @@ def main() -> int:
             print("(modal not installed — dry print only. pip install modal)")
         return 0
 
-    with modal.enable_output():  # stream the container's training logs locally
-        # detach=True: the Modal app keeps running even if this client disconnects
-        # (laptop sleeps), so training + checkpointing + wandb continue in the cloud.
-        with app.run(detach=args.detach):
-            result = train.remote(argv, exp)
+    if args.detach:
+        # TRUE detach: spawn() submits the job and returns immediately, so there is
+        # NO long-lived client connection to keep alive. app.run(detach=True) leaves
+        # the app running after this process exits.
+        # NOTE: an earlier version used the BLOCKING train.remote() here, which stays
+        # tied to the live connection — when that connection dropped mid-run the call
+        # was cancelled and the "detached" job died. spawn() fixes that.
+        with app.run(detach=True):
+            call = train.spawn(argv, exp, args.resume)
+            app_id = getattr(app, "app_id", None)
+        print(f"DETACHED: app_id={app_id} call_id={call.object_id}")
+        print("Training runs independently of this client (laptop can sleep/close).")
+        print("Watch the loss on wandb (project 'deskpartner-momo').")
+        if app_id:
+            print(f"Live logs: modal app logs {app_id}")
+        return 0
+
+    with modal.enable_output():  # attached run: stream the container's training logs
+        with app.run():
+            result = train.remote(argv, exp, args.resume)
     print("Modal finished:", result)
     return 0
 
