@@ -120,7 +120,6 @@ def build_train_argv(
         "--policy.gradient_checkpointing=true",
         # raw teleop gripper values aren't in [-1,1]; include them in normalization
         f"--policy.normalize_gripper={str(p.get('normalize_gripper', True)).lower()}",
-        "--policy.push_to_hub=false",
         f"--output_dir={output_dir}",
         f"--steps={t.get('steps', 4000)}",
         f"--batch_size={t.get('batch_size', 16)}",
@@ -138,6 +137,18 @@ def build_train_argv(
         argv += ["--policy.action_mode=both", "--policy.enable_lora_vlm=true"]
     else:
         raise RuntimeError(f"FAIL: unknown finetune mode {mode!r} (action_expert_only|lora)")
+
+    # Per-checkpoint push to the HF Hub (optional). When on, lerobot uploads each
+    # saved checkpoint to hub.repo_id as it trains — a durable backup of every step.
+    hub = cfg.get("hub") or {}
+    if hub.get("save_checkpoint_to_hub") and hub.get("repo_id"):
+        argv += [
+            "--policy.push_to_hub=true",
+            f"--policy.repo_id={hub['repo_id']}",
+            "--save_checkpoint_to_hub=true",
+        ]
+    else:
+        argv.append("--policy.push_to_hub=false")
 
     # Normalization: quantile is MolmoAct2's default but needs pre-computed stats.
     # mean_std works out-of-the-box on a fresh dataset (simplest first run).

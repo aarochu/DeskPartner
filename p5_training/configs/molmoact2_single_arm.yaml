@@ -45,6 +45,11 @@ wandb:
   enable: true                # live loss dashboard (needs the 'wandb' Modal secret)
   project: deskpartner-momo
 
+# Push every saved checkpoint to the Hub as training runs (durable backup).
+hub:
+  save_checkpoint_to_hub: true
+  repo_id: Cornerf/momo-post-trained-merged-set
+
 notes: |
   MolmoAct2 large model -> cloud A100/H100 only (never local GPU; that's SmolVLA's).
   Memory (single GPU, bf16): action-expert-only ~16-21 GiB, LoRA-VLM ~20-41 GiB.
