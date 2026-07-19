@@ -14,9 +14,9 @@
           <span><strong>ReBot Operator</strong><small>Isolated workspace</small></span>
         </a>
         <nav class="nav" aria-label="Workspace pages">
-          <a href="/">Teleop</a>
-          <a href="/training" aria-current="page">Collect & train</a>
-          <a href="http://127.0.0.1:3000/" target="_blank" rel="noreferrer">Mission course ↗</a>
+          <a href="/training" aria-current="page">Record</a>
+          <a href="/rerun">Run Library</a>
+          <button id="advanced-toggle" type="button">Advanced</button>
         </nav>
         <div class="state-pill" id="job-pill" data-state="READY">
           <span></span><b id="job-state">READY</b>
@@ -89,7 +89,7 @@
             <p>This Innomaker camera is mounted on the ReBot claw. Keep the lens secure and unobstructed; its job is to preserve a close view of the gripper fingers, contact point, and object during grasp and release.</p>
           </article>
         </div>
-        <div class="hard-rule"><strong>Hard rule:</strong> only camera 0 (Logitech overhead) and camera 1 (Innomaker wrist) are recorded. Camera 3 is the Mac webcam and stays excluded. A dark, covered, moved, wrong-size, or low-FPS training camera blocks Start.</div>
+        <div class="hard-rule"><strong>Manual camera review:</strong> only camera 0 (Logitech overhead) and camera 1 (Innomaker wrist) are recorded. Camera 3 stays excluded. The camera check is advisory; inspect both views yourself before each run.</div>
       </section>
 
       <section class="section">
@@ -99,16 +99,16 @@
         <form id="collection-form" class="form-grid">
           <label class="wide"><span>Task instruction</span><input id="task-input" name="task" value="Pick up one can and place it in the taped sorting zone" maxlength="220"><small>Use the same imperative sentence in every episode and later at inference.</small></label>
           <label class="wide"><span>Dataset name</span><input id="dataset-input" name="dataset" value="rebot-can-sort-stage1-v1-smoke" pattern="[a-z0-9][a-z0-9_-]{2,47}"><small>The first 10 episodes are the conversion/training smoke set. Existing folders are never overwritten.</small></label>
-          <label><span>Episodes this run</span><input id="episodes-input" type="number" value="10" min="1" max="500"></label>
-          <label><span>Episode seconds</span><input id="episode-time-input" type="number" value="30" min="5" max="300" step="1"></label>
-          <label><span>Auto-return / reset seconds</span><input id="reset-time-input" type="number" value="20" min="3" max="180" step="1"><small>Minimum time for scene reset</small></label>
-          <label class="check-label"><input id="resume-input" type="checkbox"><span>Resume an existing dataset</span></label>
+          <label><span>Runs per Start</span><input id="episodes-input" type="number" value="1" min="1" max="1" readonly><small>Manual mode always records exactly one take</small></label>
+          <label><span>Episode seconds</span><input id="episode-time-input" type="number" value="1000" min="5" max="3600" step="1"></label>
+          <input id="reset-time-input" type="hidden" value="20">
+          <label class="check-label"><input id="resume-input" type="checkbox" disabled><span>Append automatically when this dataset already exists</span></label>
 
           <div class="subhead wide"><strong>Separate clocks</strong><span>Fast motion; fixed training samples</span></div>
           <label><span>Control Hz</span><input id="control-hz-input" type="number" value="240" min="30" max="240"><small>Leader/follower loop</small></label>
           <label><span>Dataset FPS</span><input id="fps-input" type="number" value="30" min="5" max="60"><small>Images + state + action</small></label>
           <label><span>Motor velocity °/s</span><input id="velocity-input" type="number" value="2000" min="0.1" max="2000" step="0.1"></label>
-          <label><span>Step cap °/tick</span><input id="max-step-input" type="number" value="8.4" min="0.01" max="45" step="0.01"></label>
+          <label><span>Step cap °/tick</span><input id="max-step-input" type="number" value="33.6" min="0.01" max="45" step="0.01"></label>
           <label><span>Gripper force</span><input id="force-input" type="number" value="0.05" min="0" max="1" step="0.01"></label>
 
           <div class="subhead wide"><strong>Camera contract</strong><span>Actual dimensions, not driver-reported dimensions</span></div>
@@ -124,36 +124,43 @@
 
       <section class="section record-section">
         <div class="section-head">
-          <div><span class="step">04</span><h2>Record demonstrations</h2><p>Rerun opens automatically. Browser controls finish, redo, and finalize without global keyboard shortcuts.</p></div>
+          <div><span class="step">04</span><h2>Record one manual run</h2><p>Each Start owns exactly one take. Save or discard ends the process; return both arms yourself before starting again.</p></div>
           <div class="phase"><span>Phase</span><strong id="job-kind">Idle</strong><small id="job-runtime">00:00</small></div>
         </div>
-        <label class="readiness"><input id="ready-checkbox" type="checkbox"><span>I confirmed both camera mounts and lighting are fixed, both images are useful, the taped zone is clear, manual teleop is stopped, and I am ready to support the ReBot arm when the session ends.</span></label>
+        <div class="session-summary">
+          <span><small>DATASET</small><strong id="session-dataset">rebot-can-sort-stage1-v1-smoke</strong></span>
+          <span><small>SAVED</small><strong id="session-saved-count">Loading…</strong></span>
+          <span><small>NEXT</small><strong id="session-next-run">Run —</strong></span>
+          <span class="archive-on"><small>ARCHIVE</small><strong>● Log every run is ON</strong></span>
+        </div>
+        <label class="readiness"><input id="ready-checkbox" type="checkbox" checked><span>I confirmed both cameras are useful and both arms are in my chosen start pose.</span></label>
         <div class="failure-controls">
           <label><span>Failure reason (required only for a failed take)</span><select id="failure-label-input"><option value="">Choose after a failed attempt…</option></select></label>
           <label><span>Failure note (required for “Other”)</span><input id="failure-note-input" maxlength="500" placeholder="Optional detail for review"></label>
           <p>Successes stay unlabeled. A marked failure is archived for review but never added to the policy-training dataset.</p>
         </div>
         <div class="record-actions">
-          <button class="button primary" id="start-record-button" type="button">Start collection</button>
-          <button class="button secondary" id="finish-button" type="button" disabled>Finish & keep episode</button>
-          <button class="button danger-outline" id="rerecord-button" type="button" disabled>Mark failed & re-record</button>
-          <button class="button danger" id="stop-record-button" type="button" disabled>Stop & finalize</button>
+          <button class="button primary" id="start-record-button" type="button">▶ Start new run</button>
+          <button class="button secondary" id="pause-record-button" type="button" disabled>Pause</button>
+          <button class="button secondary" id="finish-stop-button" type="button" disabled>Save run</button>
+          <button class="button danger-outline advanced-control" id="rerecord-button" type="button" disabled>Discard with failure label</button>
+          <button class="button danger" id="stop-record-button" type="button" disabled>Discard run</button>
         </div>
         <div class="quality-grid">
           <article><strong>KEEP</strong><p>Exactly one can, one smooth grasp-and-place action, no collision, no hand in either frame, no major hesitation or correction.</p></article>
-          <article><strong>MARK FAILED</strong><p>Choose one reason, then re-record. The two videos and Rerun timeline remain available for failure analysis but are excluded from training.</p></article>
-          <article><strong>AUTO-RETURN</strong><p>The follower returns to the pose captured when collection connected. Put the passive leader back in its captured pose, then scatter the can to a new random reachable position; reset frames are not stored.</p></article>
+          <article><strong>DISCARD</strong><p>Choose one reason and end the run. The videos and Rerun timeline remain available for review but are excluded from training.</p></article>
+          <article><strong>MANUAL RESET</strong><p>After the process disconnects, return both arms to your chosen start pose and move the can. Nothing moves or starts automatically.</p></article>
         </div>
-        <div class="hard-rule"><strong>Session home:</strong> place both arms in the exact home pose before Start collection. Their current poses are captured when the process connects. After every kept or failed take, the follower returns automatically and the next take stays blocked until the leader is manually returned and the reset timer finishes.</div>
+        <div class="hard-rule"><strong>No automatic motion:</strong> saving, failure, discard, or collector error ends the current process without returning either arm. Manually return both arms before pressing Play again.</div>
         <div class="hard-rule"><strong>No silent acceptance:</strong> the timer never auto-keeps. At the time limit, motion and recording pause on the last pose until you explicitly keep, mark failed, or stop the current attempt.</div>
       </section>
 
-      <section class="section attempt-section">
+      <section class="section attempt-section" id="attempt-review">
         <div class="section-head">
-          <div><span class="step">04A</span><h2>Review every attempt</h2><p>Each take has its own Logitech video, Innomaker video, metadata, and synchronized Rerun recording.</p></div>
+          <div><span class="step">04A</span><h2>Review and label every finished attempt</h2><p>Each take has its own Logitech video, Innomaker video, metadata, and synchronized Rerun recording. A finished success can still be marked failed here and will be removed from LeRobot safely.</p></div>
           <button class="button secondary" id="refresh-attempts-button" type="button">Refresh archive</button>
         </div>
-        <div class="attempt-legend"><span><i data-state="kept"></i>Unlabeled success · included in training</span><span><i data-state="failed"></i>Manually labeled failure · excluded</span><span><i data-state="aborted"></i>Stopped/system attempt · excluded</span></div>
+        <div class="attempt-legend"><span><i data-state="kept"></i>Unlabeled success · included in training</span><span><i data-state="failed"></i>Reviewed failure · excluded from LeRobot</span><span><i data-state="aborted"></i>Stopped/system attempt · excluded but labelable</span></div>
         <div id="attempt-list" class="attempt-list"><p class="empty">No archived attempts yet.</p></div>
       </section>
 
@@ -208,10 +215,10 @@
           <li><b>Lock the two training cameras.</b><span>Logitech overhead sees the whole task path; the Innomaker claw camera sees the gripper contact. Mac webcam index 3 remains excluded.</span></li>
           <li><b>Run the camera check.</b><span>Inspect both new snapshots yourself. Do not accept a technically bright image with a bad crop, clutter, or occlusion.</span></li>
           <li><b>Stage one can.</b><span>For the first 150 clean episodes, keep exactly one can visible; pick it once and place it in the fixed taped sorting zone. Keep cameras, mounts, taped zone, and lighting fixed.</span></li>
-          <li><b>Capture session home and start.</b><span>Put both arms in the exact start pose, then Start collection. Keep them still until the connection captures that pose; afterward move the teleop arm smoothly and naturally.</span></li>
-          <li><b>Judge every take immediately.</b><span>Finish & keep only one smooth, clean success. Delete jerky-but-successful takes too; for any bad take, choose a failure reason and use Mark failed & re-record.</span></li>
-          <li><b>Reset to a new can position.</b><span>The ReBot follower returns home automatically. Manually return the passive leader, then scatter the can to a new random reachable position across corners, edges, and center; the next recording waits for both arms and the reset timer.</span></li>
-          <li><b>Review and validate.</b><span>Replay any archived take in Rerun. Stop archives the partial take as aborted; validation must PASS all 7D follower-coordinate checks.</span></li>
+          <li><b>Start one run.</b><span>Put both arms in your chosen start pose and click Play / start one run. Move the teleop arm smoothly and naturally.</span></li>
+          <li><b>Judge and end.</b><span>Click Save successful run only for one smooth, clean success. For a bad take, choose a failure reason and click Discard failed run. Either choice ends the process.</span></li>
+          <li><b>Reset manually.</b><span>Return both arms yourself, scatter the can to a new reachable position, and click Play again. No return, timer, or next recording starts automatically.</span></li>
+          <li><b>Review and validate.</b><span>Every saved episode is durable before disconnect. Every discarded or faulted take stays in the raw archive and is excluded. Validation must PASS all 7D follower-coordinate checks.</span></li>
           <li><b>Hit the Stage-1 milestones.</b><span>Hand off the first 10 episodes for a throwaway train immediately; keep collecting and checkpoint at 50, 100, and 150 clean episodes. Only after 150 add random extra cans in frame while still picking exactly one.</span></li>
           <li><b>Train only the approved route.</b><span>Use native 7D MolmoAct2, or get explicit approval for a 6D fixed-wrist-yaw adapter before using Newt.</span></li>
         </ol>
@@ -222,7 +229,7 @@
         <ul>
           <li>The confirmed Stage-1 skill is <b>one can → taped sorting zone</b>; each episode contains one picked can and one complete place action.</li>
           <li>Raw immutable collection should remain seven-axis and use <b>front</b>/<b>side</b> keys to match DeskPartner; any Newt adapter will create a separate prepared copy.</li>
-          <li>The verified high-response recording profile is 240 Hz control, 30 FPS samples, 2000°/s motor velocity, 8.4°/tick cap, and 0.05 gripper force.</li>
+          <li>The verified 4x hand-tracking recording profile is 240 Hz control, 30 FPS samples, 2000°/s motor velocity, 33.6°/tick cap, and 0.05 gripper force. The 1000-second window is only an upper guard; finish each take manually.</li>
         </ul>
         <div class="question"><strong>Decision still needed before hosted training</strong><p>Can Mission Robotics provision a native 7D ReBot MolmoAct2 base? If not, may we hold <code>wrist_yaw</code> at a fixed pose and build a reviewed 6D SO‑101 adapter? Collection can proceed in 7D while that is answered.</p></div>
       </section>

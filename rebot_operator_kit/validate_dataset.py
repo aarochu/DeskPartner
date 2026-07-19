@@ -73,6 +73,7 @@ def main() -> int:
     args = parser.parse_args()
 
     profile, profile_digest, expected_names, limits = load_profile(args.profile)
+    delta_override = args.max_action_state_delta
     if args.max_action_state_delta is None:
         try:
             args.max_action_state_delta = (
@@ -82,6 +83,15 @@ def main() -> int:
             raise SystemExit(
                 "training profile collection_defaults.max_step is invalid"
             ) from exc
+    joint_delta_limits = np.full(7, args.max_action_state_delta, dtype=np.float32)
+    if delta_override is None:
+        # The gripper command is scaled 6x and send_action performs a second
+        # feedback read after the observation sample. Preserve a bounded extra
+        # degree for gripper quantization/read skew without weakening the six
+        # arm-joint follower-coordinate check.
+        joint_delta_limits[expected_names.index("gripper.pos")] = (
+            float(profile["collection_defaults"]["max_step"]) + 1.5
+        )
     sidecar_path = args.root / "meta" / "rebot_training_profile.json"
     if not sidecar_path.is_file():
         raise SystemExit("dataset is missing meta/rebot_training_profile.json")
@@ -231,12 +241,16 @@ def main() -> int:
             raise SystemExit(f"frame {index}: state/action contains a non-finite value")
         if np.any(action < limits[:, 0] - 0.1) or np.any(action > limits[:, 1] + 0.1):
             raise SystemExit(f"frame {index}: follower-space action exceeds ReBot joint limits: {action}")
-        delta = float(np.max(np.abs(action - state)))
+        joint_deltas = np.abs(action - state)
+        delta = float(np.max(joint_deltas))
         maximum_delta = max(maximum_delta, delta)
-        if delta > args.max_action_state_delta:
+        violating = np.flatnonzero(joint_deltas > joint_delta_limits)
+        if violating.size:
+            joint_index = int(violating[np.argmax(joint_deltas[violating])])
             raise SystemExit(
-                f"frame {index}: action/state delta {delta:.3f}° exceeds "
-                f"{args.max_action_state_delta:.3f}°; actions may be in leader coordinates"
+                f"frame {index}: {expected_names[joint_index]} action/state delta "
+                f"{joint_deltas[joint_index]:.3f}° exceeds "
+                f"{joint_delta_limits[joint_index]:.3f}°; actions may be in leader coordinates"
             )
         task = str(sample.get("task", "")).strip()
         if not task:
@@ -270,6 +284,10 @@ def main() -> int:
         "minimum_sampled_camera_brightness": minimum_camera_brightness,
         "minimum_sampled_camera_contrast": minimum_camera_contrast,
         "maximum_sampled_action_state_delta_deg": maximum_delta,
+        "action_state_delta_limits_deg": {
+            name: float(limit)
+            for name, limit in zip(expected_names, joint_delta_limits, strict=True)
+        },
         "action_coordinates": "follower degrees after direction, joint-limit, and per-tick clipping",
         "training_profile_id": profile["profile_id"],
         "training_profile_version": profile["profile_version"],
@@ -292,6 +310,13 @@ def main() -> int:
     print(f"task={next(iter(task_values))}")
     print(f"sampled_frames={len(sample_indices)}")
     print(f"max_action_state_delta_deg={maximum_delta:.3f}")
+    print(
+        "action_state_delta_limits_deg="
+        + ",".join(
+            f"{name}:{float(limit):.3f}"
+            for name, limit in zip(expected_names, joint_delta_limits, strict=True)
+        )
+    )
     if args.report:
         print(f"report={args.report}")
     return 0

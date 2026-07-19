@@ -87,6 +87,14 @@ The collector uses two independent clocks:
   from that control tick. Training FPS remains stable even if the motor loop
   runs faster.
 
+Camera sampling is nonblocking and manual-cycle mode does not enforce a frame-
+age cutoff. It reuses the latest available frame and records age/staleness
+telemetry for later review, but camera scheduling jitter or a stopped producer
+thread does not stop arm control when a buffered image exists. A camera that
+has never produced any image remains a functional collection error because a
+two-camera LeRobot sample cannot be constructed without it. Inspect both views
+yourself and exclude any take with frozen or unusable video during review.
+
 Do not use DeskPartner's old P4 batch recorder for new data. It does not append
 episodes correctly and would save the wrong action coordinate frame for this
 ReBot runtime.
@@ -174,44 +182,52 @@ the raw seventh joint during recording.
 5. Leave the task instruction unchanged.
 6. Use dataset name `rebot-can-sort-stage1-v1-smoke`.
 7. Use these initial settings:
-   - Episodes: `10`
-   - Episode time: `30 s`
-   - Reset time: `20 s`
+   - Runs per Start: `1` (manual-cycle mode always enforces one)
+   - Episode time: `1000 s` upper guard; finish each take manually
+   - Reset time: retained only in the locked historical contract; no automatic reset runs
    - Control: `240 Hz`
    - Dataset: `30 FPS`
    - Motor velocity: `2000 °/s` on all seven joints
-   - Step cap: `8.4 °/tick`
+   - Step cap: `33.6 °/tick`
    - Gripper force: `0.05`
-8. Put both arms in the exact stable pose you want to use as the home position
-   for this session, and confirm the follower is clear to move. The collector
-   captures both current poses when it connects after you click Start.
-9. Check the readiness confirmation and click **Start collection** once.
+8. Put both arms in the stable pose you want for this take and confirm the
+   follower is clear to move. The collector records the start pose for audit
+   metadata only; it never commands a return to that pose.
+9. Click **Start new run**.
 10. Wait until both arms connect. Then move the leader smoothly and decisively.
 11. After one smooth pick and a clean, visible release in the taped zone, click
-    **Finish & keep episode**. The browser immediately confirms that Rerun and
-    LeRobot saving has started; do not press Stop while saving. Wait until the
-    next attempt is ready.
-12. After every kept or failed take, the follower automatically returns to the
-    captured session-home pose at a capped 120 deg/s. Manually put the passive
-    leader back in its own captured pose, then scatter the can to a new random
-    reachable position. Cover corners, edges, and center across the dataset.
-    The next attempt stays blocked until both arms are aligned and the reset
-    timer has completed; reset frames are not saved.
+    **Save run**. The browser immediately confirms that Rerun and
+    LeRobot saving has started. The process disconnects only after the episode
+    is durable, and it does not move either arm after save.
+12. Return both arms to the start pose yourself, scatter the can to a new random
+    reachable position, then click **Start new run** again. Each click
+    launches one fresh process and automatically appends when the dataset
+    already exists. There is no automatic return, alignment gate, reset timer,
+    next attempt, or automatic continuation.
 13. For a miss, collision, occlusion, dropped object, wrong destination, large
     correction, awkward hesitation, or any jerky-but-successful motion, choose
-    a failure reason and click **Mark failed & re-record**. The take is excluded
-    from training, but its videos and Rerun recording are preserved.
-14. The 30-second episode time is a target, not automatic acceptance. Recording
-    pauses motion and recording at the configured limit, then waits until you
+    **Discard run**. The take is excluded from training, its videos and Rerun
+    recording are preserved, and the process ends. Label it later in Run Library.
+14. The 1000-second episode time is only an upper guard. Finish each take
+    manually as soon as the task is complete. At the limit, recording
+    pauses motion and recording, then waits until you
     explicitly keep, mark failed, or stop the attempt. It never auto-keeps and
     cannot fill the disk while waiting for a browser decision.
-15. Use **Review every attempt** to open the separate overhead/wrist MP4 files,
-    replay the synchronized take in Rerun, or correct a failed take's label.
-    Successful takes deliberately have no label.
-16. After 10 clean saved episodes, click **Stop & finalize** only if a new
-    episode has already begun; the partial take is archived as `aborted` and
-    excluded while all saved episodes remain. Stop/abort disconnects without
-    initiating an automatic return; support the follower when stopping.
+15. Use **Review and label every finished attempt** to open the separate
+    overhead/wrist MP4 files, replay the synchronized take in Rerun, or correct
+    a failure label. Successful takes deliberately have no label. If later
+    review shows that a take kept as a success actually failed or was only a
+    test, choose a reason and click **Mark failed & exclude from LeRobot**. The
+    GUI removes that episode from the active success-only LeRobot dataset,
+    reindexes and fresh-load verifies any remaining episodes, invalidates the
+    previous validation report, and keeps a recoverable copy of the prior
+    dataset revision. The attempt's MP4s, Rerun recording, and review history
+    are never removed.
+16. Every saved run already ends its own process. **Discard run** archives
+    an unwanted partial take as `aborted` and excludes it while all earlier
+    saved episodes remain. After any save, discard, failure, or collector error,
+    the page returns to retry-ready and never initiates an automatic return;
+    support the follower when it disconnects.
 17. Select the smoke dataset and click **Validate selected dataset** with a
     minimum of `10` episodes. Continue only after the log prints `PASS`, then
     hand this checkpoint to the conversion/training owner immediately.
@@ -315,13 +331,38 @@ dependencies. The `uv sync` command creates the isolated environment.
 Run from this Mac, replacing the GPU login and path:
 
 ```bash
-rsync -av --progress \
-  ./data/rebot-can-sort-stage1-v1-smoke/ \
-  <gpu-user>@<gpu-host>:<lerobot-directory>/rebot-training/data/rebot-can-sort-stage1-v1-smoke/
+./08_share_dataset.command rsync \
+  <gpu-user>@<gpu-host>:<lerobot-directory>/rebot-training/data/rebot-can-sort-stage1-v1-smoke
 ```
 
 Copy the whole dataset directory, including `meta`, `data`, and `videos`.
-Never copy only the MP4 files.
+Never copy only the MP4 files. The command validates the dataset and generates
+a timestamped `SHARE_MANIFEST.json` with SHA-256 checksums before transferring
+only changed files. It fails closed unless the collector is idle/finalized and
+the GUI's validation report still matches the current episode/frame counts,
+then shares from a stable copy-on-write snapshot so recording data is never
+read or mutated during collection. The receiver runs
+`09_receive_dataset.command verify` on the received directory.
+
+For repeatable team-wide sharing through a private Hugging Face dataset:
+
+```bash
+./08_share_dataset.command hub \
+  <owner-or-org>/rebot-can-sort-stage1-v1-smoke
+```
+
+The first run requires `./10_hf_oauth_login.command`. It installs a current
+Hugging Face CLI in ignored local state and uses browser/device OAuth without
+changing the pinned robotics runtime or asking you to paste a token. Later
+runs reuse already uploaded content. Give teammates the immutable revision
+printed by the command and the handoff in
+`TEAMMATE_DATA_RECEIVER_PROMPT.md`; do not tell them to train from an
+unspecified moving `main` revision.
+
+The Hub repository slug must match the dataset's locked local slug. The
+append-only smoke stream therefore stays `rebot-can-sort-stage1-v1-smoke`.
+Publish `rebot-can-sort-stage1-v1` only after building the separate reviewed
+kept-only export namespace described in `AGENTS.md`.
 
 ### Generate and run the exact command
 
