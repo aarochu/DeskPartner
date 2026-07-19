@@ -16,6 +16,7 @@ config/.env
 
 # Runtime / calibration artifacts
 runs/
+outputs/
 data/calibration/*.npy
 data/calibration/*.json
 data/calibration/*.png
