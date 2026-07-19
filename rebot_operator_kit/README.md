@@ -14,6 +14,16 @@ For the current data-collection and MolmoAct2 workflow, use
 [`TRAINING_GUIDE.md`](TRAINING_GUIDE.md) and open
 `http://127.0.0.1:8765/training` from the local GUI.
 
+For incremental team sharing, run `08_share_dataset.command` on the recording
+Mac and `09_receive_dataset.command` on the receiving machine. The sender
+validates the complete dataset, creates `SHARE_MANIFEST.json` with exact
+checksums and timestamps, and then either uploads to a private Hugging Face
+dataset or uses `rsync`. It refuses to run while collection/saving is active or
+before the current dataset validation passes, and publishes from a stable
+copy-on-write snapshot rather than the active recording directory. See
+`TEAMMATE_DATA_RECEIVER_PROMPT.md` for the ready-to-send receiving-agent
+handoff.
+
 ## Confirmed on this Mac
 
 | Item | Current mapping | Status |

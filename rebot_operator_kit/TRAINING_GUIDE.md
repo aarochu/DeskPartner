@@ -322,13 +322,35 @@ dependencies. The `uv sync` command creates the isolated environment.
 Run from this Mac, replacing the GPU login and path:
 
 ```bash
-rsync -av --progress \
-  ./data/rebot-can-sort-stage1-v1-smoke/ \
-  <gpu-user>@<gpu-host>:<lerobot-directory>/rebot-training/data/rebot-can-sort-stage1-v1-smoke/
+./08_share_dataset.command rsync \
+  <gpu-user>@<gpu-host>:<lerobot-directory>/rebot-training/data/rebot-can-sort-stage1-v1-smoke
 ```
 
 Copy the whole dataset directory, including `meta`, `data`, and `videos`.
-Never copy only the MP4 files.
+Never copy only the MP4 files. The command validates the dataset and generates
+a timestamped `SHARE_MANIFEST.json` with SHA-256 checksums before transferring
+only changed files. It fails closed unless the collector is idle/finalized and
+the GUI's validation report still matches the current episode/frame counts,
+then shares from a stable copy-on-write snapshot so recording data is never
+read or mutated during collection. The receiver runs
+`09_receive_dataset.command verify` on the received directory.
+
+For repeatable team-wide sharing through a private Hugging Face dataset:
+
+```bash
+./08_share_dataset.command hub \
+  <owner-or-org>/rebot-can-sort-stage1-v1-smoke
+```
+
+The first run requires `hf auth login`. Later runs are resumable and reuse
+already uploaded content. Give teammates the immutable revision printed by the
+command and the handoff in `TEAMMATE_DATA_RECEIVER_PROMPT.md`; do not tell them
+to train from an unspecified moving `main` revision.
+
+The Hub repository slug must match the dataset's locked local slug. The
+append-only smoke stream therefore stays `rebot-can-sort-stage1-v1-smoke`.
+Publish `rebot-can-sort-stage1-v1` only after building the separate reviewed
+kept-only export namespace described in `AGENTS.md`.
 
 ### Generate and run the exact command
 
