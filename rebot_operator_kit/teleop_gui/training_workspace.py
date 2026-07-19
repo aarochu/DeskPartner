@@ -8,7 +8,7 @@ drivers, and it never writes datasets or checkpoints into the Git repository.
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -23,6 +23,8 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from attempt_archive import (
     FAILURE_LABELS,
@@ -30,7 +32,11 @@ from attempt_archive import (
     atomic_write_json,
     attempt_inventory as read_attempt_inventory,
     find_attempt,
+    mark_kept_attempt_failed as write_reviewed_failure,
+    reindex_training_episode as write_reindexed_episode,
+    review_revision,
     update_failure_label as write_failure_label,
+    utc_now,
     validate_failure_label,
 )
 
@@ -50,6 +56,7 @@ MODEL_ROOT = Path(os.environ.get("KIT_MODEL_ROOT", KIT_ROOT / "models"))
 CAMERA_ROOT = Path(os.environ.get("KIT_CAMERA_ROOT", KIT_ROOT / "camera-check"))
 RUN_ROOT = Path(os.environ.get("KIT_RUN_ROOT", KIT_ROOT / "training-runs"))
 ATTEMPT_ROOT = RUN_ROOT / "attempts"
+DATASET_REVISION_ROOT = RUN_ROOT / "dataset-revisions"
 CONTROL_ROOT = RUN_ROOT / "controls"
 CONTROLLED_RECORD = GUI_ROOT / "controlled_record.py"
 OWNED_PROCESS = GUI_ROOT / "owned_process.py"
@@ -1219,10 +1226,263 @@ def update_attempt_failure_label(payload: Any) -> dict[str, Any]:
             str(payload.get("attempt_id", "")),
             payload.get("failure_label"),
             payload.get("failure_note", ""),
+            expected_revision=payload.get("expected_revision"),
         )
     except (ValueError, FileNotFoundError) as exc:
         raise TrainingConfigError(str(exc)) from exc
     return {"attempt": metadata}
+
+
+def _review_local_now() -> str:
+    return datetime.now(ZoneInfo("America/Los_Angeles")).isoformat(timespec="seconds")
+
+
+def _review_transaction_update(transaction_root: Path, **updates: Any) -> dict[str, Any]:
+    path = transaction_root / "review-transaction.json"
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Review transaction manifest is unreadable: {path}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Review transaction manifest is invalid: {path}")
+    value.update(updates)
+    atomic_write_json(path, value)
+    return value
+
+
+def _load_review_dataset(root: Path, repo_id: str):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    return LeRobotDataset(repo_id, root=root, batch_encoding_size=1)
+
+
+def _prepare_lerobot_episode_exclusion(
+    dataset_name: str,
+    episode_index: int,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Build and verify a recoverable replacement without touching the source."""
+
+    if not DATASET_SLUG_RE.fullmatch(dataset_name):
+        raise TrainingConfigError("Invalid dataset name")
+    dataset_root = DATA_ROOT / dataset_name
+    if not dataset_root.is_dir() or dataset_root.is_symlink():
+        raise RuntimeError(f"LeRobot dataset is not safely available: {dataset_root}")
+
+    repo_id = f"local/{dataset_name}"
+    try:
+        source = _load_review_dataset(dataset_root, repo_id)
+    except Exception as exc:
+        raise RuntimeError(f"LeRobot dataset could not be fresh-loaded: {exc}") from exc
+
+    total_episodes = int(source.num_episodes)
+    if isinstance(episode_index, bool) or not 0 <= episode_index < total_episodes:
+        raise TrainingConfigError("Attempt points to an invalid LeRobot episode")
+    episode_metadata = source.meta.episodes[episode_index]
+    removed_frames = int(episode_metadata.get("length", 0))
+    expected_frames = int(source.num_frames) - removed_frames
+    remaining_episodes = total_episodes - 1
+    if expected_frames < 0:
+        raise RuntimeError("LeRobot episode frame metadata is inconsistent")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    transaction_root = (
+        DATASET_REVISION_ROOT
+        / dataset_name
+        / f"{stamp}--exclude-{attempt_id}-{uuid4().hex[:8]}"
+    )
+    transaction_root.mkdir(parents=True, exist_ok=False)
+    backup_root = transaction_root / "source-dataset"
+    replacement_root = transaction_root / "replacement-dataset"
+    validation_path = RUN_ROOT / f"{dataset_name}--validation.json"
+    validation_backup = transaction_root / "previous-validation.json"
+    manifest = {
+        "schema_version": 1,
+        "transaction_id": transaction_root.name,
+        "state": "preparing",
+        "created_at_utc": utc_now(),
+        "created_at_local": _review_local_now(),
+        "timezone": "America/Los_Angeles",
+        "dataset": dataset_name,
+        "source_path": str(dataset_root),
+        "backup_path": str(backup_root),
+        "replacement_path": str(replacement_root) if remaining_episodes else None,
+        "attempt_id": attempt_id,
+        "removed_episode_index": episode_index,
+        "source_episodes": total_episodes,
+        "source_frames": int(source.num_frames),
+        "removed_frames": removed_frames,
+        "remaining_episodes": remaining_episodes,
+        "expected_remaining_frames": expected_frames,
+    }
+    atomic_write_json(transaction_root / "review-transaction.json", manifest)
+
+    if remaining_episodes:
+        try:
+            from lerobot.datasets.dataset_tools import delete_episodes
+
+            replacement = delete_episodes(
+                source,
+                [episode_index],
+                output_dir=replacement_root,
+                repo_id=repo_id,
+            )
+            profile_sidecar = dataset_root / "meta" / "rebot_training_profile.json"
+            if profile_sidecar.is_file():
+                destination = replacement_root / "meta" / profile_sidecar.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(profile_sidecar, destination)
+            del replacement
+            verified = _load_review_dataset(replacement_root, repo_id)
+            if (
+                int(verified.num_episodes) != remaining_episodes
+                or int(verified.num_frames) != expected_frames
+            ):
+                raise RuntimeError(
+                    "Replacement LeRobot episode/frame counts do not match the review plan"
+                )
+            del verified
+        except Exception as exc:
+            _review_transaction_update(
+                transaction_root,
+                state="prepare_failed",
+                error=str(exc),
+                failed_at_utc=utc_now(),
+                failed_at_local=_review_local_now(),
+            )
+            raise RuntimeError(
+                "Could not build a verified LeRobot dataset without this episode; "
+                "the original dataset was not changed"
+            ) from exc
+
+    del source
+    _review_transaction_update(
+        transaction_root,
+        state="prepared",
+        prepared_at_utc=utc_now(),
+        prepared_at_local=_review_local_now(),
+    )
+    return {
+        **manifest,
+        "transaction_root": transaction_root,
+        "dataset_root": dataset_root,
+        "backup_root": backup_root,
+        "replacement_root": replacement_root if remaining_episodes else None,
+        "validation_path": validation_path,
+        "validation_backup": validation_backup,
+        "repo_id": repo_id,
+    }
+
+
+def _commit_lerobot_episode_exclusion(plan: dict[str, Any]) -> None:
+    dataset_root = Path(plan["dataset_root"])
+    backup_root = Path(plan["backup_root"])
+    replacement_root = (
+        Path(plan["replacement_root"]) if plan.get("replacement_root") else None
+    )
+    validation_path = Path(plan["validation_path"])
+    validation_backup = Path(plan["validation_backup"])
+    transaction_root = Path(plan["transaction_root"])
+    try:
+        dataset_root.replace(backup_root)
+        if replacement_root is not None:
+            replacement_root.replace(dataset_root)
+            verified = _load_review_dataset(dataset_root, str(plan["repo_id"]))
+            if (
+                int(verified.num_episodes) != int(plan["remaining_episodes"])
+                or int(verified.num_frames) != int(plan["expected_remaining_frames"])
+            ):
+                raise RuntimeError("Active replacement failed fresh-load verification")
+            del verified
+        elif dataset_root.exists():
+            raise RuntimeError("Zero-episode exclusion left an active dataset behind")
+        if validation_path.is_file():
+            validation_path.replace(validation_backup)
+        _review_transaction_update(
+            transaction_root,
+            state="dataset_swapped",
+            swapped_at_utc=utc_now(),
+            swapped_at_local=_review_local_now(),
+        )
+    except Exception as exc:
+        try:
+            if dataset_root.exists():
+                failed_replacement = transaction_root / "failed-active-replacement"
+                dataset_root.replace(failed_replacement)
+            if backup_root.exists():
+                backup_root.replace(dataset_root)
+            if validation_backup.exists() and not validation_path.exists():
+                validation_backup.replace(validation_path)
+        except Exception as rollback_exc:
+            _review_transaction_update(
+                transaction_root,
+                state="rollback_failed",
+                error=str(exc),
+                rollback_error=str(rollback_exc),
+                failed_at_utc=utc_now(),
+                failed_at_local=_review_local_now(),
+            )
+            raise RuntimeError(
+                "LeRobot review swap and automatic rollback both failed; validation is blocked"
+            ) from rollback_exc
+        _review_transaction_update(
+            transaction_root,
+            state="swap_failed_rolled_back",
+            error=str(exc),
+            failed_at_utc=utc_now(),
+            failed_at_local=_review_local_now(),
+        )
+        raise RuntimeError(
+            "LeRobot review swap failed and was rolled back; no training episode was removed"
+        ) from exc
+
+
+def _rollback_lerobot_episode_exclusion(plan: dict[str, Any], reason: str) -> None:
+    dataset_root = Path(plan["dataset_root"])
+    backup_root = Path(plan["backup_root"])
+    validation_path = Path(plan["validation_path"])
+    validation_backup = Path(plan["validation_backup"])
+    transaction_root = Path(plan["transaction_root"])
+    if dataset_root.exists():
+        rolled_back_replacement = transaction_root / "rolled-back-replacement"
+        dataset_root.replace(rolled_back_replacement)
+    if not backup_root.exists():
+        raise RuntimeError("Review rollback source dataset is missing")
+    backup_root.replace(dataset_root)
+    if validation_backup.exists() and not validation_path.exists():
+        validation_backup.replace(validation_path)
+    restored = _load_review_dataset(dataset_root, str(plan["repo_id"]))
+    if int(restored.num_episodes) != int(plan["source_episodes"]):
+        raise RuntimeError("Review rollback did not restore the source episode count")
+    del restored
+    _review_transaction_update(
+        transaction_root,
+        state="metadata_failed_rolled_back",
+        error=reason,
+        rolled_back_at_utc=utc_now(),
+        rolled_back_at_local=_review_local_now(),
+    )
+
+
+def _dataset_attempt_mapping(dataset_name: str, expected_episodes: int) -> list[dict[str, Any]]:
+    attempts = read_attempt_inventory(ATTEMPT_ROOT, dataset_name)
+    included = [item for item in attempts if item.get("training_included") is True]
+    raw_indices = [item.get("training_episode_index") for item in included]
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in raw_indices):
+        raise RuntimeError(
+            "Attempt-to-LeRobot episode mapping is inconsistent; review cannot safely mutate data"
+        )
+    indices = sorted(raw_indices)
+    if indices != list(range(expected_episodes)):
+        raise RuntimeError(
+            "Attempt-to-LeRobot episode mapping is inconsistent; review cannot safely mutate data"
+        )
+    return included
+
+
+def _restore_attempt_metadata(snapshots: dict[Path, dict[str, Any]]) -> None:
+    for path, value in snapshots.items():
+        atomic_write_json(path, value)
 
 
 def attempt_artifact_path(attempt_id: str, artifact: str) -> Path:
@@ -1846,6 +2106,204 @@ class TrainingManager:
             command,
             config={"dataset": name, "minimum_episodes": minimum},
         )
+
+    def review_attempt(self, payload: Any) -> dict[str, Any]:
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise RuntimeError("Another training workspace operation is in progress")
+        try:
+            self._ensure_idle()
+            return self._review_attempt_locked(payload)
+        finally:
+            self._lifecycle_lock.release()
+
+    def _review_attempt_locked(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise TrainingConfigError("Request body must be a JSON object")
+        attempt_id = str(payload.get("attempt_id", ""))
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"", "mark_failed", "label_excluded"}:
+            raise TrainingConfigError("Unknown attempt review action")
+        try:
+            directory, metadata = find_attempt(ATTEMPT_ROOT, attempt_id)
+            label, note = validate_failure_label(
+                payload.get("failure_label"), payload.get("failure_note", "")
+            )
+            current_revision = review_revision(metadata)
+        except (ValueError, FileNotFoundError) as exc:
+            raise TrainingConfigError(str(exc)) from exc
+        if metadata.get("archive_complete") is not True:
+            raise TrainingConfigError("Only a completed archived attempt can be reviewed")
+        expected_revision = payload.get("expected_revision")
+        if expected_revision is not None:
+            if isinstance(expected_revision, bool):
+                raise TrainingConfigError("Attempt review revision is invalid")
+            try:
+                expected = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise TrainingConfigError("Attempt review revision is invalid") from exc
+            if expected != current_revision:
+                raise TrainingConfigError(
+                    "This attempt was reviewed in another tab; refresh the archive before saving"
+                )
+
+        is_included_kept = bool(
+            metadata.get("disposition") == "kept"
+            and metadata.get("training_included") is True
+            and isinstance(metadata.get("training_episode_index"), int)
+            and not isinstance(metadata.get("training_episode_index"), bool)
+        )
+        if not is_included_kept:
+            if action == "mark_failed":
+                raise TrainingConfigError("This attempt is already excluded from LeRobot")
+            try:
+                updated = write_failure_label(
+                    ATTEMPT_ROOT,
+                    attempt_id,
+                    label,
+                    note,
+                    expected_revision=expected_revision,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise TrainingConfigError(str(exc)) from exc
+            self._append_log(
+                "INFO",
+                f"Reviewed excluded attempt {attempt_id}: {label}",
+            )
+            return {
+                "attempt": updated,
+                "review_action": "label_excluded",
+                "training_changed": False,
+                "message": "Review label saved; this attempt remains excluded from LeRobot.",
+            }
+
+        if action == "label_excluded":
+            raise TrainingConfigError(
+                "A kept attempt must be marked failed and removed from LeRobot"
+            )
+        dataset_name = str(metadata.get("dataset", ""))
+        episode_index = int(metadata["training_episode_index"])
+        info_path = DATA_ROOT / dataset_name / "meta" / "info.json"
+        try:
+            info = json.loads(info_path.read_text())
+            expected_episodes = int(info["total_episodes"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("LeRobot dataset metadata is unavailable or invalid") from exc
+        included = _dataset_attempt_mapping(dataset_name, expected_episodes)
+        matching = [item for item in included if item.get("attempt_id") == attempt_id]
+        if len(matching) != 1 or matching[0].get("training_episode_index") != episode_index:
+            raise RuntimeError(
+                "Finished attempt does not map uniquely to its LeRobot episode"
+            )
+
+        reindexed = sorted(
+            (
+                item
+                for item in included
+                if int(item["training_episode_index"]) > episode_index
+            ),
+            key=lambda item: int(item["training_episode_index"]),
+        )
+        affected_ids = [attempt_id, *(str(item["attempt_id"]) for item in reindexed)]
+        snapshots: dict[Path, dict[str, Any]] = {}
+        for affected_id in affected_ids:
+            affected_directory, affected_metadata = find_attempt(ATTEMPT_ROOT, affected_id)
+            snapshots[affected_directory / "metadata.json"] = affected_metadata
+
+        plan = _prepare_lerobot_episode_exclusion(
+            dataset_name,
+            episode_index,
+            attempt_id,
+        )
+        _commit_lerobot_episode_exclusion(plan)
+        try:
+            updated = write_reviewed_failure(
+                ATTEMPT_ROOT,
+                attempt_id,
+                label,
+                note,
+                expected_revision=expected_revision,
+            )
+            updated["training_exclusion_transaction"] = Path(
+                plan["transaction_root"]
+            ).name
+            updated["training_dataset_revision_backup"] = str(plan["backup_root"])
+            updated["training_dataset_remaining_episodes"] = int(
+                plan["remaining_episodes"]
+            )
+            atomic_write_json(directory / "metadata.json", updated)
+
+            for item in reindexed:
+                old_index = int(item["training_episode_index"])
+                changed = write_reindexed_episode(
+                    ATTEMPT_ROOT,
+                    str(item["attempt_id"]),
+                    old_index=old_index,
+                    new_index=old_index - 1,
+                    review_attempt_id=attempt_id,
+                )
+                changed["training_reindex_transaction"] = Path(
+                    plan["transaction_root"]
+                ).name
+                changed_directory, _ = find_attempt(
+                    ATTEMPT_ROOT, str(item["attempt_id"])
+                )
+                atomic_write_json(changed_directory / "metadata.json", changed)
+
+            _dataset_attempt_mapping(
+                dataset_name,
+                int(plan["remaining_episodes"]),
+            )
+            _review_transaction_update(
+                Path(plan["transaction_root"]),
+                state="complete",
+                failure_label=label,
+                failure_note=note,
+                completed_at_utc=utc_now(),
+                completed_at_local=_review_local_now(),
+            )
+        except Exception as exc:
+            metadata_restore_error: Exception | None = None
+            try:
+                _restore_attempt_metadata(snapshots)
+            except Exception as restore_exc:
+                metadata_restore_error = restore_exc
+            try:
+                _rollback_lerobot_episode_exclusion(plan, str(exc))
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "Post-review metadata failed and the LeRobot rollback needs manual recovery"
+                ) from rollback_exc
+            if metadata_restore_error is not None:
+                raise RuntimeError(
+                    "LeRobot was restored but attempt metadata needs manual recovery"
+                ) from metadata_restore_error
+            raise RuntimeError(
+                "Post-review metadata failed; the original LeRobot dataset was restored"
+            ) from exc
+
+        remaining = int(plan["remaining_episodes"])
+        self._append_log(
+            "INFO",
+            f"Attempt {attempt_id} marked failed and removed from LeRobot episode "
+            f"{episode_index}; {remaining} episode(s) remain",
+        )
+        return {
+            "attempt": updated,
+            "review_action": "mark_failed",
+            "training_changed": True,
+            "removed_episode_index": episode_index,
+            "remaining_episodes": remaining,
+            "dataset_empty": remaining == 0,
+            "backup_root": str(plan["backup_root"]),
+            "message": (
+                "Failure label saved and the episode was removed from LeRobot. "
+                + (
+                    "The dataset now has no kept episodes; start the next run with Resume off."
+                    if remaining == 0
+                    else f"{remaining} kept episode(s) remain and were fresh-load verified."
+                )
+            ),
+        }
 
     def record_control(self, payload: Any) -> dict[str, Any]:
         with self._decision_lock:

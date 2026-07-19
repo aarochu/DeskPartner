@@ -205,9 +205,16 @@ the raw seventh joint during recording.
     pauses motion and recording at the configured limit, then waits until you
     explicitly keep, mark failed, or stop the attempt. It never auto-keeps and
     cannot fill the disk while waiting for a browser decision.
-15. Use **Review every attempt** to open the separate overhead/wrist MP4 files,
-    replay the synchronized take in Rerun, or correct a failed take's label.
-    Successful takes deliberately have no label.
+15. Use **Review and label every finished attempt** to open the separate
+    overhead/wrist MP4 files, replay the synchronized take in Rerun, or correct
+    a failure label. Successful takes deliberately have no label. If later
+    review shows that a take kept as a success actually failed or was only a
+    test, choose a reason and click **Mark failed & exclude from LeRobot**. The
+    GUI removes that episode from the active success-only LeRobot dataset,
+    reindexes and fresh-load verifies any remaining episodes, invalidates the
+    previous validation report, and keeps a recoverable copy of the prior
+    dataset revision. The attempt's MP4s, Rerun recording, and review history
+    are never removed.
 16. After 10 clean saved episodes, click **Stop & finalize** only if a new
     episode has already begun; the partial take is archived as `aborted` and
     excluded while all saved episodes remain. Stop/abort disconnects without

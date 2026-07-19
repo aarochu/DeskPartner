@@ -280,6 +280,11 @@ function setFailureLabelOptions(labels) {
 
 function makeFailureSelect(value) {
   const select = document.createElement("select");
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Choose a failure reason…";
+  placeholder.selected = !value;
+  select.append(placeholder);
   failureLabels.forEach((item) => {
     const option = document.createElement("option");
     option.value = item.value;
@@ -308,6 +313,9 @@ function renderAttempts(payload) {
   latestAttempts.forEach((attempt) => {
     const state = attempt.disposition || "unknown";
     const manuallyFailed = state === "failed" || attempt.operator_disposition === "failed";
+    const includedKept = state === "kept" && attempt.training_included === true;
+    const alreadyExcluded = attempt.training_included === false && state !== "recording";
+    const reviewable = attempt.archive_complete === true && (includedKept || alreadyExcluded);
     const card = document.createElement("article");
     card.className = "attempt-card";
     card.dataset.state = state;
@@ -326,7 +334,7 @@ function renderAttempts(payload) {
     const included = attempt.training_included ? `training episode ${attempt.training_episode_index}` : "excluded from training";
     meta.textContent = `${attempt.dataset || "—"} · ${attempt.samples || 0} frames · ${Number(attempt.duration_s || 0).toFixed(1)}s · ${included} · ${attempt.started_at || "—"}`;
     summary.append(title, meta);
-    if (manuallyFailed) {
+    if (attempt.failure_label) {
       const label = document.createElement("p");
       label.className = "attempt-label";
       label.textContent = `Failure: ${failureLabelText(attempt.failure_label)}${attempt.failure_note ? ` — ${attempt.failure_note}` : ""}`;
@@ -358,27 +366,50 @@ function renderAttempts(payload) {
     summary.append(actions);
 
     const edit = document.createElement("div");
-    edit.className = `attempt-edit${manuallyFailed ? "" : " hidden"}`;
-    if (manuallyFailed) {
+    edit.className = `attempt-edit${reviewable ? "" : " hidden"}`;
+    if (reviewable) {
       const select = makeFailureSelect(attempt.failure_label);
       const note = document.createElement("input");
       note.maxLength = 500;
       note.placeholder = "Failure note";
       note.value = attempt.failure_note || "";
       const help = document.createElement("small");
-      help.textContent = "Only failed attempts are labeled. Editing this sidecar never adds the take to training.";
+      help.textContent = includedKept
+        ? "If review shows this take failed or was only a test, it will be removed from LeRobot. Both videos and the Rerun replay remain preserved."
+        : "Save a review reason for this excluded take. Its recorded system outcome and raw files remain preserved.";
       const save = document.createElement("button");
       save.type = "button";
       save.className = "button danger-outline";
-      save.textContent = "Save failure label";
+      save.textContent = includedKept
+        ? "Mark failed & exclude from LeRobot"
+        : (manuallyFailed ? "Update failure label" : "Label excluded attempt");
       save.addEventListener("click", () => runAction("Failure label could not be saved", async () => {
-        await post("/api/training/attempt/label", {
+        if (!select.value) throw new Error("Choose a failure reason first");
+        if (includedKept && !window.confirm(
+          `Mark ${attempt.attempt_id} failed and remove training episode ${attempt.training_episode_index} from LeRobot? The MP4s and Rerun replay will be kept.`,
+        )) return;
+        showNotice(
+          includedKept
+            ? "Reclassifying this finished episode and rebuilding the success-only LeRobot dataset. Keep this page open…"
+            : "Saving the review label…",
+          "info",
+          0,
+        );
+        const result = await post("/api/training/attempt/review", {
           attempt_id: attempt.attempt_id,
+          action: includedKept ? "mark_failed" : "label_excluded",
           failure_label: select.value,
           failure_note: note.value.trim(),
+          expected_revision: Number(attempt.review_revision || 0),
         });
-        renderAttempts(await api("/api/training/attempts"));
-        showNotice("Failure label updated.", "success", 2200);
+        if (result.dataset_empty) $("resume-input").checked = false;
+        const [attempts, datasets] = await Promise.all([
+          api("/api/training/attempts"),
+          api("/api/training/datasets"),
+        ]);
+        renderAttempts(attempts);
+        renderDatasets(datasets.datasets);
+        showNotice(result.message || "Finished-attempt review saved.", "success", 7000);
       }));
       edit.append(select, note, help, save);
     }

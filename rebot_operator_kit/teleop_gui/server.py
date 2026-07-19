@@ -42,7 +42,6 @@ from training_workspace import (
     replay_attempt,
     training_profile_status,
     training_recipe,
-    update_attempt_failure_label,
 )
 
 
@@ -915,7 +914,14 @@ class ReBotHandler(BaseHTTPRequestHandler):
                 self._send_json(replay_attempt(payload), HTTPStatus.ACCEPTED)
             elif self.path == "/api/training/attempt/label":
                 payload = self._read_json()
-                self._send_json(update_attempt_failure_label(payload))
+                self._send_json(
+                    self.server.training_manager.review_attempt(
+                        {**payload, "action": "label_excluded"}
+                    )
+                )
+            elif self.path == "/api/training/attempt/review":
+                payload = self._read_json()
+                self._send_json(self.server.training_manager.review_attempt(payload))
             elif self.path == "/api/training/validate":
                 payload = self._read_json()
                 self._send_json(

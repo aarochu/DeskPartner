@@ -89,6 +89,8 @@ class TrainingDefaultsTest(unittest.TestCase):
         training_js = (GUI_ROOT / "static" / "training.js").read_text()
         self.assertIn("Save accepted. Writing this episode to Rerun and LeRobot now.", training_js)
         self.assertIn("Do not press Stop; wait until the next attempt is ready.", training_js)
+        self.assertIn("Mark failed & exclude from LeRobot", training_js)
+        self.assertIn('/api/training/attempt/review', training_js)
 
     def test_manual_gui_default_matches_collection_profile(self) -> None:
         preset = server.PRESETS["hand_tracking"]
@@ -1168,6 +1170,292 @@ class AttemptArchiveTest(unittest.TestCase):
             os.close(owner_write)
             self.assertEqual(process.wait(timeout=5), 0)
             self.assertEqual(stopped.read_text(), "stopped")
+
+
+class FinishedAttemptReviewTest(unittest.TestCase):
+    FEATURES = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_a", "joint_b"],
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["joint_a", "joint_b"],
+        },
+    }
+
+    def make_dataset_and_attempts(
+        self,
+        root: Path,
+        dataset_name: str,
+        episode_count: int,
+    ) -> tuple[Path, Path, list[str]]:
+        data_root = root / "data"
+        attempt_root = root / "training-runs" / "attempts"
+        dataset_root = data_root / dataset_name
+        cache = root / "huggingface-cache"
+        ids: list[str] = []
+        with patch.object(datasets_config, "HF_DATASETS_CACHE", cache):
+            dataset = LeRobotDataset.create(
+                f"local/{dataset_name}",
+                30,
+                self.FEATURES,
+                root=dataset_root,
+                use_videos=False,
+                batch_encoding_size=1,
+            )
+            for episode_index in range(episode_count):
+                for frame_index in range(3):
+                    offset = float(episode_index * 10 + frame_index)
+                    dataset.add_frame(
+                        {
+                            "observation.state": np.array(
+                                [offset, offset + 0.5], dtype=np.float32
+                            ),
+                            "action": np.array(
+                                [offset + 1.0, offset + 1.5], dtype=np.float32
+                            ),
+                            "task": "finished review test",
+                        }
+                    )
+                dataset.save_episode(parallel_encoding=False)
+                dataset = controlled_record.checkpoint_and_reopen_dataset(
+                    dataset,
+                    expected_episode_index=episode_index,
+                )
+                attempt_id = attempt_archive.new_attempt_id()
+                ids.append(attempt_id)
+                directory = attempt_archive.attempt_path(
+                    attempt_root, dataset_name, attempt_id
+                )
+                directory.mkdir(parents=True)
+                attempt_archive.atomic_write_json(
+                    directory / "metadata.json",
+                    {
+                        "schema_version": 1,
+                        "attempt_id": attempt_id,
+                        "dataset": dataset_name,
+                        "started_at": attempt_archive.utc_now(),
+                        "finished_at": attempt_archive.utc_now(),
+                        "disposition": "kept",
+                        "operator_disposition": "kept",
+                        "archive_complete": True,
+                        "training_included": True,
+                        "training_episode_index": episode_index,
+                        "samples": 3,
+                    },
+                )
+            dataset.stop_image_writer()
+            dataset.finalize()
+        return data_root, attempt_root, ids
+
+    def workspace_roots(self, root: Path, data_root: Path, attempt_root: Path):
+        run_root = root / "training-runs"
+        return (
+            patch.object(workspace, "DATA_ROOT", data_root),
+            patch.object(workspace, "RUN_ROOT", run_root),
+            patch.object(workspace, "ATTEMPT_ROOT", attempt_root),
+            patch.object(workspace, "DATASET_REVISION_ROOT", run_root / "dataset-revisions"),
+        )
+
+    def test_finished_kept_episode_can_be_failed_and_compacted_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "finished-review-two"
+            data_root, attempt_root, ids = self.make_dataset_and_attempts(root, name, 2)
+            profile_sidecar = data_root / name / "meta" / "rebot_training_profile.json"
+            profile_sidecar.write_text('{"profile":"review-test"}\n')
+            validation_path = (
+                root / "training-runs" / f"{name}--validation.json"
+            )
+            validation_path.write_text('{"passed":true}\n')
+            patches = self.workspace_roots(root, data_root, attempt_root)
+            with patches[0], patches[1], patches[2], patches[3]:
+                result = workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": ids[0],
+                        "action": "mark_failed",
+                        "failure_label": "test_or_setup",
+                        "failure_note": "calibration trial",
+                        "expected_revision": 0,
+                    }
+                )
+
+                self.assertTrue(result["training_changed"])
+                self.assertEqual(result["remaining_episodes"], 1)
+                fresh = LeRobotDataset(
+                    f"local/{name}", root=data_root / name, batch_encoding_size=1
+                )
+                self.assertEqual(fresh.num_episodes, 1)
+                self.assertEqual(fresh.num_frames, 3)
+                self.assertEqual(
+                    (data_root / name / "meta" / profile_sidecar.name).read_text(),
+                    '{"profile":"review-test"}\n',
+                )
+                self.assertFalse(validation_path.exists())
+                failed = attempt_archive.find_attempt(attempt_root, ids[0])[1]
+                kept = attempt_archive.find_attempt(attempt_root, ids[1])[1]
+                self.assertEqual(failed["disposition"], "failed")
+                self.assertEqual(failed["recorded_disposition"], "kept")
+                self.assertFalse(failed["training_included"])
+                self.assertEqual(failed["failure_label"], "test_or_setup")
+                self.assertEqual(kept["training_episode_index"], 0)
+                backup = Path(result["backup_root"])
+                self.assertTrue(backup.is_dir())
+                original = LeRobotDataset(
+                    f"local/{name}", root=backup, batch_encoding_size=1
+                )
+                self.assertEqual(original.num_episodes, 2)
+                self.assertTrue((backup.parent / "previous-validation.json").is_file())
+
+    def test_reviewing_only_episode_preserves_backup_and_reopens_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "finished-review-one"
+            data_root, attempt_root, ids = self.make_dataset_and_attempts(root, name, 1)
+            patches = self.workspace_roots(root, data_root, attempt_root)
+            with patches[0], patches[1], patches[2], patches[3]:
+                result = workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": ids[0],
+                        "action": "mark_failed",
+                        "failure_label": "failed_to_perform_task",
+                        "expected_revision": 0,
+                    }
+                )
+                self.assertTrue(result["dataset_empty"])
+                self.assertFalse((data_root / name).exists())
+                backup = Path(result["backup_root"])
+                self.assertTrue(backup.is_dir())
+                original = LeRobotDataset(
+                    f"local/{name}", root=backup, batch_encoding_size=1
+                )
+                self.assertEqual(original.num_episodes, 1)
+                failed = attempt_archive.find_attempt(attempt_root, ids[0])[1]
+                self.assertFalse(failed["training_included"])
+                self.assertIsNone(failed["training_episode_index"])
+
+    def test_system_attempt_can_be_labeled_without_changing_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt_root = Path(temporary) / "attempts"
+            attempt_id = attempt_archive.new_attempt_id()
+            directory = attempt_archive.attempt_path(
+                attempt_root, "excluded-review", attempt_id
+            )
+            directory.mkdir(parents=True)
+            attempt_archive.atomic_write_json(
+                directory / "metadata.json",
+                {
+                    "attempt_id": attempt_id,
+                    "dataset": "excluded-review",
+                    "disposition": "collector_error",
+                    "operator_disposition": "collector_error",
+                    "archive_complete": True,
+                    "training_included": False,
+                    "training_episode_index": None,
+                },
+            )
+            with patch.object(workspace, "ATTEMPT_ROOT", attempt_root):
+                result = workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": attempt_id,
+                        "action": "label_excluded",
+                        "failure_label": "camera_problem",
+                        "expected_revision": 0,
+                    }
+                )
+            updated = result["attempt"]
+            self.assertEqual(updated["disposition"], "collector_error")
+            self.assertEqual(updated["failure_label"], "camera_problem")
+            self.assertFalse(updated["training_included"])
+            self.assertEqual(updated["review_revision"], 1)
+
+    def test_metadata_failure_rolls_back_original_lerobot_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "finished-review-rollback"
+            data_root, attempt_root, ids = self.make_dataset_and_attempts(root, name, 2)
+            patches = self.workspace_roots(root, data_root, attempt_root)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patch.object(
+                    workspace,
+                    "write_reviewed_failure",
+                    side_effect=RuntimeError("simulated metadata failure"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "original LeRobot dataset was restored"
+                ),
+            ):
+                workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": ids[0],
+                        "action": "mark_failed",
+                        "failure_label": "test_or_setup",
+                        "expected_revision": 0,
+                    }
+                )
+
+            restored = LeRobotDataset(
+                f"local/{name}", root=data_root / name, batch_encoding_size=1
+            )
+            self.assertEqual(restored.num_episodes, 2)
+            self.assertEqual(restored.num_frames, 6)
+            metadata = attempt_archive.find_attempt(attempt_root, ids[0])[1]
+            self.assertEqual(metadata["disposition"], "kept")
+            self.assertTrue(metadata["training_included"])
+            self.assertEqual(metadata["training_episode_index"], 0)
+
+    def test_stale_review_revision_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt_root = Path(temporary) / "attempts"
+            attempt_id = attempt_archive.new_attempt_id()
+            directory = attempt_archive.attempt_path(
+                attempt_root, "stale-review", attempt_id
+            )
+            directory.mkdir(parents=True)
+            attempt_archive.atomic_write_json(
+                directory / "metadata.json",
+                {
+                    "attempt_id": attempt_id,
+                    "dataset": "stale-review",
+                    "disposition": "failed",
+                    "archive_complete": True,
+                    "training_included": False,
+                    "review_revision": 1,
+                },
+            )
+            with (
+                patch.object(workspace, "ATTEMPT_ROOT", attempt_root),
+                self.assertRaisesRegex(
+                    workspace.TrainingConfigError, "reviewed in another tab"
+                ),
+            ):
+                workspace.TrainingManager().review_attempt(
+                    {
+                        "attempt_id": attempt_id,
+                        "action": "label_excluded",
+                        "failure_label": "test_or_setup",
+                        "expected_revision": 0,
+                    }
+                )
+
+    def test_review_is_rejected_while_collection_is_running(self) -> None:
+        class RunningProcess:
+            @staticmethod
+            def poll():
+                return None
+
+        manager = workspace.TrainingManager()
+        manager._kind = "record"
+        manager._process = RunningProcess()
+        with self.assertRaisesRegex(RuntimeError, "still running"):
+            manager.review_attempt({})
 
 
 class FileStreamingTest(unittest.TestCase):

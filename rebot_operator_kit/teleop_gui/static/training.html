@@ -150,10 +150,10 @@
 
       <section class="section attempt-section">
         <div class="section-head">
-          <div><span class="step">04A</span><h2>Review every attempt</h2><p>Each take has its own Logitech video, Innomaker video, metadata, and synchronized Rerun recording.</p></div>
+          <div><span class="step">04A</span><h2>Review and label every finished attempt</h2><p>Each take has its own Logitech video, Innomaker video, metadata, and synchronized Rerun recording. A finished success can still be marked failed here and will be removed from LeRobot safely.</p></div>
           <button class="button secondary" id="refresh-attempts-button" type="button">Refresh archive</button>
         </div>
-        <div class="attempt-legend"><span><i data-state="kept"></i>Unlabeled success · included in training</span><span><i data-state="failed"></i>Manually labeled failure · excluded</span><span><i data-state="aborted"></i>Stopped/system attempt · excluded</span></div>
+        <div class="attempt-legend"><span><i data-state="kept"></i>Unlabeled success · included in training</span><span><i data-state="failed"></i>Reviewed failure · excluded from LeRobot</span><span><i data-state="aborted"></i>Stopped/system attempt · excluded but labelable</span></div>
         <div id="attempt-list" class="attempt-list"><p class="empty">No archived attempts yet.</p></div>
       </section>
 

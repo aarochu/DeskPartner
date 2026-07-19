@@ -28,7 +28,12 @@ re-record**. Successes stay unlabeled and enter LeRobot; failures are labeled
 and excluded. Every attempt is independently archived with two MP4s, a
 synchronized `.rrd`, and an editable JSON sidecar under
 `training-runs/attempts/<dataset>/<attempt-id>/`. The training page can replay
-the `.rrd` in Rerun and can edit labels only on failed attempts.
+the `.rrd` in Rerun and can review every finished attempt. If a take was kept
+by mistake, **Mark failed & exclude from LeRobot** removes that physical
+episode from the active success-only dataset, reindexes and fresh-load verifies
+the remaining episodes, and preserves the original dataset revision plus both
+videos and the Rerun archive. Aborted and system-error attempts can also receive
+a review reason without changing their recorded system outcome.
 
 The follower's current seven-joint pose and the passive leader's corresponding
 pose are captured once, when collection connects. After every kept or failed
