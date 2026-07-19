@@ -175,11 +175,14 @@ class FakePolicyClass:
 class FakeProcessor:
     def __init__(self) -> None:
         self.reset_calls = 0
+        self.reset_error: Exception | None = None
         self.calls: list[object] = []
         self.transform = lambda value: value
 
     def reset(self) -> None:
         self.reset_calls += 1
+        if self.reset_error is not None:
+            raise self.reset_error
 
     def __call__(self, value: object) -> object:
         self.calls.append(value)
@@ -409,6 +412,19 @@ class AdapterInferenceTest(FakeBackendFixture, unittest.TestCase):
             captured_monotonic_s=123.0,
         )
 
+    def test_reset_clears_policy_and_saved_processor_state_and_fails_closed(self) -> None:
+        adapter = self.make_adapter()
+
+        adapter.reset()
+
+        self.assertEqual(FakePolicyClass.policy.reset_calls, 2)
+        self.assertEqual(self.preprocessor.reset_calls, 2)
+        self.assertEqual(self.postprocessor.reset_calls, 2)
+
+        self.preprocessor.reset_error = RuntimeError("state reset exploded")
+        with self.assertRaisesRegex(RuntimeError, "preprocessor reset failed"):
+            adapter.reset()
+
     def test_maps_raw_observation_predicts_and_postprocesses_a_chunk(self) -> None:
         adapter = self.make_adapter()
         observation = self.observation()
@@ -545,11 +561,17 @@ class FakeDataset:
 class FakeOfflineAdapter:
     def __init__(self) -> None:
         self.observations: list[object] = []
+        self.reset_calls = 0
+        self.state = 0
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+        self.state = 0
 
     def predict(self, observation: object) -> np.ndarray:
         self.observations.append(observation)
-        offset = len(self.observations)
-        return np.full((2, 7), offset, dtype=np.float64)
+        self.state += 1
+        return np.full((2, 7), self.state, dtype=np.float64)
 
 
 def dataset_sample(
@@ -615,8 +637,9 @@ class OfflineEvaluationTest(unittest.TestCase):
         self.assertEqual([result.episode_index for result in results], [4, 4, 9])
         self.assertEqual([result.sample_index for result in results], [0, 1, 2])
         self.assertEqual([result.shape for result in results], [(2, 7)] * 3)
-        self.assertEqual([result.minimum for result in results], [1.0, 2.0, 3.0])
-        self.assertEqual([result.maximum for result in results], [1.0, 2.0, 3.0])
+        self.assertEqual([result.minimum for result in results], [1.0, 2.0, 1.0])
+        self.assertEqual([result.maximum for result in results], [1.0, 2.0, 1.0])
+        self.assertEqual(self.adapter.reset_calls, 2)
         np.testing.assert_allclose(
             [result.latency_s for result in results], [0.1, 0.2, 0.3]
         )

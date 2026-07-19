@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -124,7 +125,12 @@ class PolicyEvaluationTest(unittest.TestCase):
                 )
                 clamps = trial.get("clamps", 0)
                 clamps = clamps if isinstance(clamps, int) and not isinstance(clamps, bool) else 0
-                rows: list[dict[str, object]] = [{"event": "rollout_metadata"}]
+                rows: list[dict[str, object]] = [{
+                    "event": "rollout_metadata",
+                    "checkpoint": trial.get("checkpoint"),
+                    "checkpoint_digest": trial.get("checkpoint_digest"),
+                    "profile_authentication": "checkpoint-sidecar-verified",
+                }]
                 for attempt in range(1, max(1, attempts) + 1):
                     final = attempt == attempts
                     rows.append(
@@ -276,6 +282,42 @@ class PolicyEvaluationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reused across placements"):
             module.load_trial_manifest(path)
 
+    def test_checkpoint_identity_binds_resolved_path_and_model_weights(self) -> None:
+        module = self.require_module()
+        checkpoint = self.root / "checkpoint"
+        checkpoint.mkdir()
+        weights = checkpoint / "model.safetensors"
+        weights.write_bytes(b"test weights")
+
+        identity = module.checkpoint_identity(checkpoint)
+
+        self.assertEqual(identity.path, checkpoint.resolve())
+        self.assertEqual(identity.digest, hashlib.sha256(b"test weights").hexdigest())
+        weights.unlink()
+        with self.assertRaisesRegex(ValueError, "model.safetensors"):
+            module.checkpoint_identity(checkpoint)
+
+    def test_rejects_audit_checkpoint_digest_or_authentication_mismatch(self) -> None:
+        module = self.require_module()
+        for field, value in (
+            ("checkpoint", "/models/different"),
+            ("checkpoint_digest", DIGEST_B),
+            ("profile_authentication", "standalone-untrusted"),
+        ):
+            with self.subTest(field=field):
+                manifest = make_manifest()
+                path = self.write_manifest(manifest, f"binding-{field}.json")
+                audit = Path(manifest["trials"][0]["source_jsonl_paths"][0])  # type: ignore[index]
+                rows = [json.loads(line) for line in audit.read_text().splitlines()]
+                metadata = next(row for row in rows if row.get("event") == "rollout_metadata")
+                metadata[field] = value
+                audit.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "checkpoint|authenticated"):
+                    module.load_trial_manifest(path)
+
     def test_rejects_nonabsolute_missing_symlink_or_malformed_audit_path(self) -> None:
         module = self.require_module()
         cases: list[tuple[str, str]] = []
@@ -329,8 +371,9 @@ class PolicyEvaluationTest(unittest.TestCase):
                 manifest["trials"][0].update(attempts_used=2, completion_s=3.0)  # type: ignore[index]
                 path = self.write_manifest(manifest, f"terminal-{name}.json")
                 audit = Path(manifest["trials"][0]["source_jsonl_paths"][0])  # type: ignore[index]
+                metadata = json.loads(audit.read_text().splitlines()[0])
                 audit.write_text(
-                    "".join(json.dumps(row) + "\n" for row in rows),
+                    "".join(json.dumps(row) + "\n" for row in [metadata, *rows]),
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(ValueError, "attempt|terminal reason"):

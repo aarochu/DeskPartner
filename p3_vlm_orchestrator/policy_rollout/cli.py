@@ -419,6 +419,9 @@ def _checkpoint_loader(deps: CliDependencies) -> Callable[[Path], object]:
 
 def _run_inspect(args: argparse.Namespace, deps: CliDependencies) -> int:
     bundle = _checkpoint_loader(deps)(args.checkpoint)
+    from p3_vlm_orchestrator.policy_rollout.evaluation import checkpoint_identity
+
+    identity = checkpoint_identity(bundle.path)
     config = _load_json_object(Path(bundle.path) / "config.json", "policy config")
     policy_type = config.get("type", config.get("policy_type", "unknown"))
     processor_artifacts = _processor_artifact_report(Path(bundle.path))
@@ -449,6 +452,7 @@ def _run_inspect(args: argparse.Namespace, deps: CliDependencies) -> int:
         file=deps.output(),
     )
     print(f"profile_digest={bundle.profile_digest}", file=deps.output())
+    print(f"checkpoint_digest={identity.digest}", file=deps.output())
     return 0
 
 
@@ -532,6 +536,8 @@ def _run_hardware(
         profile_digest = canonical_profile_digest(profile_snapshot)
         profile_authentication = "standalone-untrusted"
         task = profile_snapshot["collection_defaults"]["task"]
+        checkpoint_path = None
+        checkpoint_digest = None
         policy = _dummy_policy_factory(deps)()
     else:
         bundle = _checkpoint_loader(deps)(args.checkpoint)
@@ -539,6 +545,11 @@ def _run_hardware(
         profile_digest = bundle.profile_digest
         profile_authentication = "checkpoint-sidecar-verified"
         task = bundle.task
+        from p3_vlm_orchestrator.policy_rollout.evaluation import checkpoint_identity
+
+        identity = checkpoint_identity(bundle.path)
+        checkpoint_path = str(identity.path)
+        checkpoint_digest = identity.digest
         processor_artifacts = _processor_artifact_report(Path(bundle.path))
         print(
             "processor_artifacts=" + ",".join(processor_artifacts),
@@ -556,6 +567,8 @@ def _run_hardware(
             profile_snapshot=profile_snapshot,
             profile_digest=profile_digest,
             profile_authentication=profile_authentication,
+            checkpoint_path=checkpoint_path,
+            checkpoint_digest=checkpoint_digest,
             task=task,
             policy=policy,
         )
@@ -593,6 +606,8 @@ def _run_hardware(
         task=task,
         profile_digest=profile_digest,
         profile_authentication=profile_authentication,
+        checkpoint_path=checkpoint_path,
+        checkpoint_digest=checkpoint_digest,
     )
     print(f"jsonl_path={log_path}", file=deps.output())
     if mode == "shadow" and args.dummy_hold:
@@ -664,6 +679,8 @@ def _run_episode_hardware(
     profile_snapshot: Mapping[str, Any],
     profile_digest: str,
     profile_authentication: str,
+    checkpoint_path: str | None,
+    checkpoint_digest: str | None,
     task: str,
     policy: object,
 ) -> int:
@@ -672,6 +689,9 @@ def _run_episode_hardware(
     attempt = 1
     metadata_written = False
     while True:
+        reset_policy = getattr(policy, "reset", None)
+        if callable(reset_policy):
+            reset_policy()
         safety = _safety_factory(deps)(profile_snapshot, mode=mode)
         guard = _guard_factory(deps)(
             arm_config_path=args.arm_config,
@@ -708,6 +728,8 @@ def _run_episode_hardware(
                 task=task,
                 profile_digest=profile_digest,
                 profile_authentication=profile_authentication,
+                checkpoint_path=checkpoint_path,
+                checkpoint_digest=checkpoint_digest,
             )
             print(f"jsonl_path={log_path}", file=deps.output())
             if mode == "shadow" and args.dummy_hold:
@@ -1265,6 +1287,8 @@ def _write_rollout_metadata(
     task: str,
     profile_digest: str,
     profile_authentication: str,
+    checkpoint_path: str | None,
+    checkpoint_digest: str | None,
 ) -> None:
     row = {
         "event": "rollout_metadata",
@@ -1273,10 +1297,12 @@ def _write_rollout_metadata(
         "task": task,
         "profile_digest": profile_digest,
         "profile_authentication": profile_authentication,
+        "checkpoint": checkpoint_path,
+        "checkpoint_digest": checkpoint_digest,
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
+        with path.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
             handle.flush()
     except Exception as exc:

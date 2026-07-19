@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import csv
 from dataclasses import dataclass
+import hashlib
 from io import StringIO
 import json
 import math
@@ -83,6 +84,29 @@ class TrialManifest:
 class ReportPaths:
     json_path: Path
     csv_path: Path
+
+
+@dataclass(frozen=True)
+class CheckpointIdentity:
+    path: Path
+    digest: str
+
+
+def checkpoint_identity(path: Path | str) -> CheckpointIdentity:
+    """Bind the accepted checkpoint layout to its resolved path and weights."""
+
+    checkpoint = Path(path).expanduser().resolve()
+    weights = checkpoint / "model.safetensors"
+    if weights.is_symlink() or not weights.is_file():
+        raise ValueError("Checkpoint model.safetensors is missing or not a regular file")
+    digest = hashlib.sha256()
+    try:
+        with weights.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError(f"Checkpoint model.safetensors cannot be read: {exc}") from exc
+    return CheckpointIdentity(path=checkpoint, digest=digest.hexdigest())
 
 
 @dataclass(frozen=True)
@@ -350,7 +374,13 @@ def _source_paths(value: object) -> tuple[str, ...]:
 def _validate_trial_audits(trial: Trial) -> None:
     terminal_rows: list[_TerminalAudit] = []
     for source in trial.source_jsonl_paths:
-        terminal_rows.extend(_read_terminal_audits(Path(source)))
+        terminal_rows.extend(
+            _read_terminal_audits(
+                Path(source),
+                checkpoint=trial.checkpoint,
+                checkpoint_digest=trial.checkpoint_digest,
+            )
+        )
 
     attempts = sorted(row.attempt for row in terminal_rows)
     expected_attempts = list(range(1, trial.attempts_used + 1))
@@ -390,12 +420,18 @@ def _validate_trial_audits(trial: Trial) -> None:
         )
 
 
-def _read_terminal_audits(path: Path) -> list[_TerminalAudit]:
+def _read_terminal_audits(
+    path: Path,
+    *,
+    checkpoint: str,
+    checkpoint_digest: str,
+) -> list[_TerminalAudit]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"Cannot read source JSONL at {path}: {exc}") from exc
     terminal_rows: list[_TerminalAudit] = []
+    metadata_rows: list[Mapping[str, object]] = []
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             raise ValueError(f"Source JSONL {path}:{line_number} is blank")
@@ -409,6 +445,9 @@ def _read_terminal_audits(path: Path) -> list[_TerminalAudit]:
             raise ValueError(
                 f"Source JSONL {path}:{line_number} must contain an object"
             )
+        if row.get("event") == "rollout_metadata":
+            metadata_rows.append(row)
+            continue
         if row.get("event") not in ("terminal", "terminal_fallback"):
             continue
         attempt = _integer(row.get("attempt"), "source JSONL terminal attempt")
@@ -434,6 +473,15 @@ def _read_terminal_audits(path: Path) -> list[_TerminalAudit]:
                 ),
             )
         )
+    if len(metadata_rows) != 1:
+        raise ValueError("source JSONL must contain exactly one rollout_metadata row")
+    metadata = metadata_rows[0]
+    if metadata.get("profile_authentication") != "checkpoint-sidecar-verified":
+        raise ValueError("source JSONL does not contain an authenticated checkpoint")
+    if metadata.get("checkpoint") != checkpoint:
+        raise ValueError("source JSONL checkpoint does not match the manifest")
+    if metadata.get("checkpoint_digest") != checkpoint_digest:
+        raise ValueError("source JSONL checkpoint digest does not match the manifest")
     return terminal_rows
 
 

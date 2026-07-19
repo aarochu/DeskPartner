@@ -308,6 +308,19 @@ class LeRobotPolicyAdapter:
         backend = _load_lerobot_backend(bundle.path, device)
         return cls(bundle=bundle, device=device, backend=backend)
 
+    def reset(self) -> None:
+        """Clear policy and saved-processor episode state before a new trial."""
+
+        for label, component in (
+            ("policy", self.policy),
+            ("preprocessor", self.preprocessor),
+            ("postprocessor", self.postprocessor),
+        ):
+            try:
+                _reset_if_supported(component)
+            except Exception as exc:
+                raise RuntimeError(f"{label} reset failed: {exc}") from exc
+
     def predict(self, observation: RolloutObservation) -> np.ndarray:
         try:
             state = np.array(

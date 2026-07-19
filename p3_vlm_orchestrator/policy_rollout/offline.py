@@ -165,6 +165,7 @@ def evaluate_checkpoint(
     adapter = make_adapter(bundle, device)
     selected_episodes: list[int] = []
     selected_set: set[int] = set()
+    active_episode: int | None = None
     results: list[OfflinePrediction] = []
 
     for sample_index in range(len(dataset)):
@@ -181,6 +182,12 @@ def evaluate_checkpoint(
                 continue
             selected_episodes.append(episode_index)
             selected_set.add(episode_index)
+
+        if episode_index != active_episode:
+            reset = getattr(adapter, "reset", None)
+            if callable(reset):
+                reset()
+            active_episode = episode_index
 
         task = sample.get("task")
         if task != bundle.task:

@@ -28,11 +28,10 @@ DATASET=/absolute/path/to/finalized/lerobot-dataset
 Person 3 must provide the complete immutable checkpoint directory, including
 `model.safetensors`, `config.json`, `preprocessor_config.json`,
 `postprocessor_config.json`, and `rebot_training_profile.json`. Record the
-absolute checkpoint path and a SHA-256 identity for its weights in each trial
-manifest:
+resolved checkpoint path and the `checkpoint_digest` printed by the shared
+identity check in each trial manifest:
 
 ```zsh
-shasum -a 256 "$CHECKPOINT/model.safetensors"
 ./p3_vlm_orchestrator/08_policy_rollout.command inspect --checkpoint "$CHECKPOINT"
 ```
 
@@ -100,7 +99,7 @@ is one placement after its final allowed outcome, not each attempt.
 For each placement, keep the physical e-stop operator present and run:
 
 ```zsh
-LOG_PATH="$PWD/runs/policy/checkpoint-a-held-out-01.jsonl"
+LOG_PATH="$PWD/runs/policy/checkpoint-a-held-out-01.jsonl" # must not exist yet
 ./p3_vlm_orchestrator/08_policy_rollout.command live \
   --checkpoint "$CHECKPOINT" --speed-scale 0.10 --live \
   --episode --retry-on-failure --log-path "$LOG_PATH"
@@ -108,10 +107,13 @@ LOG_PATH="$PWD/runs/policy/checkpoint-a-held-out-01.jsonl"
 
 The keyboard controls are `s` for operator success, `f` for operator failure,
 and `q`, `x`, or Escape to stop. An operator failure may be retried once only
-after the program has disconnected, a person has manually reset the can and
-cleared the workspace, and the exact reset acknowledgement is entered. There
-is no automatic reset or motion. Safety faults, timeout, and stop are never
-retried.
+after the program has disconnected and a person has manually reset the can and
+cleared the workspace. The retry prompts require the exact reset phrase
+`I RESET THE CAN AND CLEARED THE WORKSPACE`, then both live acknowledgements
+`I HAVE AN E-STOP OPERATOR` and `WORKSPACE IS EMPTY` again. There is no
+automatic reset or motion. Safety faults, timeout, and stop are never retried.
+Use a fresh, non-existing log path for every placement; never append a new
+placement to an old JSONL.
 
 Create one read-only JSON manifest per checkpoint with exactly this envelope
 and trial schema. Include 10-15 trial objects; the abbreviated example shows
@@ -189,12 +191,13 @@ physical workspace calibration for this rig is supplied. Never invent values,
 bypass the guard, or weaken the check to make a run start.
 
 The adapter is generic across policies registered in the active LeRobot
-runtime and always restores their saved processors. The bundled LeRobot 0.4.4
-tree can describe SmolVLA, but this machine does not have its optional
-Transformers dependencies or the newer MolmoAct2 plugin. A real MolmoAct2
-checkpoint requires the official current LeRobot Python 3.12 runtime with its
-MolmoAct2 dependencies, normally on the GPU host. Generic loading does not mean
-missing local policy dependencies are supported.
+runtime and always restores their saved processors. The bundled Python 3.11 /
+LeRobot 0.4.4 runtime cannot execute MolmoAct2. It lacks the newer MolmoAct2
+plugin and dependencies. Gates A-D are therefore blocked for MolmoAct2 until
+the team validates one combined Python 3.12 runtime that contains both the
+MolmoAct2 policy stack and the ReBot hardware plugins, or implements and
+validates a remote inference transport. Neither route exists in this repo
+today. Generic loading does not mean missing policy dependencies work.
 
 ## Stop, rollback, and shutdown
 

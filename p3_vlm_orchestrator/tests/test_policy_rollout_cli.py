@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import StringIO
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -322,6 +323,7 @@ class PolicyRolloutCliTest(unittest.TestCase):
             profile_snapshot=self.profile,
         )
         self.bundle.path.mkdir()
+        (self.bundle.path / "model.safetensors").write_bytes(b"test weights")
         self.write_processor_configs(self.bundle.path)
 
     def dependencies(self, **overrides) -> CliDependencies:
@@ -539,6 +541,16 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertIs(runner_calls[0]["stop_requested"], keyboard.event)
         self.assertIn("actions_attempted=2", self.stdout.getvalue())
         self.assertIn("primary_fault=none", self.stdout.getvalue())
+        metadata = json.loads(
+            (self.root / "runs" / "policy" / "rollout.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        self.assertEqual(metadata["checkpoint"], str(self.bundle.path.resolve()))
+        self.assertEqual(
+            metadata["checkpoint_digest"],
+            hashlib.sha256(b"test weights").hexdigest(),
+        )
 
     def test_episode_default_has_no_retry_and_prints_attempt_metrics(self) -> None:
         robots: list[FakeRobot] = []
@@ -656,6 +668,53 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertTrue(all(robot.disconnect_count == 1 for robot in robots))
         self.assertIn("attempt=2", self.stdout.getvalue())
         self.assertIn("terminal_reason=operator_success", self.stdout.getvalue())
+
+    def test_each_live_episode_attempt_resets_policy_before_robot_use(self) -> None:
+        class StatefulPolicy:
+            def __init__(self) -> None:
+                self.state = 99
+                self.reset_calls = 0
+
+            def reset(self) -> None:
+                self.reset_calls += 1
+                self.state = 0
+
+        policy = StatefulPolicy()
+        states_at_attempt: list[int] = []
+        outcomes = ["operator_failure", "operator_success"]
+
+        class StatefulRunner:
+            def __init__(self, **kwargs) -> None:
+                self.policy = kwargs["policy"]
+                self.robot = kwargs["robot"]
+
+            def run_episode(self, *, attempt: int) -> EpisodeSummary:
+                states_at_attempt.append(self.policy.state)
+                self.policy.state += 1
+                self.robot.connect()
+                self.robot.disconnect()
+                return EpisodeSummary(attempt=attempt, terminal_reason=outcomes.pop(0))
+
+        def input_fn(prompt: str) -> str:
+            if "manual reset" in prompt.lower():
+                return MANUAL_RESET_PHRASE
+            return "I HAVE AN E-STOP OPERATOR" if "E-STOP" in prompt else "WORKSPACE IS EMPTY"
+
+        robots: list[FakeRobot] = []
+        status = main(
+            self.rollout_args() + ["--live", "--episode", "--retry-on-failure"],
+            dependencies=self.dependencies(
+                input_fn=input_fn,
+                policy_factory=lambda bundle, device: policy,
+                robot_factory=lambda **kwargs: robots.append(FakeRobot()) or robots[-1],
+                runner_factory=lambda **kwargs: StatefulRunner(**kwargs),
+            ),
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(policy.reset_calls, 2)
+        self.assertEqual(states_at_attempt, [0, 0])
+        self.assertEqual(len(robots), 2)
 
     def test_second_operator_failure_never_produces_a_third_attempt(self) -> None:
         robots: list[FakeRobot] = []
@@ -801,6 +860,8 @@ class PolicyRolloutCliTest(unittest.TestCase):
         metadata = json.loads(log_path.read_text().splitlines()[0])
         self.assertEqual(metadata["profile_digest"], canonical_profile_digest(self.profile))
         self.assertEqual(metadata["profile_authentication"], "standalone-untrusted")
+        self.assertIsNone(metadata["checkpoint"])
+        self.assertIsNone(metadata["checkpoint_digest"])
         self.assertNotIn("verified", metadata["profile_authentication"])
         self.assertEqual(robot.send_count, 0)
 
@@ -999,6 +1060,23 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertTrue(expected.is_file())
         self.assertIn(f"jsonl_path={expected}", self.stdout.getvalue())
+
+    def test_existing_rollout_log_is_refused_without_overwrite(self) -> None:
+        log_path = self.root / "runs" / "policy" / "rollout.jsonl"
+        log_path.parent.mkdir(parents=True)
+        log_path.write_text("existing audit\n", encoding="utf-8")
+        deps = self.dependencies(
+            input_fn=lambda prompt: (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+        )
+
+        status = main(self.rollout_args() + ["--live"], dependencies=deps)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(log_path.read_text(encoding="utf-8"), "existing audit\n")
 
     def test_shared_stop_event_set_after_preflight_prevents_policy_and_send(self) -> None:
         from p3_vlm_orchestrator.policy_rollout.runner import RolloutRunner
