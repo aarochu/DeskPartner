@@ -1,7 +1,7 @@
 # Rerun bounty progress (reBot / non-SO-101)
 
-**Prize:** $1,000 — Best end-to-end port of a non-SO-101 robot  
-**Goal:** Reproduce the full SO-101 Rerun data/learning loop on **reBot**, not just URDF or telemetry.
+**Prize focus:** $2,000 — Best example using the Rerun Query API
+**Goal:** Use Rerun Query API evidence to prepare a traceable reBot training dataset, while preserving the non-SO-101 end-to-end port.
 
 **Reference repo:** https://github.com/mission-robotics-ai/so100-hackathon  
 **Team gameplan:** `saturday_gameplan.md` (Person 5 = integration + bounty)  
@@ -19,6 +19,12 @@
 | Slice C — `record_episode` → `.rrd` | done (dry-run) | Fake episode → catalog + `.traj.npz` + frames |
 | Slice D — `query_dataset` | done | Tag filter + entity inspect via traj sidecar |
 | Slice D2 — **Rerun Query API** | done (dry-run) | `query_api_cli`: Server + `reader()` + goal-vs-position; see `QUERY_API.md` |
+| Query source lock and inventory | implemented; real acceptance pending | Four exact Hugging Face SHAs; expected 77 successes + 25 failures |
+| Canonical Query alignment and metrics | implemented; real acceptance pending | Segment-safe seven-joint action/state plus front/side camera evidence |
+| Label-blind quality evaluation | implemented; real acceptance pending | 61 calibration successes; 16 held-out successes; all 25 failures |
+| Deterministic report and manifest | integration in progress | Must checksum every artifact and exclude failures/`REVIEW` from selection |
+| Derivative fresh-load validation | integration in progress | Local-only until explicit publication approval |
+| Competition workflow CLI | implemented; 102-item run pending | `inventory`, `materialize`, `audit`, `evaluate`, `prepare`, `run`; no upload flag |
 | Slice E — `export_lerobot` | done (dry-run) | `robot_type=seeed_b601_dm_follower`, 7 joints, front/side |
 | Slice F — `replay_episode` | done (dry-run) | Fake replay OK; live follower TODO on venue |
 | Viewer Blueprint | done (synthetic) | Interactive recordings center both cameras, 3D reBot URDF, goal/position traces, and the time panel |
@@ -26,7 +32,7 @@
 | Demo video + 60s pitch | TODO | |
 | Off-site sync (RRDs / checkpoints) | TODO | |
 
-**Last updated:** 2026-07-18 — Query API CLI added (`rr.server.Server` + dataframe reader); dry-run green; live arm still TODO.
+**Last updated:** 2026-07-19 — competition quality-gate implementation underway. Unit boundaries are green, but the full 102-item run and derivative fresh-load are not yet recorded; do not present expected counts as measured results.
 
 **Pipeline flowchart:** see [`p5_rerun_port/README.md`](./p5_rerun_port/README.md#how-it-connects-flowchart) (GUI track vs Rerun bounty loop vs training).  
 **Query API docs:** [`p5_rerun_port/QUERY_API.md`](./p5_rerun_port/QUERY_API.md) — terminal CLI after recording (not inside the Rerun Viewer UI).
@@ -36,7 +42,7 @@
 | Prize | Status |
 |-------|--------|
 | $1k non-SO-101 port | Code + dry-run; live e2e TODO |
-| $2k Query API | Implemented: `query_api_cli` + docs (dry-run on fake `.rrd`) |
+| $2k Query API | Revision-locked quality gate implemented in stages; full 102-item acceptance and measured report still required |
 | $2k interesting Viewer | Purpose-built operator Blueprint implemented and synthetic `.rrd` verified; live Viewer rehearsal TODO |
 
 ---

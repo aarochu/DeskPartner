@@ -1,151 +1,130 @@
 # Hackathon submission and judge demo
 
-Use this as the short presentation layer. Detailed setup and safety procedures
-remain in `docs/Rerun_bounty_progress.md`, `docs/p5_rerun_port/README.md`, and
-`p3_vlm_orchestrator/PERSON4_RUNBOOK.md`.
-
 ## 60-second pitch
 
-> We ported the Rerun SO-101 learning loop to reBot, a different seven-joint
-> robot with Damiao motors, two named cameras, and an extra wrist-yaw degree of
-> freedom. One episode flows from joint, goal, camera, and URDF logging into a
-> local Rerun catalog; the Query API compares commanded and observed motion so
-> we can reject bad takes; selected episodes export in a reBot LeRobot v3
-> schema; and the same trajectory can be replayed or handed to our guarded
-> learned-policy runner. The important part is the loop, not a URDF screenshot:
-> collect, inspect, curate, export, and close the loop. Our checked-in evidence
-> proves that entire path with synthetic hardware. [Only after a successful
-> rehearsal: We also ran the same path on the physical reBot.] The result is a
-> reproducible non-SO-101 integration with auditable safety and data contracts.
+> Rerun is not just showing our robot. Its Query API inspects and aligns 102
+> revision-locked reBot demonstrations, compares commanded and observed
+> motion, transforms native failure recordings, and issues deterministic
+> `PASS`, `REVIEW`, or `REJECT` verdicts. We freeze thresholds using only the
+> first 80 percent of operator-approved successes, then reveal labels for 16
+> held-out successes and all 25 failures. Only operator-approved successes
+> with a Query `PASS` enter a checksummed LeRobot derivative that is fresh-load
+> validated before publication. We report misses honestly: telemetry is a
+> data-quality detector, not proof that the robot semantically completed a
+> grasp.
 
-Do not say the bracketed live sentence unless the live row in the evidence
-table below has been filled with a recording, command log, and outcome.
+## Evidence on screen
 
-## Prize-track mapping
+The four sources are pinned to exact Hugging Face revisions:
 
-| Track | Submission position | Evidence and remaining gate |
-|---|---|---|
-| Rerun non-SO-101 end-to-end port ($1k) | **Primary** | `p5_rerun_port` covers log, record, catalog/query, LeRobot export, and replay for a 7-DOF reBot. Synthetic path is documented green; physical end-to-end remains a required venue proof. |
-| Rerun Query API ($2k) | **Secondary** | `query_api_cli` uses the Rerun server/reader path for schema, entity reads, and goal-versus-position comparison. The tracked example is `docs/p5_rerun_port/examples/cans_query_report.md`; current proof is synthetic. |
-| Interesting Rerun Viewer ($2k) | **Additional submission** | Interactive recordings activate a purpose-built Blueprint with synchronized front/side cameras, the 3D reBot URDF, goal-versus-position traces, and the time panel in one operator view. Rehearse the real Viewer before claiming live use. |
+| Source | SHA | Count |
+|---|---|---:|
+| `Cornerf/rebot-can-sort-stage1-v1-smoke` | `74d1f300786d58b4f6f55e1798cbb1a1a48f5409` | 52 successes |
+| `Cornerf/rebot-two-can-recycle-v2-smoke` | `778d0bf5de1096a80b1cf355073e369faa1409da` | 25 successes |
+| `Cornerf/rebot-can-sort-stage1-v1-failed` | `4952b618a23f8f2e5b09f736cea0a490c62e57b4` | 19 failures |
+| `Cornerf/rebot-two-can-recycle-v2-failed` | `2d9ea53cf8f4835fcfc1656b23d56308696b3e5b` | 6 failures |
 
-## Evidence boundary
+Total: 102 unique items, comprising 77 successes and 25 failures. Show the
+measured report, not an expected accuracy. Name exact false positives and false
+negatives and retain per-label misses.
 
-| Capability | Synthetic evidence currently supported | Live evidence required before claiming it |
-|---|---|---|
-| reBot telemetry, cameras, goals, and URDF in Rerun | `log_rebot --fake --teleop`; tracked progress marks dry-run done | Saved live `.rrd` showing the physical seven-joint follower, both real cameras, and URDF |
-| Episode recording and catalog | `record_episode --fake`; dry-run `.rrd`, trajectory sidecar, frames, and catalog path documented | One clean physical can-to-zone episode with matching `.rrd`, metadata, trajectory, and camera frames |
-| Query API curation | Schema/entity/goal-vs-position commands and tracked example report | Run the same query against the physical episode and show the episode ID on screen |
-| Central Viewer workflow | The checked-in Blueprint and real synthetic `.rrd` put both cameras, the URDF, and tracking error in one layout | Open the physical episode with the Blueprint active and use it during collection/curation, not only as a final screenshot |
-| LeRobot export | Fallback export is documented green with reBot type, seven joints, `front`, then `side` | Load and validate an export made from the physical episode; record exact output path/revision |
-| Replay / close loop | `replay_episode --fake` is documented green | Physical replay only after a supervised rehearsal, clear workspace, e-stop operator, and conservative speed |
-| Learned autonomous pick | Guarded runner, offline/shadow/live gates, and tests exist | A real checkpoint must pass inspect, offline, shadow, and empty-workspace live gates before filming a can pick |
-| Training quality or success rate | Training/evaluation tooling exists | A real checkpoint plus held-out trial report; do not infer success from training loss or code tests |
-
-## Judge demo sequence
-
-### 1. State the evidence level (5 seconds)
-
-Say either “This is the reproducible synthetic pipeline” or “This is the live
-pipeline validated in rehearsal.” Never switch labels mid-demo.
-
-### 2. Show one complete synthetic episode (25 seconds)
-
-Run from the repository root. A timestamped dataset avoids reusing stale demo
-artifacts:
+## Rehearsed command
 
 ```bash
-export DEMO_DATASET="hackathon-demo-$(date -u +%Y%m%dT%H%M%SZ)"
-
-python -m p5_rerun_port.record_episode \
-  --fake --dataset "$DEMO_DATASET" \
-  --task "Pick up one can and place it in the taped sorting zone" \
-  --tag "Good episode" --seconds 5 --no-viewer
-
-rerun "recordings/$DEMO_DATASET/episode_01.rrd"
+./rebot_setup/vendor/rebot_lerobot/.venv/bin/python \
+  -m p5_rerun_port.query_challenge_cli run \
+  --config config/rerun_query_challenge.yaml \
+  --artifacts-root artifacts/rerun-query
 ```
 
-In Rerun, point out `follower/position`, `follower/goal`, the seven-joint arm,
-and both camera streams. If any entity is absent, stop and use the last
-rehearsed artifact without calling the new run successful.
+A verified run ends with:
 
-### 3. Query and curate (15 seconds)
+```text
+RUN_ID=<digest>
+REPORT_HTML=<absolute path>
+SELECTION_MANIFEST=<absolute path>
+DERIVATIVE_ROOT=<absolute path>
+```
+
+If those lines or checksum/fresh-load validation are absent, use the last
+verified report and do not claim a new run succeeded. The command is local-only
+and cannot upload.
+
+## 90-second judge script
+
+### 0–15 seconds — locked inventory
+
+Show `source-lock.json` and the four SHAs. Say: “These are 102 real labeled
+demonstrations: 77 successes and 25 failures. The original repositories are
+read-only.”
+
+### 15–35 seconds — Inspect, Align, Transform
+
+Open the report drill-down for one successful and one failed episode. Point to
+the segment identity, action timestamp, matched state/camera timestamps, and
+ages. Explain that native failure RRDs were transformed through Query API rows
+into the same seven-joint, two-camera canonical schema.
+
+### 35–55 seconds — Filter and Compare
+
+Filter the review queue by task and reason. Compare per-joint action/state
+error, zero-lag versus best-lag RMS, discontinuity, and camera coverage. Point
+to deterministic reason codes rather than an opaque composite score.
+
+### 55–75 seconds — Evaluate
+
+Show the frozen 41 + 20 calibration split, then the label-blind evaluation of
+11 + 5 held-out successes and 25 failures. Read the measured confusion matrix,
+precision, recall, F1, false-rejection rate, and at least one miss. Say:
+“`REVIEW` and `REJECT` predict questionable training data; labels were revealed
+only after verdict digests were frozen.”
+
+### 75–90 seconds — Prepare
+
+Open `selection-manifest.json`, its `selection_payload_digest`, and the fresh
+load validation. Show that every selected item is both an approved success and
+`PASS`, while every failure and `REVIEW` item is excluded. Name the intended
+destination `Cornerf/rebot-cansort-rerun-curated`; do not claim it was published
+until an exact remote revision has been refetched and verified.
+
+Close with: “Rerun decides which demonstrations are structurally sound,
+measures what it can detect, shows what it cannot, and prepares the exact data
+our policy trains on.”
+
+## Challenge coverage checklist
+
+- [ ] **Inspect:** schema, segments, timelines, joints, and cameras are visible.
+- [ ] **Align:** source/matched timestamps and bounded ages are visible.
+- [ ] **Filter:** task, verdict, reason, revision, and label filters work.
+- [ ] **Compare:** traces, lag, tasks, and success/failure distributions appear.
+- [ ] **Transform:** a native failed RRD has canonical provenance.
+- [ ] **Evaluate:** measured held-out results and exact misses are shown.
+- [ ] **Prepare:** checksummed manifest and derivative validation are shown.
+
+## Truthful evidence boundary
+
+- A `PASS` means the episode passed authenticated structural, telemetry,
+  timing, camera, and calibrated anomaly checks.
+- A `PASS` does not prove the can was grasped or placed correctly. Dropped
+  objects and other semantic failures may require operator/video evidence.
+- `REVIEW` is excluded from the first derivative; it is not silently treated as
+  a success.
+- Failed-source data is evaluation evidence only and can never enter training.
+- Do not quote a target accuracy. Quote the measured report, including misses.
+- Publication is staged and requires explicit approval after local validation.
+
+## Backup and smoke test
+
+Keep the last verified `report.html`, `report.md`, `selection-manifest.json`,
+`checksums.json`, and source/run digests ready. If live querying fails, show
+that backup without implying a new execution.
+
+The legacy synthetic command is only a fast compatibility smoke test:
 
 ```bash
-python -m p5_rerun_port.query_api_cli --dataset "$DEMO_DATASET" --schema
 python -m p5_rerun_port.query_api_cli \
-  --dataset "$DEMO_DATASET" --compare goal-vs-position
-python -m p5_rerun_port.query_dataset \
-  --dataset "$DEMO_DATASET" --tag "Good episode"
+  --dataset query-smoke --compare goal-vs-position
 ```
 
-Explain that goal-versus-position error exposes lag, dropped samples, or bad
-takes before they enter training.
-
-### 4. Export and close the synthetic loop (10 seconds)
-
-```bash
-python -m p5_rerun_port.export_lerobot \
-  --dataset "$DEMO_DATASET" --tag "Good episode" --fallback
-python -m p5_rerun_port.replay_episode \
-  --dataset "$DEMO_DATASET" --episode episode_01 \
-  --fake --speed 0.5 --no-viewer
-```
-
-Call this a schema/export and fake-replay proof. Do not call it physical replay.
-
-### 5. Optional live closeout
-
-Only use this after the full preflight below and one successful private
-rehearsal. Keep a dedicated operator on the physical e-stop/power cut.
-
-```bash
-./rebot_operator_kit/01_check_hardware.command
-./rebot_operator_kit/02_dual_camera_check.command
-
-python -m p5_rerun_port.log_rebot --teleop --seconds 20
-python -m p5_rerun_port.record_episode \
-  --dataset cans-live-demo \
-  --task "Pick up one can and place it in the taped sorting zone" \
-  --tag "Good episode"
-python -m p5_rerun_port.query_api_cli \
-  --dataset cans-live-demo --compare goal-vs-position
-python -m p5_rerun_port.export_lerobot \
-  --dataset cans-live-demo --tag "Good episode"
-```
-
-Physical replay is a separate safety decision. Do not improvise it during the
-judge session. If it was approved and rehearsed, use the documented command:
-
-```bash
-python -m p5_rerun_port.replay_episode \
-  --dataset cans-live-demo --episode episode_01 --speed 0.5
-```
-
-For a learned checkpoint, follow all four gates in
-`p3_vlm_orchestrator/PERSON4_RUNBOOK.md`; never jump directly to a can pick.
-
-## Preflight checklist
-
-- [ ] The presenter can identify every artifact as synthetic or live.
-- [ ] `git status --short` has no unexplained source changes; runtime recordings remain ignored.
-- [ ] `python -m p5_rerun_port.record_episode --help` and `python -m p5_rerun_port.query_api_cli --help` open successfully.
-- [ ] The timestamped synthetic sequence above has been rehearsed from a fresh dataset name.
-- [ ] Rerun opens the saved `.rrd`; both cameras, `follower/position`, and `follower/goal` are visible.
-- [ ] Query API schema and goal-versus-position comparison return for the same episode.
-- [ ] Export contains seven ordered joints and the `front`, then `side` image contract.
-- [ ] Demo screen recording, terminal font size, and backup artifact are ready.
-- [ ] Live only: hardware discovery and simultaneous camera checks pass immediately before the demo.
-- [ ] Live only: fixed cameras, lighting, taped zone, cables, and arm bases have not moved.
-- [ ] Live only: workspace is clear, follower is supported, and one person owns the physical e-stop/power cut.
-- [ ] Live only: no other process owns follower or leader serial ports.
-- [ ] Live only: one private full-path rehearsal produced a saved `.rrd` and command log.
-- [ ] Learned policy only: checkpoint identity, processor files, calibration/profile digest, offline, shadow, and empty-workspace live gates all pass.
-- [ ] Off-site copy of the chosen `.rrd`, export, checkpoint (if used), and demo video exists.
-
-## Failure fallback
-
-If live hardware, cameras, Rerun, or policy gating fails, stop motion and show
-the last verified synthetic `.rrd` plus the tracked query report. State the
-failure plainly. A reproducible dry-run with a clear live gap is stronger than
-an unsafe or mislabeled “live” claim.
+Never substitute that single synthetic comparison for the real 102-item,
+revision-locked, label-blind evaluation.

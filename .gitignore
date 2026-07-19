@@ -30,6 +30,7 @@ p5_training/configs/mixture_deskpartner.yaml
 # Rerun / LeRobot export artifacts (Person 5 bounty port)
 recordings/
 datasets/
+artifacts/
 *.rrd
 *.traj.npz
 

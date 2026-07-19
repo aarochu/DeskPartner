@@ -33,10 +33,37 @@ def _import_rr():
 
 
 def dataset_rrd_paths(recordings_dir: Path, dataset: str) -> list[Path]:
+    """Return canonical episode recordings registered by a metadata sidecar."""
     directory = recordings_dir / sanitize_name(dataset)
     if not directory.is_dir():
         return []
-    return sorted(directory.glob("*.rrd"))
+    return sorted(
+        path
+        for path in directory.glob("*.rrd")
+        if not path.stem.endswith("_replay")
+        and path.with_suffix(".meta.json").is_file()
+    )
+
+
+def rrd_paths_for_records(records: list[EpisodeRecord]) -> list[Path]:
+    """Resolve authoritative recording paths in catalog selection order."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for record in records:
+        if not record.rrd_path:
+            raise SystemExit(
+                f"FAIL: recording for {record.dataset}/{record.episode} has no rrd_path"
+            )
+        path = Path(record.rrd_path).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(
+                f"FAIL: recording for {record.dataset}/{record.episode} does not exist: {path}"
+            )
+        if path in seen:
+            raise SystemExit(f"FAIL: duplicate recording path selected: {path}")
+        seen.add(path)
+        paths.append(path)
+    return paths
 
 
 @contextmanager
@@ -182,11 +209,106 @@ class CompareResult:
         return lines
 
 
+@dataclass(frozen=True)
+class EpisodeSegmentIdentity:
+    """Catalog episode identity bound to the recording segment it must query."""
+
+    episode: str
+    segment_id: str
+
+
+def episode_segment_identity(record: EpisodeRecord) -> EpisodeSegmentIdentity:
+    """Build the segment identity emitted by ``takes.begin_recording`` for a record."""
+    episode = sanitize_name(record.episode)
+    rrd_stem = Path(record.rrd_path).stem
+    if not record.episode.strip() or episode != rrd_stem:
+        raise SystemExit(
+            "FAIL: catalog episode does not match its recording path: "
+            f"{record.episode!r} != {rrd_stem!r}"
+        )
+    return EpisodeSegmentIdentity(
+        episode=episode,
+        segment_id=f"{sanitize_name(record.dataset)}-{rrd_stem}",
+    )
+
+
+@dataclass(frozen=True)
+class AlignedVectorRows:
+    """Goal/state vectors paired from the same Query API dataframe rows."""
+
+    segment_ids: tuple[str, ...]
+    goal: np.ndarray
+    state: np.ndarray
+
+
+def _valid_segment_id(value: Any) -> str | None:
+    """Return a non-blank Rerun segment identifier, never a stringified null."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _finite_vector(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        vector = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if vector.ndim == 0:
+        vector = vector.reshape(1)
+    else:
+        vector = vector.reshape(-1)
+    if vector.size == 0 or not np.isfinite(vector).all():
+        return None
+    return vector
+
+
+def aligned_vector_rows(df, *, goal_column: str, state_column: str) -> AlignedVectorRows:
+    """Keep only finite goal/state vectors present together in one segment row."""
+    if "rerun_segment_id" not in df.columns:
+        raise SystemExit("FAIL: Query API dataframe has no rerun_segment_id column")
+
+    segments: list[str] = []
+    goals: list[np.ndarray] = []
+    states: list[np.ndarray] = []
+    expected_shape: tuple[int, ...] | None = None
+    rows = df[["rerun_segment_id", goal_column, state_column]].itertuples(
+        index=False, name=None
+    )
+    for segment_id, goal_value, state_value in rows:
+        segment = _valid_segment_id(segment_id)
+        if segment is None:
+            continue
+        goal = _finite_vector(goal_value)
+        state = _finite_vector(state_value)
+        if goal is None or state is None or goal.shape != state.shape:
+            continue
+        if expected_shape is None:
+            expected_shape = goal.shape
+        if goal.shape != expected_shape:
+            continue
+        segments.append(segment)
+        goals.append(goal)
+        states.append(state)
+
+    width = expected_shape[0] if expected_shape else 0
+    return AlignedVectorRows(
+        segment_ids=tuple(segments),
+        goal=np.asarray(goals, dtype=np.float64).reshape(len(goals), width),
+        state=np.asarray(states, dtype=np.float64).reshape(len(states), width),
+    )
+
+
 def compare_goal_vs_position(
     dataset_entry: Any,
     *,
     episode: str | None = None,
     timeline: str | None = None,
+    verified_identity: EpisodeSegmentIdentity | None = None,
 ) -> CompareResult:
     """Align follower/goal vs follower/position via Query API and score tracking error."""
     index = pick_timeline(dataset_entry, timeline)
@@ -209,26 +331,33 @@ def compare_goal_vs_position(
             f"df_columns={list(df.columns)[:20]}"
         )
 
-    pos = stack_scalar_column(df[pos_cols[0]])
-    goal = stack_scalar_column(df[goal_cols[0]])
-    if pos is None or goal is None:
-        raise SystemExit("FAIL: empty position/goal series from Query API")
-
-    n = min(len(pos), len(goal))
-    pos, goal = pos[:n], goal[:n]
-    # Drop rows where either is all-nan
-    mask = ~(np.isnan(pos).all(axis=1) | np.isnan(goal).all(axis=1))
-    pos, goal = pos[mask], goal[mask]
-    if len(pos) == 0:
+    aligned = aligned_vector_rows(
+        df, goal_column=goal_cols[0], state_column=pos_cols[0]
+    )
+    if len(aligned.goal) == 0:
         raise SystemExit("FAIL: no overlapping non-null goal/position rows")
 
-    err = np.abs(goal - pos)
+    err = np.abs(aligned.goal - aligned.state)
     mean_abs = np.nanmean(err, axis=0)
     max_abs = np.nanmax(err, axis=0)
     rms = float(np.sqrt(np.nanmean(err**2)))
+    expected_segment_id = (
+        _valid_segment_id(verified_identity.segment_id)
+        if verified_identity is not None
+        else None
+    )
+    observed_segment_ids = [_valid_segment_id(value) for value in df["rerun_segment_id"]]
+    requested_episode_is_proven = (
+        episode is not None
+        and verified_identity is not None
+        and episode == verified_identity.episode
+        and expected_segment_id is not None
+        and all(segment_id is not None for segment_id in observed_segment_ids)
+        and set(observed_segment_ids) == {expected_segment_id}
+    )
     return CompareResult(
-        episode=episode or "all",
-        n_rows=len(pos),
+        episode=episode if requested_episode_is_proven else "all",
+        n_rows=len(aligned.goal),
         mean_abs_error=mean_abs,
         max_abs_error=max_abs,
         rms_error=rms,
@@ -252,8 +381,15 @@ def episodes_for_query(
     )
 
 
-def schema_report(dataset: str, recordings_dir: Path = DEFAULT_RECORDINGS_DIR) -> str:
-    with open_dataset_server(dataset, recordings_dir=recordings_dir) as ds:
+def schema_report(
+    dataset: str,
+    recordings_dir: Path = DEFAULT_RECORDINGS_DIR,
+    *,
+    rrd_paths: list[Path] | None = None,
+) -> str:
+    with open_dataset_server(
+        dataset, recordings_dir=recordings_dir, rrd_paths=rrd_paths
+    ) as ds:
         schema = list_schema(ds)
         timeline = pick_timeline(ds)
         lines = [

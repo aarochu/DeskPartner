@@ -10,6 +10,7 @@ import pytest
 from p5_rerun_port.config import resolve_urdf_path
 from p5_rerun_port.constants import FOLLOWER, JOINT_NAMES, REPO_ROOT
 from p5_rerun_port.rerun_query import (
+    EpisodeSegmentIdentity,
     compare_goal_vs_position,
     list_schema,
     open_dataset_server,
@@ -91,7 +92,7 @@ def test_query_api_compares_small_real_recording(tmp_path: Path) -> None:
     import rerun as rr
 
     rrd_path = tmp_path / "tracking.rrd"
-    rec = rr.RecordingStream("deskpartner-query-test")
+    rec = rr.RecordingStream("deskpartner-query-test", recording_id="tracking-segment")
     rec.set_sinks(rr.FileSink(str(rrd_path)))
     offsets = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.float64)
     for frame in range(3):
@@ -103,7 +104,13 @@ def test_query_api_compares_small_real_recording(tmp_path: Path) -> None:
 
     with open_dataset_server("tracking", rrd_paths=[rrd_path]) as dataset:
         schema = list_schema(dataset)
-        result = compare_goal_vs_position(dataset, episode="episode_smoke")
+        result = compare_goal_vs_position(
+            dataset,
+            episode="episode_smoke",
+            verified_identity=EpisodeSegmentIdentity(
+                episode="episode_smoke", segment_id="tracking-segment"
+            ),
+        )
 
     assert f"/{FOLLOWER}/position" in schema["entities"]
     assert f"/{FOLLOWER}/goal" in schema["entities"]
