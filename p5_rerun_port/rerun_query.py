@@ -33,10 +33,37 @@ def _import_rr():
 
 
 def dataset_rrd_paths(recordings_dir: Path, dataset: str) -> list[Path]:
+    """Return canonical episode recordings registered by a metadata sidecar."""
     directory = recordings_dir / sanitize_name(dataset)
     if not directory.is_dir():
         return []
-    return sorted(directory.glob("*.rrd"))
+    return sorted(
+        path
+        for path in directory.glob("*.rrd")
+        if not path.stem.endswith("_replay")
+        and path.with_suffix(".meta.json").is_file()
+    )
+
+
+def rrd_paths_for_records(records: list[EpisodeRecord]) -> list[Path]:
+    """Resolve authoritative recording paths in catalog selection order."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for record in records:
+        if not record.rrd_path:
+            raise SystemExit(
+                f"FAIL: recording for {record.dataset}/{record.episode} has no rrd_path"
+            )
+        path = Path(record.rrd_path).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(
+                f"FAIL: recording for {record.dataset}/{record.episode} does not exist: {path}"
+            )
+        if path in seen:
+            raise SystemExit(f"FAIL: duplicate recording path selected: {path}")
+        seen.add(path)
+        paths.append(path)
+    return paths
 
 
 @contextmanager
@@ -182,6 +209,68 @@ class CompareResult:
         return lines
 
 
+@dataclass(frozen=True)
+class AlignedVectorRows:
+    """Goal/state vectors paired from the same Query API dataframe rows."""
+
+    segment_ids: tuple[str, ...]
+    goal: np.ndarray
+    state: np.ndarray
+
+
+def _finite_vector(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        vector = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if vector.ndim == 0:
+        vector = vector.reshape(1)
+    else:
+        vector = vector.reshape(-1)
+    if vector.size == 0 or not np.isfinite(vector).all():
+        return None
+    return vector
+
+
+def aligned_vector_rows(df, *, goal_column: str, state_column: str) -> AlignedVectorRows:
+    """Keep only finite goal/state vectors present together in one segment row."""
+    if "rerun_segment_id" not in df.columns:
+        raise SystemExit("FAIL: Query API dataframe has no rerun_segment_id column")
+
+    segments: list[str] = []
+    goals: list[np.ndarray] = []
+    states: list[np.ndarray] = []
+    expected_shape: tuple[int, ...] | None = None
+    rows = df[["rerun_segment_id", goal_column, state_column]].itertuples(
+        index=False, name=None
+    )
+    for segment_id, goal_value, state_value in rows:
+        if segment_id is None:
+            continue
+        goal = _finite_vector(goal_value)
+        state = _finite_vector(state_value)
+        if goal is None or state is None or goal.shape != state.shape:
+            continue
+        if expected_shape is None:
+            expected_shape = goal.shape
+        if goal.shape != expected_shape:
+            continue
+        segments.append(str(segment_id))
+        goals.append(goal)
+        states.append(state)
+
+    width = expected_shape[0] if expected_shape else 0
+    return AlignedVectorRows(
+        segment_ids=tuple(segments),
+        goal=np.asarray(goals, dtype=np.float64).reshape(len(goals), width),
+        state=np.asarray(states, dtype=np.float64).reshape(len(states), width),
+    )
+
+
 def compare_goal_vs_position(
     dataset_entry: Any,
     *,
@@ -209,26 +298,25 @@ def compare_goal_vs_position(
             f"df_columns={list(df.columns)[:20]}"
         )
 
-    pos = stack_scalar_column(df[pos_cols[0]])
-    goal = stack_scalar_column(df[goal_cols[0]])
-    if pos is None or goal is None:
-        raise SystemExit("FAIL: empty position/goal series from Query API")
-
-    n = min(len(pos), len(goal))
-    pos, goal = pos[:n], goal[:n]
-    # Drop rows where either is all-nan
-    mask = ~(np.isnan(pos).all(axis=1) | np.isnan(goal).all(axis=1))
-    pos, goal = pos[mask], goal[mask]
-    if len(pos) == 0:
+    aligned = aligned_vector_rows(
+        df, goal_column=goal_cols[0], state_column=pos_cols[0]
+    )
+    if len(aligned.goal) == 0:
         raise SystemExit("FAIL: no overlapping non-null goal/position rows")
 
-    err = np.abs(goal - pos)
+    err = np.abs(aligned.goal - aligned.state)
     mean_abs = np.nanmean(err, axis=0)
     max_abs = np.nanmax(err, axis=0)
     rms = float(np.sqrt(np.nanmean(err**2)))
+    observed_segment_ids = {
+        str(segment_id)
+        for segment_id in df["rerun_segment_id"]
+        if segment_id is not None
+    }
+    requested_episode_has_one_segment = len(observed_segment_ids) == 1
     return CompareResult(
-        episode=episode or "all",
-        n_rows=len(pos),
+        episode=episode if episode and requested_episode_has_one_segment else "all",
+        n_rows=len(aligned.goal),
         mean_abs_error=mean_abs,
         max_abs_error=max_abs,
         rms_error=rms,
@@ -252,8 +340,15 @@ def episodes_for_query(
     )
 
 
-def schema_report(dataset: str, recordings_dir: Path = DEFAULT_RECORDINGS_DIR) -> str:
-    with open_dataset_server(dataset, recordings_dir=recordings_dir) as ds:
+def schema_report(
+    dataset: str,
+    recordings_dir: Path = DEFAULT_RECORDINGS_DIR,
+    *,
+    rrd_paths: list[Path] | None = None,
+) -> str:
+    with open_dataset_server(
+        dataset, recordings_dir=recordings_dir, rrd_paths=rrd_paths
+    ) as ds:
         schema = list_schema(ds)
         timeline = pick_timeline(ds)
         lines = [

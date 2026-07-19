@@ -24,13 +24,22 @@ from p5_rerun_port.rerun_query import (
     open_dataset_server,
     pick_timeline,
     reader_to_pandas,
+    rrd_paths_for_records,
     schema_report,
     stack_scalar_column,
 )
 
 
-def _inspect_entity_via_query(dataset: str, entity: str, recordings_dir: Path, timeline: str | None) -> None:
-    with open_dataset_server(dataset, recordings_dir=recordings_dir) as ds:
+def _inspect_entity_via_query(
+    dataset: str,
+    entity: str,
+    recordings_dir: Path,
+    timeline: str | None,
+    rrd_paths: list[Path],
+) -> None:
+    with open_dataset_server(
+        dataset, recordings_dir=recordings_dir, rrd_paths=rrd_paths
+    ) as ds:
         index = pick_timeline(ds, timeline)
         variants = [entity, entity.strip("/"), f"/{entity.strip('/')}"]
         view = ds.filter_contents(variants)
@@ -96,6 +105,9 @@ def main(argv: list[str] | None = None) -> int:
         recordings_dir=args.recordings_dir,
         catalog_path=args.catalog,
     )
+    if (args.episode or args.tag) and not rows:
+        raise SystemExit("FAIL: no catalog episodes match the requested --episode/--tag filter")
+    rrd_paths = rrd_paths_for_records(rows)
     print("=== catalog (local metadata) ===")
     _print_table(rows)
     report_lines.append("## Catalog episodes")
@@ -108,12 +120,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"| {e.dataset} | {e.episode} | {e.tag} | {e.n_frames} | {e.duration_s:.1f} | {e.task} |"
             )
     else:
-        report_lines.append("_No catalog rows (Query API can still open .rrd files by dataset folder)._")
+        report_lines.append("_No catalog rows selected._")
     report_lines.append("")
 
     if args.schema:
         print("=== Query API schema ===")
-        text = schema_report(args.dataset, args.recordings_dir)
+        text = schema_report(
+            args.dataset, args.recordings_dir, rrd_paths=rrd_paths
+        )
         print(text)
         report_lines.append("## Schema")
         report_lines.append("```")
@@ -123,14 +137,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.entity:
         print("=== Query API entity series ===")
-        _inspect_entity_via_query(args.dataset, args.entity, args.recordings_dir, args.timeline)
+        _inspect_entity_via_query(
+            args.dataset,
+            args.entity,
+            args.recordings_dir,
+            args.timeline,
+            rrd_paths,
+        )
         report_lines.append(f"## Entity `{args.entity}`")
         report_lines.append("Inspected via `dataset.filter_contents(...).reader(...).to_pandas()`.")
         report_lines.append("")
 
     if args.compare == "goal-vs-position":
         print("=== Query API compare: goal vs position ===")
-        with open_dataset_server(args.dataset, recordings_dir=args.recordings_dir) as ds:
+        with open_dataset_server(
+            args.dataset, recordings_dir=args.recordings_dir, rrd_paths=rrd_paths
+        ) as ds:
             result = compare_goal_vs_position(
                 ds, episode=args.episode, timeline=args.timeline
             )
@@ -150,7 +172,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.schema and not args.entity and not args.compare:
         # Default: schema snapshot so a bare invoke still exercises Query API
         print("=== Query API schema (default) ===")
-        text = schema_report(args.dataset, args.recordings_dir)
+        text = schema_report(
+            args.dataset, args.recordings_dir, rrd_paths=rrd_paths
+        )
         print(text)
         report_lines.append("## Schema")
         report_lines.append("```")
