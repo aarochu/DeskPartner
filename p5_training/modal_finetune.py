@@ -184,7 +184,8 @@ if modal is not None:
         volumes={"/ckpts": ckpt_vol, "/data": data_vol},
         # HF_TOKEN for pulling the private dataset from the Hub (never in code/logs).
         # hf-write is the known-good token (read+write access to Cornerf repos).
-        secrets=[modal.Secret.from_name("hf-write")],
+        # wandb secret (WANDB_API_KEY) powers the live loss dashboard.
+        secrets=[modal.Secret.from_name("hf-write"), modal.Secret.from_name("wandb")],
     )
     def train(argv: list[str], exp_name: str) -> dict:
         """Run `lerobot-train` for MolmoAct2; checkpoints land in /ckpts volume."""

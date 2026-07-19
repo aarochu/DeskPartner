@@ -2,7 +2,7 @@
 # Docs: https://huggingface.co/docs/lerobot/main/en/molmoact2
 # Consumed by p5_training/modal_finetune.py -> build_train_argv().
 
-exp_name: rebot_52ep_molmoact2
+exp_name: rebot_merged77_molmoact2
 
 # Warm-start checkpoint:
 #   allenai/MolmoAct2                     -> generic base, fresh processor from our
@@ -14,8 +14,8 @@ base_checkpoint: allenai/MolmoAct2
 
 # Dataset — private HF repo, pulled on Modal via the 'huggingface' secret.
 # Keep the revision pinned so every run is reproducible.
-dataset_repo_id: Cornerf/rebot-can-sort-stage1-v1-smoke
-dataset_revision: 74d1f300786d58b4f6f55e1798cbb1a1a48f5409  # 52 episodes / 36,729 frames
+dataset_repo_id: Cornerf/rebot-cansort-recycle-merged
+dataset_revision: 9446607fe0815f810a0c8ad92a5d4cdf4c32ece3  # merged: 77 episodes / 51,207 frames (can-sort + two-can-recycle)
 
 finetune:
   mode: action_expert_only    # action_expert_only | lora   (NEVER full)
@@ -23,26 +23,27 @@ finetune:
 
 policy:
   control_mode: "absolute joint pose"   # reBot teleop records joint angles
-  setup_type: "single rebot b601 arm sorting cans on a desk"
+  setup_type: "single rebot b601 arm sorting and recycling cans on a desk"
   image_keys: ["observation.images.front", "observation.images.side"]
   chunk_size: 10
   n_action_steps: 10
   num_flow_timesteps: 8
 
 train:
-  steps: 6000                 # 52 demos; raise once we see the loss curve
-  batch_size: 16              # fits A100-40GB for action-expert-only
+  steps: 8000                 # 77 demos; raise once we see the loss curve
+  batch_size: 8               # safe for L4 (24GB) action-expert-only
   num_workers: 4
   save_freq: 1000
 
 normalization: mean_std       # mean_std (no preprocessing) | quantile (needs augment step)
 
 # Modal
-gpu: A100-40GB                # override via DESKPARTNER_MODAL_GPU env
+gpu: L4                       # 24GB, no payment method; override via DESKPARTNER_MODAL_GPU env
 wall_clock_timeout_s: 21600   # 6h hard stop
 
 wandb:
-  enable: false               # set true + project/entity to log the loss curve
+  enable: true                # live loss dashboard (needs the 'wandb' Modal secret)
+  project: deskpartner-momo
 
 notes: |
   MolmoAct2 large model -> cloud A100/H100 only (never local GPU; that's SmolVLA's).
