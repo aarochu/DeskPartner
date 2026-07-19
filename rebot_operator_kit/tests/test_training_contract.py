@@ -370,6 +370,36 @@ class SessionHomeReturnTest(unittest.TestCase):
         camera.read_latest.assert_called_once_with(max_age_ms=500)
         camera.async_read.assert_not_called()
 
+    def test_real_wrist_camera_jitter_burst_recovers_without_killing_take(self) -> None:
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        camera = SimpleNamespace(
+            latest_timestamp=0.0,
+            read_latest=Mock(return_value=frame),
+            async_read=Mock(side_effect=AssertionError("blocking camera read must not run")),
+        )
+        telemetry: dict[str, object] = {}
+        robot = SimpleNamespace(cameras={"side": camera})
+
+        # The live failure reached 318.896 ms after three consecutive samples.
+        # Every frame remained inside the camera's bounded 500 ms contract and
+        # must be accepted long enough for the producer thread to recover.
+        for age_s in (0.251, 0.285, 0.318896):
+            with patch.object(controlled_record.time, "perf_counter", return_value=age_s):
+                observation = controlled_record.read_latest_camera_observation(
+                    robot, telemetry
+                )
+            self.assertIs(observation["side"], frame)
+
+        self.assertEqual(telemetry["side"]["status"], "transient_jitter_accepted")
+        self.assertEqual(telemetry["side"]["consecutive_jitter_samples"], 3)
+
+        camera.latest_timestamp = 1.0
+        with patch.object(controlled_record.time, "perf_counter", return_value=1.005):
+            controlled_record.read_latest_camera_observation(robot, telemetry)
+        self.assertEqual(telemetry["side"]["status"], "fresh")
+        self.assertEqual(telemetry["side"]["consecutive_jitter_samples"], 0)
+        camera.async_read.assert_not_called()
+
     def test_persistent_camera_staleness_fails_without_blocking_motor_loop(self) -> None:
         frame = np.zeros((2, 3, 3), dtype=np.uint8)
         camera = SimpleNamespace(
@@ -380,12 +410,12 @@ class SessionHomeReturnTest(unittest.TestCase):
         telemetry: dict[str, object] = {}
         robot = SimpleNamespace(cameras={"side": camera})
         with patch.object(controlled_record.time, "perf_counter", return_value=0.300):
-            controlled_record.read_latest_camera_observation(robot, telemetry)
-            controlled_record.read_latest_camera_observation(robot, telemetry)
-            with self.assertRaisesRegex(TimeoutError, "3 consecutive samples"):
+            for _ in range(controlled_record.CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES):
+                controlled_record.read_latest_camera_observation(robot, telemetry)
+            with self.assertRaisesRegex(TimeoutError, "9 consecutive samples"):
                 controlled_record.read_latest_camera_observation(robot, telemetry)
         self.assertEqual(telemetry["side"]["status"], "sustained_stale")
-        self.assertEqual(camera.read_latest.call_count, 3)
+        self.assertEqual(camera.read_latest.call_count, 9)
         camera.async_read.assert_not_called()
 
     def test_capture_inverts_driver_directions_and_reset_returns_home(self) -> None:

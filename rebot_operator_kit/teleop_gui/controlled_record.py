@@ -76,12 +76,14 @@ from lerobot_teleoperator_rebot_arm_102 import (
 
 # Camera buffers are sampled without waiting so the 30 FPS image clock cannot
 # throttle the motor loop. A frame up to 250 ms old is normally fresh. macOS
-# scheduling/USB jitter may briefly exceed that, so at most two consecutive
-# samples may use a frame up to 500 ms old. A third consecutive jitter sample,
-# or any frame older than 500 ms, fails closed as a stale/frozen camera.
+# scheduling/USB jitter may briefly exceed that. At the 30 FPS dataset clock,
+# allow up to eight consecutive samples in this bounded 250-500 ms jitter band;
+# this covers the roughly 320 ms wrist-camera stalls observed on macOS without
+# coupling camera reads back into the motor loop. A ninth consecutive jitter
+# sample, or any frame older than 500 ms, fails closed as a stale/frozen camera.
 CAMERA_FRESH_AGE_MS = 250.0
 CAMERA_JITTER_MAX_AGE_MS = 500
-CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES = 2
+CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES = 8
 
 
 def parse_args() -> argparse.Namespace:
