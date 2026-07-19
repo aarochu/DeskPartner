@@ -6,10 +6,12 @@ Port of the [so100-hackathon](https://github.com/mission-robotics-ai/so100-hacka
 **Code package:** [`../../p5_rerun_port/`](../../p5_rerun_port/)
 
 ```text
-log_rebot → record_episode (.rrd) → query_dataset → export_lerobot → replay_episode
+log_rebot → record_episode (.rrd) → Query API refine → export_lerobot → replay_episode
 ```
 
 Leaves `p4_data_collection` (native LeRobot record) and `rebot_operator_kit` untouched. This package is the **Rerun → catalog → LeRobot v3 → replay** product shape — a **parallel** bounty path that shares hardware/config with the operator GUI track.
+
+**Query API (post-record):** step-by-step in [`QUERY_API.md`](./QUERY_API.md) — terminal CLI `python -m p5_rerun_port.query_api_cli` (not inside the Rerun Viewer; Viewer is optional for watching `.rrd` files).
 
 ## How it connects (flowchart)
 
@@ -39,7 +41,7 @@ flowchart TB
     R0["log_rebot<br/>joints + cams + URDF"]
     R1["record_episode<br/>.rrd + tag + frames"]
     R2["Local catalog<br/>catalog.json · .meta · .traj.npz"]
-    R3["query_dataset<br/>list / filter / inspect"]
+    R3["Query API refine<br/>Server + reader / compare"]
     R4["export_lerobot<br/>LeRobot v3 reBot schema"]
     R5["replay_episode<br/>follower/goal on arm"]
     R0 --> R1 --> R2 --> R3 --> R4 --> R5
@@ -85,11 +87,12 @@ python -m p5_rerun_port.record_episode \
   --fake --dataset cans --task "Pick one can and place in taped zone" \
   --tag "Good episode" --seconds 5 --no-viewer
 
-# 3) Query / curate
-python -m p5_rerun_port.query_dataset --dataset cans
+# 3) Query / curate — Rerun Query API (after recording stops)
+python -m p5_rerun_port.query_api_cli --dataset cans --schema
+python -m p5_rerun_port.query_api_cli --dataset cans --entity follower/position
+python -m p5_rerun_port.query_api_cli --dataset cans --compare goal-vs-position
+# sidecar catalog listing still available:
 python -m p5_rerun_port.query_dataset --dataset cans --tag "Good episode"
-python -m p5_rerun_port.query_dataset --dataset cans --episode episode_01 \
-  --entity follower/position
 
 # 4) Export → LeRobot v3-shaped folder (reBot schema)
 python -m p5_rerun_port.export_lerobot --dataset cans --tag "Good episode" --fallback

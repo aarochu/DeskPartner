@@ -58,9 +58,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tag", default=None)
     ap.add_argument("--episode", default=None)
     ap.add_argument("--entity", default=None, help="Inspect traj for this entity (e.g. follower/position)")
+    ap.add_argument(
+        "--rerun-api",
+        action="store_true",
+        help="Use Rerun Query API (rr.server.Server + reader) instead of traj.npz sidecar",
+    )
     ap.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     ap.add_argument("--recordings-dir", type=Path, default=DEFAULT_RECORDINGS_DIR)
     args = ap.parse_args(argv)
+
+    if args.rerun_api:
+        if not args.dataset:
+            raise SystemExit("--rerun-api requires --dataset")
+        from p5_rerun_port.query_api_cli import main as query_api_main
+
+        api_argv = ["--dataset", args.dataset]
+        if args.tag:
+            api_argv += ["--tag", args.tag]
+        if args.episode:
+            api_argv += ["--episode", args.episode]
+        if args.entity:
+            api_argv += ["--entity", args.entity]
+        else:
+            api_argv += ["--schema"]
+        api_argv += ["--recordings-dir", str(args.recordings_dir), "--catalog", str(args.catalog)]
+        return query_api_main(api_argv)
 
     rows = query_episodes(
         dataset=args.dataset,
