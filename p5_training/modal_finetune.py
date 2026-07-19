@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -27,7 +28,7 @@ DEFAULT_TRAIN_CFG = ROOT / "p5_training" / "configs" / "molmoact2_single_arm.yam
 # ---------------------------------------------------------------------------
 # Config knobs (also overridable via mixture / train yaml)
 # ---------------------------------------------------------------------------
-GPU = "A100-40GB"  # change if Modal pool differs: "L4", "A10G", "H100", ...
+GPU = os.environ.get("DESKPARTNER_MODAL_GPU", "A100-40GB")  # cheap override for wiring tests, e.g. T4; default A100 for real training
 WALL_CLOCK_TIMEOUT_S = 6 * 60 * 60  # hard stop — do not eat all of Saturday night
 SAVE_INTERVAL_STEPS = 500
 MAX_STEPS = 5000  # small-data LoRA; raise only with more demos
