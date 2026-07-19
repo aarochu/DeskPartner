@@ -1,4 +1,5 @@
 .venv/
+.venv-lerobot/
 .venv-zed/
 pyzed-*.whl
 PyOpenGL*.whl
@@ -16,6 +17,7 @@ config/.env
 
 # Runtime / calibration artifacts
 runs/
+outputs/
 data/calibration/*.npy
 data/calibration/*.json
 data/calibration/*.png
