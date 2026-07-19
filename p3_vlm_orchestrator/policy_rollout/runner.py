@@ -20,6 +20,9 @@ from rebot_operator_kit.rollout.safety import SafetyDecision, SafetyGovernor
 
 
 EXPECTED_ACTION_DIMENSION = 7
+EPISODE_TIMEOUT_S = 30.0
+EPISODE_MAX_ACTIONS = 300
+_OPERATOR_VERDICTS = frozenset(("success", "failure"))
 
 
 class _StopEvent(Protocol):
@@ -44,6 +47,9 @@ class RunSummary:
     primary_fault_reason: str | None
     cleanup_fault_reason: str | None
     audit_fault_reason: str | None
+    attempt: int = 1
+    elapsed_seconds: float = 0.0
+    clamp_count: int = 0
 
     @property
     def actions_sent(self) -> int:
@@ -87,6 +93,7 @@ class RolloutRunner:
         monotonic_clock: Callable[[], float],
         stop_requested: Callable[[], bool] | _StopEvent,
         action_guard: ActionGuard | None = None,
+        operator_verdict: Callable[[], str | None] | None = None,
     ) -> None:
         if mode not in ("shadow", "live"):
             raise ValueError("Rollout mode must be exactly 'shadow' or 'live'")
@@ -100,6 +107,7 @@ class RolloutRunner:
         self.log_path = Path(log_path)
         self.monotonic_clock = monotonic_clock
         self.action_guard = action_guard
+        self.operator_verdict = operator_verdict
         self.stop_requested = (
             stop_requested if callable(stop_requested) else stop_requested.is_set
         )
@@ -107,9 +115,49 @@ class RolloutRunner:
     def run(self, max_cycles: int) -> RunSummary:
         """Run until the cycle limit, a stop request, or a fail-closed fault."""
 
+        return self._run(max_cycles=max_cycles, episode=None)
+
+    def run_episode(
+        self,
+        *,
+        attempt: int,
+        timeout_s: float = EPISODE_TIMEOUT_S,
+        max_actions: int = EPISODE_MAX_ACTIONS,
+    ) -> RunSummary:
+        """Run one human-verdict episode with fixed fail-closed bounds."""
+
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("Episode attempt must be a positive integer")
+        if not 0.0 < float(timeout_s) <= EPISODE_TIMEOUT_S:
+            raise ValueError("Episode timeout must be within (0, 30.0] seconds")
+        if (
+            isinstance(max_actions, bool)
+            or not isinstance(max_actions, int)
+            or not 1 <= max_actions <= EPISODE_MAX_ACTIONS
+        ):
+            raise ValueError("Episode action cap must be within [1, 300]")
+        if self.operator_verdict is None:
+            raise ValueError("Episode mode requires a nonblocking operator verdict source")
+        episode = (attempt, float(timeout_s), max_actions)
+        return self._run(max_cycles=None, episode=episode)
+
+    def _run(
+        self,
+        *,
+        max_cycles: int | None,
+        episode: tuple[int, float, int] | None,
+    ) -> RunSummary:
+        """Execute the shared one-step loop in bounded smoke or episode mode."""
+
         cycles_completed = 0
         actions_attempted = 0
         actions_confirmed = 0
+        clamp_count = 0
+        attempt = 1 if episode is None else episode[0]
+        elapsed_seconds = 0.0
+        episode_started_at = (
+            None if episode is None else self.monotonic_clock()
+        )
         terminal_reason = "max_cycles"
         primary_fault_reason: str | None = None
         cleanup_fault_reason: str | None = None
@@ -117,6 +165,30 @@ class RolloutRunner:
         phase = "audit log open"
         context = _CycleContext()
         log_file: IO[str] | None = None
+
+        def episode_boundary() -> str | None:
+            nonlocal elapsed_seconds
+
+            if episode is None or episode_started_at is None:
+                return None
+            checked_at = self.monotonic_clock()
+            elapsed_seconds = max(0.0, checked_at - episode_started_at)
+            if self.stop_requested():
+                return "stopped"
+            verdict = self.operator_verdict()
+            if self.stop_requested():
+                return "stopped"
+            if verdict is not None and verdict not in _OPERATOR_VERDICTS:
+                raise ValueError(f"Unsupported operator verdict: {verdict!r}")
+            if verdict == "success":
+                return "operator_success"
+            if verdict == "failure":
+                return "operator_failure"
+            if elapsed_seconds >= episode[1]:
+                return "timeout"
+            if self.mode == "live" and actions_confirmed >= episode[2]:
+                return "timeout"
+            return None
 
         def emit(event: str, *, monotonic_s: float | None = None) -> bool:
             nonlocal audit_fault_reason
@@ -131,6 +203,9 @@ class RolloutRunner:
                 context=context,
                 actions_attempted=actions_attempted,
                 actions_confirmed=actions_confirmed,
+                attempt=attempt,
+                elapsed_seconds=elapsed_seconds,
+                clamp_count=clamp_count,
                 terminal_reason=(terminal_reason if event == "terminal" else None),
                 primary_fault_reason=primary_fault_reason,
                 cleanup_fault_reason=cleanup_fault_reason,
@@ -150,7 +225,11 @@ class RolloutRunner:
                 context=context,
                 actions_attempted=actions_attempted,
                 actions_confirmed=actions_confirmed,
+                attempt=attempt,
+                elapsed_seconds=elapsed_seconds,
+                clamp_count=clamp_count,
                 fault_reason=audit_fault_reason,
+                episode_mode=episode is not None,
             )
             return False
 
@@ -169,12 +248,21 @@ class RolloutRunner:
                 phase = "connect"
                 self.robot.connect()
 
-                while cycles_completed < max_cycles:
+                while max_cycles is None or cycles_completed < max_cycles:
                     context = _CycleContext(cycle=cycles_completed)
+                    if episode is not None:
+                        phase = "episode boundary"
+                        boundary_reason = episode_boundary()
+                        if boundary_reason is not None:
+                            terminal_reason = boundary_reason
+                            emit(boundary_reason)
+                            break
                     phase = "stop check"
                     if self.stop_requested():
-                        terminal_reason = "stop_requested"
-                        emit("stop_requested")
+                        terminal_reason = (
+                            "stopped" if episode is not None else "stop_requested"
+                        )
+                        emit(terminal_reason)
                         break
 
                     phase = "observation"
@@ -204,10 +292,19 @@ class RolloutRunner:
                     ):
                         break
 
+                    if episode is not None:
+                        phase = "episode boundary"
+                        boundary_reason = episode_boundary()
+                        if boundary_reason is not None:
+                            terminal_reason = boundary_reason
+                            emit(boundary_reason)
+                            break
                     phase = "stop check"
                     if self.stop_requested():
-                        terminal_reason = "stop_requested"
-                        emit("stop_requested")
+                        terminal_reason = (
+                            "stopped" if episode is not None else "stop_requested"
+                        )
+                        emit(terminal_reason)
                         break
 
                     policy_observation = RolloutObservation(
@@ -273,8 +370,10 @@ class RolloutRunner:
 
                     phase = "stop check"
                     if self.stop_requested():
-                        terminal_reason = "stop_requested"
-                        emit("stop_requested")
+                        terminal_reason = (
+                            "stopped" if episode is not None else "stop_requested"
+                        )
+                        emit(terminal_reason)
                         break
 
                     if self.action_guard is not None:
@@ -305,6 +404,8 @@ class RolloutRunner:
                         safety_checked_at,
                         context.observation.captured_monotonic_s,
                     )
+                    if context.safety_result.clamped:
+                        clamp_count += 1
                     if not emit("safety", monotonic_s=safety_checked_at):
                         break
 
@@ -322,15 +423,36 @@ class RolloutRunner:
 
                     phase = "stop check"
                     if self.stop_requested():
-                        terminal_reason = "stop_requested"
-                        emit("stop_requested")
+                        terminal_reason = (
+                            "stopped" if episode is not None else "stop_requested"
+                        )
+                        emit(terminal_reason)
                         break
 
                     if self.mode == "live":
+                        if episode is not None:
+                            phase = "episode send boundary"
+                            boundary_reason = episode_boundary()
+                            if boundary_reason is not None:
+                                terminal_reason = boundary_reason
+                                emit(boundary_reason)
+                                break
                         if not emit("send_intent"):
                             break
+                        if episode is not None:
+                            phase = "episode send boundary"
+                            boundary_reason = episode_boundary()
+                            if boundary_reason is not None:
+                                terminal_reason = boundary_reason
+                                emit("send_cancelled")
+                                emit(boundary_reason)
+                                break
                         if self.stop_requested():
-                            terminal_reason = "stop_requested"
+                            terminal_reason = (
+                                "stopped"
+                                if episode is not None
+                                else "stop_requested"
+                            )
                             emit("send_cancelled")
                             break
 
@@ -358,6 +480,19 @@ class RolloutRunner:
                             emit("send_cancelled")
                             emit("fault")
                             break
+
+                        if episode is not None:
+                            phase = "episode final send boundary"
+                            boundary_reason = episode_boundary()
+                            if boundary_reason is not None:
+                                terminal_reason = boundary_reason
+                                emit(
+                                    "send_boundary_safety",
+                                    monotonic_s=send_checked_at,
+                                )
+                                emit("send_cancelled")
+                                emit(boundary_reason)
+                                break
 
                         actions_attempted += 1
                         phase = "send"
@@ -422,9 +557,31 @@ class RolloutRunner:
                 )
                 terminal_reason = "fault"
 
+            if episode is not None and episode_started_at is not None:
+                try:
+                    elapsed_seconds = max(
+                        0.0, self.monotonic_clock() - episode_started_at
+                    )
+                except Exception as exc:
+                    if primary_fault_reason is None:
+                        primary_fault_reason = (
+                            "episode final clock failed: "
+                            + self._exception_text(exc)
+                        )
+                    terminal_reason = "fault"
+            if episode is not None and (
+                terminal_reason == "fault"
+                or primary_fault_reason is not None
+                or cleanup_fault_reason is not None
+                or audit_fault_reason is not None
+            ):
+                terminal_reason = "safety_fault"
+
             if log_file is not None:
                 context.cycle = cycles_completed
                 emit("terminal")
+                if episode is not None and terminal_reason == "fault":
+                    terminal_reason = "safety_fault"
                 try:
                     log_file.close()
                 except Exception:
@@ -439,6 +596,9 @@ class RolloutRunner:
             primary_fault_reason=primary_fault_reason,
             cleanup_fault_reason=cleanup_fault_reason,
             audit_fault_reason=audit_fault_reason,
+            attempt=attempt,
+            elapsed_seconds=elapsed_seconds,
+            clamp_count=clamp_count,
         )
 
     def _write_event_guarded(
@@ -460,6 +620,9 @@ class RolloutRunner:
         context: _CycleContext,
         actions_attempted: int,
         actions_confirmed: int,
+        attempt: int,
+        elapsed_seconds: float,
+        clamp_count: int,
         terminal_reason: str | None,
         primary_fault_reason: str | None,
         cleanup_fault_reason: str | None,
@@ -490,6 +653,9 @@ class RolloutRunner:
             "inference_latency_s": context.inference_latency_s,
             "actions_attempted": actions_attempted,
             "actions_confirmed": actions_confirmed,
+            "attempt": attempt,
+            "elapsed_seconds": elapsed_seconds,
+            "clamp_count": clamp_count,
             "terminal_reason": terminal_reason,
             "fault_reason": fault_reason,
             "primary_fault_reason": primary_fault_reason,
@@ -507,7 +673,11 @@ class RolloutRunner:
         context: _CycleContext,
         actions_attempted: int,
         actions_confirmed: int,
+        attempt: int,
+        elapsed_seconds: float,
+        clamp_count: int,
         fault_reason: str,
+        episode_mode: bool,
     ) -> None:
         try:
             row = {
@@ -528,13 +698,20 @@ class RolloutRunner:
                 "inference_latency_s": None,
                 "actions_attempted": actions_attempted,
                 "actions_confirmed": actions_confirmed,
+                "attempt": attempt,
+                "elapsed_seconds": elapsed_seconds,
+                "clamp_count": clamp_count,
                 "failed_event": failed_event,
                 "fault_reason": fault_reason,
                 "primary_fault_reason": None,
                 "cleanup_fault_reason": None,
                 "audit_fault_reason": fault_reason,
                 "terminal_reason": (
-                    "fault" if failed_event == "terminal" else None
+                    (
+                        "safety_fault" if episode_mode else "fault"
+                    )
+                    if failed_event == "terminal"
+                    else None
                 ),
             }
             log_file.write(json.dumps(row, allow_nan=False, sort_keys=True) + "\n")

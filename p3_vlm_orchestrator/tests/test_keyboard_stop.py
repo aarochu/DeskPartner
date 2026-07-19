@@ -4,7 +4,12 @@ from io import StringIO
 import threading
 import unittest
 
-from p3_vlm_orchestrator.policy_rollout.keyboard_stop import KeyboardStop
+from p3_vlm_orchestrator.policy_rollout.keyboard_stop import (
+    FAILURE_KEYS,
+    STOP_KEYS,
+    SUCCESS_KEYS,
+    KeyboardStop,
+)
 
 
 class FakeSignalAPI:
@@ -134,6 +139,24 @@ class KeyboardStopTest(unittest.TestCase):
                 self.assertEqual(termios.set_calls, [(42, termios.TCSADRAIN, termios.saved)])
                 self.assertEqual(signals.current[signals.SIGINT], "old-int")
                 self.assertEqual(signals.current[signals.SIGTERM], "old-term")
+
+    def test_exact_verdict_and_stop_keys_are_nonoverlapping(self) -> None:
+        self.assertEqual(SUCCESS_KEYS, frozenset(("s",)))
+        self.assertEqual(FAILURE_KEYS, frozenset(("f",)))
+        self.assertEqual(STOP_KEYS, frozenset(("q", "x", "\x1b")))
+        self.assertFalse((SUCCESS_KEYS | FAILURE_KEYS) & STOP_KEYS)
+
+    def test_tty_success_and_failure_keys_publish_a_nonblocking_verdict(self) -> None:
+        for key, expected in (("s", "success"), ("f", "failure")):
+            with self.subTest(key=key):
+                stop, _signals, _termios, _tty, _warnings = self.make_stop(
+                    stdin=FakeInput(tty=True, characters=key),
+                    thread_factory=ImmediateThread,
+                )
+
+                with stop:
+                    self.assertEqual(stop.verdict(), expected)
+                    self.assertFalse(stop.event.is_set())
 
     def test_sigint_and_sigterm_handlers_set_the_same_event(self) -> None:
         for signum in (FakeSignalAPI.SIGINT, FakeSignalAPI.SIGTERM):

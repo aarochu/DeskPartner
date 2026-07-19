@@ -13,6 +13,8 @@ from typing import IO, Any
 
 
 STOP_KEYS = frozenset(("q", "x", "\x1b"))
+SUCCESS_KEYS = frozenset(("s",))
+FAILURE_KEYS = frozenset(("f",))
 POLL_INTERVAL_S = 0.10
 
 
@@ -58,6 +60,8 @@ class KeyboardStop:
         self._entered = False
         self._closed = False
         self._closing = False
+        self._verdict: str | None = None
+        self._verdict_lock = threading.Lock()
 
     def __enter__(self) -> KeyboardStop:
         if not self.is_main_thread():
@@ -102,6 +106,12 @@ class KeyboardStop:
 
     def is_set(self) -> bool:
         return self.event.is_set()
+
+    def verdict(self) -> str | None:
+        """Return the current operator verdict without waiting for input."""
+
+        with self._verdict_lock:
+            return self._verdict
 
     def _install_signal_handlers(self) -> None:
         for name in ("SIGINT", "SIGTERM"):
@@ -165,6 +175,14 @@ class KeyboardStop:
                 return
             if character in STOP_KEYS:
                 self.stop()
+                return
+            if character in SUCCESS_KEYS:
+                with self._verdict_lock:
+                    self._verdict = "success"
+                return
+            if character in FAILURE_KEYS:
+                with self._verdict_lock:
+                    self._verdict = "failure"
                 return
 
     def _restore_terminal(self) -> None:

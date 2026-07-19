@@ -28,6 +28,7 @@ EMPTY_WORKSPACE_PHRASE = "WORKSPACE IS EMPTY"
 MIN_SPEED_SCALE = 0.10
 MAX_SPEED_SCALE = 0.20
 MAX_CLI_CYCLES = 20
+MANUAL_RESET_PHRASE = "I RESET THE CAN AND CLEARED THE WORKSPACE"
 EXPECTED_IMAGE_ORDER = (
     "observation.images.front",
     "observation.images.side",
@@ -78,6 +79,13 @@ python -m p3_vlm_orchestrator.policy_rollout.cli live --checkpoint CHECKPOINT --
 
 # Gate D: only after Gate C has no faults/clamps, up to five cycles
 python -m p3_vlm_orchestrator.policy_rollout.cli live --checkpoint CHECKPOINT --cycles 5 --speed-scale 0.10 --live
+
+Explicit held-out episode evaluation (Gate B-D behavior is unchanged unless
+--episode is present): s = success, f = failure, q/x/Esc = stop. Each attempt
+ends at the 30.0-second cap or 300 confirmed live actions. Stop and the physical
+e-stop always take priority. --retry-on-failure permits at most one retry only
+after an explicit manual reset acknowledgement; it never retries a safety
+fault, timeout, or stop.
 """
 
 
@@ -133,6 +141,9 @@ class _TerminalSummary:
     primary_fault_reason: str | None
     cleanup_fault_reason: str | None
     audit_fault_reason: str | None
+    attempt: int = 1
+    elapsed_seconds: float = 0.0
+    clamp_count: int = 0
 
 
 class PreflightRobotAdapter:
@@ -290,6 +301,16 @@ def _add_hardware_arguments(parser: argparse.ArgumentParser) -> None:
         default=root / "data" / "calibration" / "calibration.json",
     )
     parser.add_argument("--log-path", type=Path, default=None)
+    parser.add_argument(
+        "--episode",
+        action="store_true",
+        help="Run one 30-second, human-verdict held-out evaluation attempt.",
+    )
+    parser.add_argument(
+        "--retry-on-failure",
+        action="store_true",
+        help="After manual reset acknowledgement, retry operator failure once.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -435,6 +456,8 @@ def _run_hardware(
 ) -> int:
     if mode == "live" and not args.live_gate:
         raise ValueError("live rollout requires the explicit --live flag")
+    if args.retry_on_failure and not args.episode:
+        raise ValueError("--retry-on-failure requires explicit --episode mode")
     speed_scale = _checked_speed_scale(args.speed_scale)
     cycles = args.cycles
     if not 1 <= cycles <= MAX_CLI_CYCLES:
@@ -466,6 +489,20 @@ def _run_hardware(
             file=deps.output(),
         )
         policy = _policy_factory(deps)(bundle, args.device)
+
+    if args.episode:
+        return _run_episode_hardware(
+            args,
+            deps,
+            mode=mode,
+            speed_scale=speed_scale,
+            log_path=log_path,
+            profile_snapshot=profile_snapshot,
+            profile_digest=profile_digest,
+            profile_authentication=profile_authentication,
+            task=task,
+            policy=policy,
+        )
 
     safety = _safety_factory(deps)(profile_snapshot, mode=mode)
     guard = _guard_factory(deps)(
@@ -559,6 +596,161 @@ def _run_hardware(
         )
     )
     return 1 if has_fault or summary.terminal_reason == "fault" else 0
+
+
+def _run_episode_hardware(
+    args: argparse.Namespace,
+    deps: CliDependencies,
+    *,
+    mode: str,
+    speed_scale: float,
+    log_path: Path,
+    profile_snapshot: Mapping[str, Any],
+    profile_digest: str,
+    profile_authentication: str,
+    task: str,
+    policy: object,
+) -> int:
+    """Run one episode and, only after manual reset, one fresh retry."""
+
+    attempt = 1
+    metadata_written = False
+    while True:
+        safety = _safety_factory(deps)(profile_snapshot, mode=mode)
+        guard = _guard_factory(deps)(
+            arm_config_path=args.arm_config,
+            workspace_config_path=args.workspace_config,
+            calibration_path=args.workspace_calibration,
+            current_utc=deps.now_utc,
+        )
+        robot = _robot_factory(deps)(
+            profile_snapshot=profile_snapshot,
+            runtime_root=args.runtime_root,
+            speed_scale=speed_scale,
+            monotonic_clock=deps.monotonic(),
+        )
+
+        follower_port = _selected_follower_port(robot)
+        serial_checker = deps.serial_port_is_free or default_serial_port_is_free
+        try:
+            serial_is_free = serial_checker(follower_port)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Follower serial ownership check failed: {exc}"
+            ) from exc
+        if serial_is_free is not True:
+            raise RuntimeError("Follower serial port is owned or could not be checked")
+
+        if mode == "live":
+            _require_live_phrases(deps.read_input())
+
+        if not metadata_written:
+            _write_rollout_metadata(
+                log_path,
+                now=deps.now_utc(),
+                mode=mode,
+                task=task,
+                profile_digest=profile_digest,
+                profile_authentication=profile_authentication,
+            )
+            print(f"jsonl_path={log_path}", file=deps.output())
+            if mode == "shadow" and args.dummy_hold:
+                print(
+                    f"standalone_profile_digest={profile_digest} "
+                    "(schema-validated, unauthenticated)",
+                    file=deps.output(),
+                )
+            metadata_written = True
+
+        preflight_robot = PreflightRobotAdapter(
+            robot=robot,
+            expected_task=task,
+            profile_snapshot=profile_snapshot,
+        )
+        keyboard = _keyboard_stop_factory(deps)()
+        summary: object
+        try:
+            with keyboard:
+                verdict_source = getattr(keyboard, "verdict", None)
+                if not callable(verdict_source):
+                    raise RuntimeError(
+                        "Episode keyboard control did not expose nonblocking verdicts"
+                    )
+                try:
+                    runner = _runner_factory(deps)(
+                        policy=policy,
+                        robot=preflight_robot,
+                        safety=safety,
+                        mode=mode,
+                        log_path=log_path,
+                        monotonic_clock=deps.monotonic(),
+                        stop_requested=keyboard.event,
+                        action_guard=guard,
+                        operator_verdict=verdict_source,
+                    )
+                except Exception as exc:
+                    summary = _fault_summary(
+                        primary=(
+                            "runner construction failed: " + _exception_text(exc)
+                        ),
+                        cleanup=preflight_robot.cleanup_fault_reason,
+                        episode=True,
+                        attempt=attempt,
+                    )
+                else:
+                    try:
+                        summary = runner.run_episode(attempt=attempt)
+                    except Exception as exc:
+                        summary = _fault_summary(
+                            primary=(
+                                "runner execution failed: " + _exception_text(exc)
+                            ),
+                            cleanup=preflight_robot.cleanup_fault_reason,
+                            episode=True,
+                            attempt=attempt,
+                        )
+        except Exception as exc:
+            summary = _fault_summary(
+                primary="keyboard stop setup failed: " + _exception_text(exc),
+                cleanup=preflight_robot.cleanup_fault_reason,
+                episode=True,
+                attempt=attempt,
+            )
+
+        summary = _with_cleanup_fault(
+            summary,
+            preflight_robot.cleanup_fault_reason,
+            episode=True,
+        )
+        _print_summary(summary, deps.output())
+        has_fault = any(
+            getattr(summary, field, None)
+            for field in (
+                "primary_fault_reason",
+                "cleanup_fault_reason",
+                "audit_fault_reason",
+            )
+        )
+        if has_fault or summary.terminal_reason == "safety_fault":
+            return 1
+        if (
+            summary.terminal_reason != "operator_failure"
+            or not args.retry_on_failure
+            or attempt >= 2
+        ):
+            return 0
+
+        reset = deps.read_input()(
+            "After manual reset with no automatic motion, type exactly "
+            f'"{MANUAL_RESET_PHRASE}": '
+        )
+        if reset != MANUAL_RESET_PHRASE:
+            print(
+                "retry_skipped=manual_reset_not_acknowledged",
+                file=deps.output(),
+            )
+            return 0
+        attempt = 2
 
 
 def _policy_factory(deps: CliDependencies) -> Callable[[object, str], object]:
@@ -1040,29 +1232,40 @@ def _fault_summary(
     primary: str,
     cleanup: str | None = None,
     audit: str | None = None,
+    episode: bool = False,
+    attempt: int = 1,
 ) -> _TerminalSummary:
     return _TerminalSummary(
         cycles_completed=0,
         actions_attempted=0,
         actions_confirmed=0,
-        terminal_reason="fault",
+        terminal_reason="safety_fault" if episode else "fault",
         primary_fault_reason=primary,
         cleanup_fault_reason=cleanup,
         audit_fault_reason=audit,
+        attempt=attempt,
     )
 
 
-def _with_cleanup_fault(summary: object, cleanup: str | None) -> object:
+def _with_cleanup_fault(
+    summary: object,
+    cleanup: str | None,
+    *,
+    episode: bool = False,
+) -> object:
     if cleanup is None or getattr(summary, "cleanup_fault_reason", None) is not None:
         return summary
     return _TerminalSummary(
         cycles_completed=getattr(summary, "cycles_completed"),
         actions_attempted=getattr(summary, "actions_attempted"),
         actions_confirmed=getattr(summary, "actions_confirmed"),
-        terminal_reason="fault",
+        terminal_reason="safety_fault" if episode else "fault",
         primary_fault_reason=getattr(summary, "primary_fault_reason", None),
         cleanup_fault_reason=cleanup,
         audit_fault_reason=getattr(summary, "audit_fault_reason", None),
+        attempt=getattr(summary, "attempt", 1),
+        elapsed_seconds=getattr(summary, "elapsed_seconds", 0.0),
+        clamp_count=getattr(summary, "clamp_count", 0),
     )
 
 
@@ -1072,6 +1275,9 @@ def _print_summary(summary: object, output: IO[str]) -> None:
         f"cycles={getattr(summary, 'cycles_completed')} "
         f"actions_attempted={getattr(summary, 'actions_attempted')} "
         f"actions_confirmed={getattr(summary, 'actions_confirmed')} "
+        f"attempt={getattr(summary, 'attempt', 1)} "
+        f"elapsed_seconds={float(getattr(summary, 'elapsed_seconds', 0.0)):.3f} "
+        f"clamp_count={getattr(summary, 'clamp_count', 0)} "
         f"terminal_reason={getattr(summary, 'terminal_reason')} "
         f"primary_fault={_fault_text(getattr(summary, 'primary_fault_reason', None))} "
         f"cleanup_fault={_fault_text(getattr(summary, 'cleanup_fault_reason', None))} "

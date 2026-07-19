@@ -27,6 +27,7 @@ from rebot_operator_kit.rollout.contracts import RolloutObservation
 
 TASK = "Pick up one can and place it in the taped sorting zone"
 NOW = datetime(2026, 7, 18, 21, 22, 23, tzinfo=timezone.utc)
+MANUAL_RESET_PHRASE = "I RESET THE CAN AND CLEARED THE WORKSPACE"
 
 
 def make_profile() -> dict[str, object]:
@@ -227,6 +228,9 @@ class FakeKeyboardStop:
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.exited = True
 
+    def verdict(self) -> str | None:
+        return None
+
 
 @dataclass
 class Summary:
@@ -237,6 +241,40 @@ class Summary:
     primary_fault_reason: str | None = None
     cleanup_fault_reason: str | None = None
     audit_fault_reason: str | None = None
+
+
+@dataclass
+class EpisodeSummary:
+    attempt: int
+    terminal_reason: str
+    cycles_completed: int = 1
+    actions_attempted: int = 0
+    actions_confirmed: int = 0
+    primary_fault_reason: str | None = None
+    cleanup_fault_reason: str | None = None
+    audit_fault_reason: str | None = None
+    elapsed_seconds: float = 1.25
+    clamp_count: int = 0
+
+
+class ScriptedEpisodeRunner:
+    def __init__(self, *, outcomes: list[str], attempts: list[int], **kwargs) -> None:
+        self.outcomes = outcomes
+        self.attempts = attempts
+        self.robot = kwargs["robot"]
+
+    def run_episode(self, *, attempt: int) -> EpisodeSummary:
+        self.attempts.append(attempt)
+        self.robot.connect()
+        self.robot.disconnect()
+        outcome = self.outcomes.pop(0)
+        return EpisodeSummary(
+            attempt=attempt,
+            terminal_reason=outcome,
+            primary_fault_reason=(
+                "simulated safety fault" if outcome == "safety_fault" else None
+            ),
+        )
 
 
 class ExercisingRunner:
@@ -373,6 +411,13 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertIn("physical e-stop", help_text.lower())
         self.assertIn("offline --checkpoint CHECKPOINT", help_text)
         self.assertIn("live --checkpoint CHECKPOINT --cycles 5", help_text)
+        self.assertIn("s = success", help_text)
+        self.assertIn("f = failure", help_text)
+        self.assertIn("q/x/Esc = stop", help_text)
+        self.assertIn("30.0-second", help_text)
+        self.assertIn("300 confirmed live actions", help_text)
+        self.assertIn("manual reset", help_text.lower())
+        self.assertIn("--retry-on-failure", help_text)
 
     def test_inspect_validates_and_prints_contract_without_policy_factory(self) -> None:
         checkpoint = self.write_checkpoint()
@@ -494,6 +539,192 @@ class PolicyRolloutCliTest(unittest.TestCase):
         self.assertIs(runner_calls[0]["stop_requested"], keyboard.event)
         self.assertIn("actions_attempted=2", self.stdout.getvalue())
         self.assertIn("primary_fault=none", self.stdout.getvalue())
+
+    def test_episode_default_has_no_retry_and_prints_attempt_metrics(self) -> None:
+        robots: list[FakeRobot] = []
+        attempts: list[int] = []
+        outcomes = ["operator_failure"]
+        prompts: list[str] = []
+
+        def input_fn(prompt: str) -> str:
+            prompts.append(prompt)
+            return (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+
+        deps = self.dependencies(
+            input_fn=input_fn,
+            robot_factory=lambda **kwargs: robots.append(FakeRobot()) or robots[-1],
+            runner_factory=lambda **kwargs: ScriptedEpisodeRunner(
+                outcomes=outcomes,
+                attempts=attempts,
+                **kwargs,
+            ),
+        )
+
+        status = main(
+            self.rollout_args() + ["--live", "--episode"],
+            dependencies=deps,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(attempts, [1])
+        self.assertEqual(len(robots), 1)
+        self.assertFalse(any("manual reset" in prompt.lower() for prompt in prompts))
+        summary = self.stdout.getvalue()
+        self.assertIn("attempt=1", summary)
+        self.assertIn("elapsed_seconds=1.250", summary)
+        self.assertIn("clamp_count=0", summary)
+        self.assertIn("terminal_reason=operator_failure", summary)
+
+    def test_episode_failure_without_exact_reset_ack_is_not_retried(self) -> None:
+        robots: list[FakeRobot] = []
+        attempts: list[int] = []
+        outcomes = ["operator_failure"]
+        prompts: list[str] = []
+
+        def input_fn(prompt: str) -> str:
+            prompts.append(prompt)
+            if "manual reset" in prompt.lower():
+                return "not acknowledged"
+            return (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+
+        deps = self.dependencies(
+            input_fn=input_fn,
+            robot_factory=lambda **kwargs: robots.append(FakeRobot()) or robots[-1],
+            runner_factory=lambda **kwargs: ScriptedEpisodeRunner(
+                outcomes=outcomes,
+                attempts=attempts,
+                **kwargs,
+            ),
+        )
+
+        status = main(
+            self.rollout_args()
+            + ["--live", "--episode", "--retry-on-failure"],
+            dependencies=deps,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(attempts, [1])
+        self.assertEqual(len(robots), 1)
+        self.assertEqual(
+            sum("manual reset" in prompt.lower() for prompt in prompts),
+            1,
+        )
+
+    def test_acknowledged_failure_retries_once_with_fresh_robot_lifecycle(self) -> None:
+        robots: list[FakeRobot] = []
+        attempts: list[int] = []
+        outcomes = ["operator_failure", "operator_success"]
+
+        def input_fn(prompt: str) -> str:
+            if "manual reset" in prompt.lower():
+                return MANUAL_RESET_PHRASE
+            return (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+
+        deps = self.dependencies(
+            input_fn=input_fn,
+            robot_factory=lambda **kwargs: robots.append(FakeRobot()) or robots[-1],
+            runner_factory=lambda **kwargs: ScriptedEpisodeRunner(
+                outcomes=outcomes,
+                attempts=attempts,
+                **kwargs,
+            ),
+        )
+
+        status = main(
+            self.rollout_args()
+            + ["--live", "--episode", "--retry-on-failure"],
+            dependencies=deps,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(attempts, [1, 2])
+        self.assertEqual(len(robots), 2)
+        self.assertTrue(all(robot.connect_count == 1 for robot in robots))
+        self.assertTrue(all(robot.disconnect_count == 1 for robot in robots))
+        self.assertIn("attempt=2", self.stdout.getvalue())
+        self.assertIn("terminal_reason=operator_success", self.stdout.getvalue())
+
+    def test_second_operator_failure_never_produces_a_third_attempt(self) -> None:
+        robots: list[FakeRobot] = []
+        attempts: list[int] = []
+        outcomes = ["operator_failure", "operator_failure"]
+
+        def input_fn(prompt: str) -> str:
+            if "manual reset" in prompt.lower():
+                return MANUAL_RESET_PHRASE
+            return (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+
+        deps = self.dependencies(
+            input_fn=input_fn,
+            robot_factory=lambda **kwargs: robots.append(FakeRobot()) or robots[-1],
+            runner_factory=lambda **kwargs: ScriptedEpisodeRunner(
+                outcomes=outcomes,
+                attempts=attempts,
+                **kwargs,
+            ),
+        )
+
+        status = main(
+            self.rollout_args()
+            + ["--live", "--episode", "--retry-on-failure"],
+            dependencies=deps,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(attempts, [1, 2])
+        self.assertEqual(len(robots), 2)
+
+    def test_safety_fault_is_never_retried(self) -> None:
+        robots: list[FakeRobot] = []
+        attempts: list[int] = []
+        outcomes = ["safety_fault"]
+        prompts: list[str] = []
+
+        def input_fn(prompt: str) -> str:
+            prompts.append(prompt)
+            return (
+                "I HAVE AN E-STOP OPERATOR"
+                if "E-STOP" in prompt
+                else "WORKSPACE IS EMPTY"
+            )
+
+        deps = self.dependencies(
+            input_fn=input_fn,
+            robot_factory=lambda **kwargs: robots.append(FakeRobot()) or robots[-1],
+            runner_factory=lambda **kwargs: ScriptedEpisodeRunner(
+                outcomes=outcomes,
+                attempts=attempts,
+                **kwargs,
+            ),
+        )
+
+        status = main(
+            self.rollout_args()
+            + ["--live", "--episode", "--retry-on-failure"],
+            dependencies=deps,
+        )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(attempts, [1])
+        self.assertEqual(len(robots), 1)
+        self.assertFalse(any("manual reset" in prompt.lower() for prompt in prompts))
 
     def test_live_rejects_either_incorrect_phrase_before_connect(self) -> None:
         cases = (
