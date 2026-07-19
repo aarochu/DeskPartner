@@ -26,6 +26,12 @@ class _StopEvent(Protocol):
     def is_set(self) -> bool: ...
 
 
+class ActionGuard(Protocol):
+    """Fail-closed geometric validator for one physical follower action."""
+
+    def validate(self, action_deg: np.ndarray) -> None: ...
+
+
 @dataclass(frozen=True)
 class RunSummary:
     """Terminal outcome of one rollout run."""
@@ -80,6 +86,7 @@ class RolloutRunner:
         log_path: Path | str,
         monotonic_clock: Callable[[], float],
         stop_requested: Callable[[], bool] | _StopEvent,
+        action_guard: ActionGuard | None = None,
     ) -> None:
         if mode not in ("shadow", "live"):
             raise ValueError("Rollout mode must be exactly 'shadow' or 'live'")
@@ -92,6 +99,7 @@ class RolloutRunner:
         self.mode = mode
         self.log_path = Path(log_path)
         self.monotonic_clock = monotonic_clock
+        self.action_guard = action_guard
         self.stop_requested = (
             stop_requested if callable(stop_requested) else stop_requested.is_set
         )
@@ -268,6 +276,26 @@ class RolloutRunner:
                         terminal_reason = "stop_requested"
                         emit("stop_requested")
                         break
+
+                    if self.action_guard is not None:
+                        phase = "workspace safety validation"
+                        workspace_checked_at = self.monotonic_clock()
+                        try:
+                            self.action_guard.validate(
+                                context.predicted_first_action.copy()
+                            )
+                        except Exception as exc:
+                            primary_fault_reason = (
+                                "workspace safety rejected action: "
+                                + self._exception_text(exc)
+                            )
+                            terminal_reason = "fault"
+                            if emit(
+                                "workspace_safety_fault",
+                                monotonic_s=workspace_checked_at,
+                            ):
+                                emit("fault", monotonic_s=workspace_checked_at)
+                            break
 
                     phase = "safety validation"
                     safety_checked_at = self.monotonic_clock()

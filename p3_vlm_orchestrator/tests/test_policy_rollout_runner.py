@@ -14,6 +14,7 @@ from p3_vlm_orchestrator.policy_rollout.dummy_policy import (
     UnsafePolicy,
 )
 from p3_vlm_orchestrator.policy_rollout.runner import RolloutRunner
+from p3_vlm_orchestrator.policy_rollout.workspace_guard import WorkspaceViolation
 from rebot_operator_kit.rollout.contracts import RolloutObservation
 from rebot_operator_kit.rollout.safety import SafetyGovernor
 
@@ -238,6 +239,25 @@ class MutatingPolicy:
         return np.repeat(observation.state_deg[None, :], 10, axis=0)
 
 
+class RecordingActionGuard:
+    def __init__(
+        self,
+        events: list[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.events = events
+        self.error = error
+        self.actions: list[np.ndarray] = []
+
+    def validate(self, action_deg: np.ndarray) -> None:
+        if self.events is not None:
+            self.events.append("workspace")
+        self.actions.append(np.asarray(action_deg, dtype=float).copy())
+        action_deg[:] = 999.0
+        if self.error is not None:
+            raise self.error
+
+
 class RolloutRunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -252,6 +272,7 @@ class RolloutRunnerTest(unittest.TestCase):
         mode: str = "shadow",
         stop_requested: Event | None = None,
         clock: AdvancingClock | SequenceClock | None = None,
+        action_guard: object | None = None,
     ) -> RolloutRunner:
         return RolloutRunner(
             policy=policy,
@@ -261,6 +282,7 @@ class RolloutRunnerTest(unittest.TestCase):
             log_path=self.log_path,
             monotonic_clock=clock or AdvancingClock(),
             stop_requested=stop_requested or Event(),
+            action_guard=action_guard,
         )
 
     def read_log(self) -> list[dict[str, object]]:
@@ -300,6 +322,79 @@ class RolloutRunnerTest(unittest.TestCase):
         self.assertEqual(summary.cycles_completed, 2)
         self.assertEqual(summary.actions_sent, 0)
         self.assertEqual(robot.sent_actions, [])
+
+    def test_shadow_invokes_workspace_guard_on_copy_before_safety_and_never_sends(self) -> None:
+        events: list[str] = []
+        guard = RecordingActionGuard(events)
+        robot = FakeRobot()
+        runner = self.make_runner(
+            policy=HoldPositionPolicy(),
+            robot=robot,
+            action_guard=guard,
+        )
+        original_validate = runner.safety.validate
+
+        def safety_validate(*args, **kwargs):
+            events.append("safety")
+            return original_validate(*args, **kwargs)
+
+        runner.safety.validate = safety_validate  # type: ignore[method-assign]
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertEqual(events, ["workspace", "safety"])
+        self.assertEqual(len(guard.actions), 1)
+        np.testing.assert_array_equal(guard.actions[0], np.zeros(7))
+        self.assertEqual(summary.cycles_completed, 1)
+        self.assertEqual(robot.sent_actions, [])
+
+    def test_workspace_rejection_faults_shadow_and_live_before_safety_or_send(self) -> None:
+        for mode in ("shadow", "live"):
+            with self.subTest(mode=mode):
+                robot = FakeRobot()
+                guard = RecordingActionGuard(
+                    error=WorkspaceViolation("tip outside calibrated polygon")
+                )
+                runner = self.make_runner(
+                    policy=HoldPositionPolicy(),
+                    robot=robot,
+                    mode=mode,
+                    action_guard=guard,
+                )
+                safety_calls = 0
+
+                def unexpected_safety(*args, **kwargs):
+                    nonlocal safety_calls
+                    safety_calls += 1
+                    raise AssertionError("safety must run after workspace validation")
+
+                runner.safety.validate = unexpected_safety  # type: ignore[method-assign]
+
+                summary = runner.run(max_cycles=1)
+
+                self.assertEqual(summary.terminal_reason, "fault")
+                self.assertIn("workspace safety", summary.primary_fault_reason or "")
+                self.assertEqual(safety_calls, 0)
+                self.assertEqual(robot.sent_actions, [])
+                self.assertIn(
+                    "workspace_safety_fault",
+                    [row["event"] for row in self.read_log()],
+                )
+                self.log_path.unlink()
+
+    def test_invalid_prediction_shape_does_not_invoke_workspace_guard(self) -> None:
+        guard = RecordingActionGuard()
+        robot = FakeRobot()
+        runner = self.make_runner(
+            policy=ArrayPolicy(np.zeros((1, 6))),
+            robot=robot,
+            action_guard=guard,
+        )
+
+        summary = runner.run(max_cycles=1)
+
+        self.assertIn("prediction shape", summary.primary_fault_reason or "")
+        self.assertEqual(guard.actions, [])
 
     def test_hold_position_policy_completes_multiple_fresh_observation_cycles(
         self,
