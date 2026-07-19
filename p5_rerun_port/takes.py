@@ -35,16 +35,43 @@ def begin_recording(
     rr = _import_rerun()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    blueprint = None
+    if spawn_viewer and not save_only:
+        try:
+            from p5_rerun_port.viewer_blueprint import build_hackathon_blueprint
+
+            blueprint = build_hackathon_blueprint()
+        except Exception as exc:
+            # Recording must remain usable if a particular SDK build lacks a
+            # blueprint feature. The FileSink is the durable source of truth.
+            print(f"WARN: Viewer blueprint unavailable ({exc}); using automatic layout", flush=True)
+
     # Prefer modern multi-sink API; fall back to init+save for older SDKs.
     try:
         rec = rr.RecordingStream(APP_ID, recording_id=f"{sanitize_name(dataset)}-{path.stem}")
+        if spawn_viewer and not save_only and hasattr(rec, "spawn"):
+            try:
+                # Spawn without connecting first: set_sinks below then tees the
+                # stream to both the Viewer and the durable .rrd FileSink.
+                rec.spawn(
+                    connect=False,
+                    hide_welcome_screen=True,
+                    default_blueprint=blueprint,
+                )
+            except Exception as exc:
+                print(f"WARN: Rerun Viewer did not start ({exc}); recording to file", flush=True)
         sinks: list[Any] = [rr.FileSink(str(path))]
         if spawn_viewer and not save_only:
             try:
                 sinks.insert(0, rr.GrpcSink())
             except Exception:
                 pass
-        rec.set_sinks(*sinks)
+        rec.set_sinks(*sinks, default_blueprint=blueprint)
+        if blueprint is not None and hasattr(rec, "send_blueprint"):
+            try:
+                rec.send_blueprint(blueprint, make_active=True, make_default=True)
+            except Exception as exc:
+                print(f"WARN: Viewer blueprint was not activated ({exc})", flush=True)
         if hasattr(rec, "send_recording_name"):
             rec.send_recording_name(episode)
         if hasattr(rec, "send_property"):
@@ -57,6 +84,8 @@ def begin_recording(
     except Exception:
         rr.init(APP_ID, spawn=spawn_viewer and not save_only)
         rr.save(str(path))
+        if blueprint is not None and hasattr(rr, "send_blueprint"):
+            rr.send_blueprint(blueprint, make_active=True, make_default=True)
         rr.log("/task", rr.TextDocument(task or ""), static=True)
         return rr
 
