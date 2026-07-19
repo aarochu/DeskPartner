@@ -1,0 +1,37 @@
+schema_version: 1
+sources:
+  - repo_id: Cornerf/rebot-can-sort-stage1-v1-smoke
+    revision: 74d1f300786d58b4f6f55e1798cbb1a1a48f5409
+    role: success
+    task_key: single_can
+    expected_items: 52
+    expected_frames: 36729
+  - repo_id: Cornerf/rebot-two-can-recycle-v2-smoke
+    revision: 778d0bf5de1096a80b1cf355073e369faa1409da
+    role: success
+    task_key: two_can
+    expected_items: 25
+    expected_frames: 14478
+  - repo_id: Cornerf/rebot-can-sort-stage1-v1-failed
+    revision: 4952b618a23f8f2e5b09f736cea0a490c62e57b4
+    role: failure
+    task_key: single_can
+    expected_items: 19
+  - repo_id: Cornerf/rebot-two-can-recycle-v2-failed
+    revision: 2d9ea53cf8f4835fcfc1656b23d56308696b3e5b
+    role: failure
+    task_key: two_can
+    expected_items: 6
+robot_type: seeed_b601_dm_follower
+fps: 30
+joint_names: [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_yaw, wrist_roll, gripper]
+camera_keys: [front, side]
+destination_repo: Cornerf/rebot-cansort-rerun-curated
+quality:
+  max_state_age_ms: 100.0
+  max_camera_age_ms: 66.666667
+  lag_search_frames: 15
+  calibration_fraction: 0.8
+  upper_quantile: 0.99
+  lower_quantile: 0.01
+  mad_multiplier: 5.0
