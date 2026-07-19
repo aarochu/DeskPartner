@@ -131,6 +131,75 @@ HF_HUB_ENABLE_HF_TRANSFER=1 rebot_setup/vendor/rebot_lerobot/.venv/bin/lerobot-t
 ```
 
 (This public dataset's cameras are `side`/`up`, hence the different rename map
+than our real reBot data.) Success = loss prints and decreases, and a checkpoint
+appears under `outputs/smolvla/smoke_test/checkpoints/`. Verified end-to-end on
+MPS 2026-07-18.
+
+## Training on multiple datasets (merge first)
+
+`lerobot-train` only accepts ONE dataset (the multi-dataset path is disabled in
+this vendored version). To train on several recorded datasets together, first
+**merge** them into one with LeRobot's aggregate tool, then train on the result.
+The datasets must share the same schema (action/state dims, camera keys, fps,
+codebase version) — the aggregate tool validates this and refuses otherwise.
+
+1. **Log in to Hugging Face** (private Cornerf datasets need a **classic Read**
+   token — a fine-grained token shows zero datasets):
+
+   ```bash
+   hf auth login   # paste a Read token from https://huggingface.co/settings/tokens
+   ```
+
+2. **Download each dataset** at a pinned revision (get the sha from the dataset's
+   HF page or `HfApi().dataset_info(repo_id).sha`):
+
+   ```bash
+   hf download <repo_id> --repo-type dataset --revision <sha> \
+     --local-dir ~/rebot-training/data/<name>
+   ```
+
+3. **Merge** them into one combined dataset (originals stay read-only):
+
+   ```python
+   from pathlib import Path
+   from lerobot.datasets.aggregate import aggregate_datasets
+   aggregate_datasets(
+       repo_ids=["<repo_a>", "<repo_b>"],
+       aggr_repo_id="<combined_name>",
+       roots=[Path("~/rebot-training/data/<a>"), Path("~/rebot-training/data/<b>")],
+       aggr_root=Path("~/rebot-training/data/<combined>"),
+   )
+   ```
+
+4. **Train** on the merged dataset (same warm-start command, point `--dataset.root`
+   at the combined dataset; no `--dataset.revision` since it is local):
+
+   ```bash
+   HF_HUB_ENABLE_HF_TRANSFER=1 ./.venv-lerobot/bin/lerobot-train \
+     --policy.path=lerobot/smolvla_base \
+     --dataset.repo_id=<combined_name> \
+     --dataset.root=~/rebot-training/data/<combined> \
+     --dataset.video_backend=pyav \
+     --rename_map='{"observation.images.front": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+     --policy.empty_cameras=1 \
+     --policy.device=mps --policy.push_to_hub=false \
+     --batch_size=4 --steps=20000 --save_freq=1000 --log_freq=200 --eval_freq=0 \
+     --output_dir=outputs/smolvla/<run_name> \
+     --wandb.enable=false
+   ```
+
+Done 2026-07-18: merged `rebot-can-sort-stage1-v1-smoke` (52 eps) +
+`rebot-two-can-recycle-v2-smoke` (25 eps) → 77 eps / 51,207 frames, trained on MPS.
+
+## Note on checkpoints and datasets
+
+`outputs/` (trained checkpoints) and the datasets under `~/rebot-training/data/`
+are NOT in git — checkpoints are hundreds of MB each and datasets are multi-GB.
+Back checkpoints up to Hugging Face or Drive; the datasets already live on the HF
+Hub under the `Cornerf` org.
+
+
+## left over from merge conflict
 than our real reBot data.) Success = all 20 steps report finite loss and
 `checkpoints/000020/pretrained_model/model.safetensors` exists. Do not require a
 monotonic loss curve from only 20 shuffled mini-batches. This exact command path
