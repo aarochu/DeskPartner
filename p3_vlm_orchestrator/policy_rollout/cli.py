@@ -336,6 +336,26 @@ def build_parser() -> argparse.ArgumentParser:
     offline_parser.add_argument("--episodes", type=_episodes, default=2)
     offline_parser.add_argument("--device", default="cpu")
 
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Validate one held-out trial manifest and write offline reports.",
+    )
+    report_parser.add_argument("--manifest", required=True, type=Path)
+    report_parser.add_argument("--output-name", required=True)
+
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help="Rank checkpoints evaluated on the same held-out placements.",
+    )
+    compare_parser.add_argument(
+        "--manifest",
+        required=True,
+        type=Path,
+        nargs="+",
+        help="Two or more strict final-trial JSON manifests.",
+    )
+    compare_parser.add_argument("--output-name", required=True)
+
     shadow_parser = subparsers.add_parser(
         "shadow",
         help="Gate B: observe and predict without sending an action.",
@@ -375,6 +395,10 @@ def main(
             return _run_inspect(args, deps)
         if args.command == "offline":
             return _run_offline(args, deps)
+        if args.command == "report":
+            return _run_report(args, deps, compare_checkpoints=False)
+        if args.command == "compare":
+            return _run_report(args, deps, compare_checkpoints=True)
         if args.command == "shadow":
             return _run_hardware(args, deps, mode="shadow")
         if args.command == "live":
@@ -445,6 +469,38 @@ def _run_offline(args: argparse.Namespace, deps: CliDependencies) -> int:
     )
     if not results:
         raise RuntimeError("No samples were found in the selected dataset episodes")
+    return 0
+
+
+def _run_report(
+    args: argparse.Namespace,
+    deps: CliDependencies,
+    *,
+    compare_checkpoints: bool,
+) -> int:
+    """Load the standard-library-only reporting stack on explicit request."""
+
+    from p3_vlm_orchestrator.policy_rollout.evaluation import (
+        compare,
+        load_trial_manifest,
+        write_reports,
+    )
+
+    manifest_paths = args.manifest if compare_checkpoints else [args.manifest]
+    manifests = [load_trial_manifest(path) for path in manifest_paths]
+    winner: str | None = None
+    if compare_checkpoints:
+        ranked = compare(manifests)
+        winner = str(ranked[0]["checkpoint"])
+    paths = write_reports(
+        manifests,
+        output_name=args.output_name,
+        repo_root=deps.repository_root(),
+    )
+    print(f"report_json={paths.json_path}", file=deps.output())
+    print(f"report_csv={paths.csv_path}", file=deps.output())
+    if winner is not None:
+        print(f"winner={winner}", file=deps.output())
     return 0
 
 
