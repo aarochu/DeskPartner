@@ -2351,8 +2351,10 @@ class TrainingManager:
             self._record_decision_pending = True
         try:
             # Stop never overwrites a finish/failure decision that the collector
-            # may not have consumed yet. SIGHUP carries the stop event itself.
-            if action != "stop":
+            # may not have consumed yet.  With no pending decision, publish Stop
+            # too so the collector has a durable fallback if signal forwarding
+            # is delayed.
+            if action != "stop" or not was_pending:
                 atomic_write_json(control_file, decision)
             os.kill(process.pid, signals[action])
         except Exception as exc:

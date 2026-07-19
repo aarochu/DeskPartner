@@ -139,7 +139,18 @@ def main() -> int:
     for pending_signal in pending:
         forward(pending_signal)
 
-    return_code = worker.wait()
+    # Do not block indefinitely in waitpid.  CPython only runs Python signal
+    # handlers on the main thread between bytecode instructions, so an
+    # unbounded wait can leave SIGUSR1/SIGUSR2/SIGHUP pending until the worker
+    # exits—the exact opposite of a responsive recording control channel.
+    # The short timeout returns to Python often enough to forward operator
+    # decisions promptly while retaining the supervisor's detached ownership.
+    while True:
+        try:
+            return_code = worker.wait(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            continue
     relay.join()
     return return_code if return_code >= 0 else 128 + abs(return_code)
 

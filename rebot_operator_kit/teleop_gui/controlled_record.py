@@ -357,6 +357,45 @@ def read_control_decision(args: argparse.Namespace, expected_action: str) -> dic
     return payload
 
 
+def consume_published_decision(
+    control_file: Path,
+    events: dict[str, bool],
+    last_sequence: int | None,
+) -> int | None:
+    """Consume an atomic browser decision without relying solely on signals.
+
+    POSIX signals remain the low-latency wakeup, while the atomic control file
+    is the durable source of truth for Finish, Re-record, and an unopposed Stop.
+    Polling it closes the gap if a supervisor is briefly unable to forward a
+    signal.
+    """
+
+    try:
+        payload = json.loads(control_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return last_sequence
+    if not isinstance(payload, dict):
+        return last_sequence
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, int) or sequence == last_sequence:
+        return last_sequence
+    action = payload.get("action")
+    if action == "finish":
+        events["finish"] = True
+        print("GUI_EVENT finish_current_episode source=control_file", flush=True)
+    elif action == "rerecord":
+        events["rerecord"] = True
+        events["finish"] = True
+        print("GUI_EVENT rerecord_current_episode source=control_file", flush=True)
+    elif action == "stop":
+        events["stop"] = True
+        events["finish"] = True
+        print("GUI_EVENT stop_and_finalize source=control_file", flush=True)
+    else:
+        return last_sequence
+    return sequence
+
+
 def resolve_attempt_disposition(
     events: dict[str, bool],
     published_action: str | None,
@@ -1508,8 +1547,18 @@ def control_segment(
     status_started = started
     status_loops = 0
     minimum_free_bytes = 5 * 1024**3
+    next_decision_poll = started
+    last_decision_sequence: int | None = None
 
     while time.perf_counter() - started < duration_s:
+        now = time.perf_counter()
+        if record and now >= next_decision_poll:
+            last_decision_sequence = consume_published_decision(
+                args.control_file,
+                events,
+                last_decision_sequence,
+            )
+            next_decision_poll = now + 0.05
         if events["finish"] or events["stop"]:
             break
         loop_started = time.perf_counter()

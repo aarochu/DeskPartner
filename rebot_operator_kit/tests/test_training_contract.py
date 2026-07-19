@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -361,6 +362,34 @@ class SessionHomeReturnTest(unittest.TestCase):
                 record=False,
                 task="failure test",
             )
+
+    def test_control_file_decisions_work_without_a_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            for action, expected in (
+                ("finish", {"finish": True, "rerecord": False, "stop": False}),
+                ("rerecord", {"finish": True, "rerecord": True, "stop": False}),
+                ("stop", {"finish": True, "rerecord": False, "stop": True}),
+            ):
+                events = {"finish": False, "rerecord": False, "stop": False}
+                control_file.write_text(json.dumps({"action": action, "sequence": 17}))
+                sequence = controlled_record.consume_published_decision(
+                    control_file,
+                    events,
+                    None,
+                )
+                self.assertEqual(sequence, 17)
+                self.assertEqual(events, expected)
+
+                # The same atomic publication is idempotent when polled again.
+                self.assertEqual(
+                    controlled_record.consume_published_decision(
+                        control_file,
+                        events,
+                        sequence,
+                    ),
+                    17,
+                )
 
 
 class ZeroFrameQuarantineTest(unittest.TestCase):
@@ -974,6 +1003,28 @@ class AttemptArchiveTest(unittest.TestCase):
             self.assertEqual(control_file.read_text(), before_stop)
             send_stop.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGHUP)
 
+    def test_record_stop_is_durable_when_no_episode_decision_is_pending(self) -> None:
+        class FakeProcess:
+            pid = 424243
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            manager = workspace.TrainingManager()
+            manager._kind = "record"
+            manager._process = FakeProcess()
+            manager._record_control_file = control_file
+            manager._record_decision_pending = False
+            with patch.object(workspace.os, "kill") as send_signal:
+                manager.record_control({"action": "stop"})
+            decision = json.loads(control_file.read_text())
+            self.assertEqual(decision["action"], "stop")
+            self.assertIsInstance(decision["sequence"], int)
+            send_signal.assert_called_once_with(FakeProcess.pid, workspace.signal.SIGHUP)
+
     def test_shutdown_waits_for_record_archive_and_escalates_recovery_safely(self) -> None:
         class FakeProcess:
             pid = 515151
@@ -1140,6 +1191,45 @@ class AttemptArchiveTest(unittest.TestCase):
         self.assertEqual(process.returncode, 0)
         self.assertIn("OWNER_LOST forwarding=SIGINT", output)
         self.assertIn("WORKER_STOPPED", output)
+
+    def test_owned_process_forwards_finish_while_worker_is_running(self) -> None:
+        owner_read, owner_write = os.pipe()
+        worker_code = (
+            "import signal,time\n"
+            "running=True\n"
+            "def finish(*_):\n global running\n print('FINISH_RECEIVED', flush=True)\n running=False\n"
+            "signal.signal(signal.SIGUSR1, finish)\n"
+            "print('WORKER_READY', flush=True)\n"
+            "while running: time.sleep(0.01)\n"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GUI_ROOT / "owned_process.py"),
+                "--owner-fd",
+                str(owner_read),
+                "--owner-stop-signal",
+                "SIGINT",
+                "--",
+                sys.executable,
+                "-u",
+                "-c",
+                worker_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            pass_fds=(owner_read,),
+            start_new_session=True,
+        )
+        os.close(owner_read)
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.readline().strip(), "WORKER_READY")
+        os.kill(process.pid, signal.SIGUSR1)
+        output = process.communicate(timeout=5)[0]
+        os.close(owner_write)
+        self.assertEqual(process.returncode, 0)
+        self.assertIn("FINISH_RECEIVED", output)
 
     def test_owned_process_cleanup_survives_broken_log_pipe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
