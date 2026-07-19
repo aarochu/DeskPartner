@@ -4,10 +4,28 @@
 **Code:** [`p5_rerun_port/rerun_query.py`](../../p5_rerun_port/rerun_query.py), [`query_api_cli.py`](../../p5_rerun_port/query_api_cli.py)  
 **Runs:** after recording stops (read-only over `.rrd`). Does **not** open arms or the operator GUI.
 
+## Where this runs (important)
+
+| Surface | Role |
+|---------|------|
+| **This Query API** | **Terminal / Python CLI** — `python -m p5_rerun_port.query_api_cli …` uses Rerun’s catalog + `dataset.reader()` (DataFusion) and prints tables/metrics (optional markdown report). |
+| **Rerun Viewer** | Separate app for *looking* at an `.rrd` (`rerun recordings/cans/episode_01.rrd`). Not where Query API commands run. |
+| **Operator Collect & train GUI** | Unrelated keep/fail LeRobot workflow. Untouched. |
+
+```text
+record_episode → .rrd on disk
+       ↓
+query_api_cli   ← you are here (terminal)
+       ↓
+optional: open the same .rrd in the Viewer to watch
+       ↓
+export_lerobot
+```
+
 ## Pipeline
 
 ```text
-record_episode (.rrd) → Query API (list / filter / inspect / compare) → export_lerobot
+record_episode (.rrd) → Query API CLI (list / filter / inspect / compare) → export_lerobot
 ```
 
 ```mermaid
