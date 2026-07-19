@@ -74,16 +74,14 @@ from lerobot_teleoperator_rebot_arm_102 import (
 )
 
 
-# Camera buffers are sampled without waiting so the 30 FPS image clock cannot
-# throttle the motor loop. A frame up to 250 ms old is normally fresh. macOS
-# scheduling/USB jitter may briefly exceed that. At the 30 FPS dataset clock,
-# allow up to eight consecutive samples in this bounded 250-500 ms jitter band;
-# this covers the roughly 320 ms wrist-camera stalls observed on macOS without
-# coupling camera reads back into the motor loop. A ninth consecutive jitter
-# sample, or any frame older than 500 ms, fails closed as a stale/frozen camera.
-CAMERA_FRESH_AGE_MS = 250.0
-CAMERA_JITTER_MAX_AGE_MS = 500
-CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES = 8
+# Manual collection never lets camera-age telemetry stop arm control. The
+# operator explicitly starts, judges, saves, and ends each take. We still log
+# frame age for later review, but reuse the latest available frame regardless
+# of age or producer-thread state. A camera that has never produced any frame
+# remains a functional error because a valid two-camera LeRobot sample cannot
+# be constructed without an image.
+CAMERA_FRESH_REFERENCE_MS = 250.0
+CAMERA_FALLBACK_READ_MAX_AGE_MS = 86_400_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -403,6 +401,12 @@ def consume_published_decision(
         events["stop"] = True
         events["finish"] = True
         print("GUI_EVENT stop_and_finalize source=control_file", flush=True)
+    elif action == "pause":
+        events["paused"] = True
+        print("GUI_EVENT pause_manual_run source=control_file", flush=True)
+    elif action == "play":
+        events["paused"] = False
+        print("GUI_EVENT resume_manual_run source=control_file", flush=True)
     else:
         return last_sequence
     return sequence
@@ -1222,7 +1226,7 @@ class RecoverySafeVideoEncodingManager(VideoEncodingManager):
 
 
 def install_signal_controls() -> dict[str, bool]:
-    events = {"finish": False, "rerecord": False, "stop": False}
+    events = {"finish": False, "rerecord": False, "stop": False, "paused": False}
 
     def finish(_signum: int, _frame: Any) -> None:
         events["finish"] = True
@@ -1486,14 +1490,12 @@ def _camera_freshness_entry(telemetry: dict[str, Any], camera_key: str) -> dict[
     return telemetry.setdefault(
         camera_key,
         {
-            "fresh_limit_ms": CAMERA_FRESH_AGE_MS,
-            "jitter_limit_ms": CAMERA_JITTER_MAX_AGE_MS,
-            "max_consecutive_jitter_samples": CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES,
+            "mode": "manual_unchecked",
+            "age_enforced": False,
+            "fresh_reference_ms": CAMERA_FRESH_REFERENCE_MS,
             "sample_attempts": 0,
             "fresh_samples": 0,
-            "transient_jitter_samples": 0,
-            "consecutive_jitter_samples": 0,
-            "max_consecutive_jitter_seen": 0,
+            "stale_samples_accepted": 0,
             "last_age_ms": None,
             "max_age_ms_seen": 0.0,
             "status": "waiting_for_sample",
@@ -1505,40 +1507,34 @@ def read_latest_camera_observation(
     robot: SeeedB601DMFollower,
     freshness_telemetry: dict[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Peek at camera buffers with bounded jitter tolerance and no frame wait."""
+    """Peek at camera buffers without waiting or enforcing frame age."""
 
     telemetry = freshness_telemetry if freshness_telemetry is not None else {}
     observation: dict[str, np.ndarray] = {}
     for camera_key, camera in robot.cameras.items():
         entry = _camera_freshness_entry(telemetry, camera_key)
         entry["sample_attempts"] += 1
-        try:
-            # read_latest only copies the current buffer. It never clears the
-            # new-frame event or waits for camera hardware.
-            frame = camera.read_latest(max_age_ms=CAMERA_JITTER_MAX_AGE_MS)
-        except Exception as exc:
-            age_ms = _camera_frame_age_ms(camera)
-            if age_ms is not None:
-                entry["last_age_ms"] = round(age_ms, 3)
-                entry["max_age_ms_seen"] = round(
-                    max(float(entry["max_age_ms_seen"]), age_ms), 3
-                )
-            entry["status"] = "hard_stale_or_unavailable"
-            entry["error"] = str(exc)
-            print(
-                f"CAMERA_FRESHNESS key={camera_key} status=hard_stale_or_unavailable "
-                f"age_ms={age_ms if age_ms is not None else 'unknown'}",
-                flush=True,
-            )
-            raise
+        frame = None
+        frame_lock = getattr(camera, "frame_lock", None)
+        if frame_lock is not None and hasattr(camera, "latest_frame"):
+            # OpenCVCamera.read_latest also rejects a stopped producer thread
+            # and old timestamps. Manual mode deliberately bypasses those
+            # health gates while retaining the latest buffer for this take.
+            with frame_lock:
+                frame = getattr(camera, "latest_frame", None)
+        else:
+            # Compatibility path for test doubles and alternative cameras.
+            # This remains nonblocking and effectively disables age rejection.
+            frame = camera.read_latest(max_age_ms=CAMERA_FALLBACK_READ_MAX_AGE_MS)
+        if frame is None:
+            entry["status"] = "no_frame_available"
+            entry["error"] = f"{camera_key} has not produced an image"
+            raise RuntimeError(entry["error"])
 
         age_ms = _camera_frame_age_ms(camera)
         if age_ms is None:
-            # Test doubles and non-OpenCV cameras may not expose a timestamp;
-            # the camera's own bounded read_latest contract remains authoritative.
             entry["fresh_samples"] += 1
-            entry["consecutive_jitter_samples"] = 0
-            entry["status"] = "fresh_age_reported_by_camera"
+            entry["status"] = "accepted_age_unknown"
             observation[camera_key] = frame
             continue
 
@@ -1546,41 +1542,21 @@ def read_latest_camera_observation(
         entry["max_age_ms_seen"] = round(
             max(float(entry["max_age_ms_seen"]), age_ms), 3
         )
-        if age_ms <= CAMERA_FRESH_AGE_MS:
+        if age_ms <= CAMERA_FRESH_REFERENCE_MS:
             entry["fresh_samples"] += 1
-            entry["consecutive_jitter_samples"] = 0
             entry["status"] = "fresh"
             entry.pop("error", None)
         else:
-            entry["transient_jitter_samples"] += 1
-            entry["consecutive_jitter_samples"] += 1
-            entry["max_consecutive_jitter_seen"] = max(
-                int(entry["max_consecutive_jitter_seen"]),
-                int(entry["consecutive_jitter_samples"]),
-            )
-            if (
-                entry["consecutive_jitter_samples"]
-                > CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES
-            ):
-                entry["status"] = "sustained_stale"
-                entry["error"] = (
-                    f"{camera_key} stayed older than {CAMERA_FRESH_AGE_MS:g} ms for "
-                    f"{entry['consecutive_jitter_samples']} consecutive samples"
-                )
+            entry["stale_samples_accepted"] += 1
+            entry["status"] = "stale_frame_accepted_manual_mode"
+            stale_count = int(entry["stale_samples_accepted"])
+            if stale_count == 1 or stale_count % 30 == 0:
                 print(
-                    f"CAMERA_FRESHNESS key={camera_key} status=sustained_stale "
-                    f"age_ms={age_ms:.1f} consecutive="
-                    f"{entry['consecutive_jitter_samples']}",
+                    f"CAMERA_FRESHNESS key={camera_key} "
+                    f"status=stale_frame_accepted_manual_mode age_ms={age_ms:.1f} "
+                    f"accepted_samples={stale_count}",
                     flush=True,
                 )
-                raise TimeoutError(entry["error"])
-            entry["status"] = "transient_jitter_accepted"
-            print(
-                f"CAMERA_FRESHNESS key={camera_key} status=transient_jitter_accepted "
-                f"age_ms={age_ms:.1f} consecutive={entry['consecutive_jitter_samples']} "
-                f"limit={CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES}",
-                flush=True,
-            )
         observation[camera_key] = frame
     return observation
 
@@ -1603,7 +1579,7 @@ def capture_session_home(
     robot: SeeedB601DMFollower,
     leader: RebotArm102Leader,
 ) -> dict[str, Any]:
-    """Capture the stationary pose that this collection session returns to."""
+    """Capture the operator-selected start pose for audit metadata only."""
 
     feature_names = list(robot.action_features)
     follower_positions = _joint_positions(
@@ -1630,6 +1606,8 @@ def capture_session_home(
     return {
         "captured_at": utc_now(),
         "capture_event": "collection_process_connected_before_first_attempt",
+        "return_policy": "manual_operator_return_after_process_exit",
+        "automatic_return": False,
         "follower_positions_deg": follower_positions,
         "follower_input_deg": follower_input,
         "leader_positions_deg": leader_positions,
@@ -1806,6 +1784,9 @@ def control_segment(
             next_decision_poll = now + 0.05
         if events["finish"] or events["stop"]:
             break
+        if events.get("paused"):
+            precise_sleep(0.02)
+            continue
         loop_started = time.perf_counter()
         try:
             joint_observation = read_follower_joint_observation(robot)
@@ -1874,6 +1855,10 @@ def control_segment(
 
 def main() -> int:
     args = parse_args()
+    # Manual-cycle contract: one process owns exactly one physical take. Saving,
+    # failing, or discarding always ends the process; the operator returns both
+    # arms and explicitly starts the next take from the GUI.
+    args.episodes = 1
     init_logging()
     profile = verify_profile_lock(args)
     contract = verify_collection_contract(args)
@@ -1892,8 +1877,7 @@ def main() -> int:
             raise RuntimeError("Locked calibration did not load; refusing to collect")
         session_home = capture_session_home(robot, leader)
         print(
-            "SESSION home_captured joints=7 "
-            f"return_speed={session_home['return_speed_deg_s']:g}deg_s",
+            "SESSION manual_start_pose_captured joints=7 automatic_return=false",
             flush=True,
         )
         dataset = make_dataset(args, robot, action_processor, observation_processor)
@@ -2050,30 +2034,17 @@ def main() -> int:
                             f"label={failure_label} training_included=false",
                             flush=True,
                         )
-                        if events["stop"]:
-                            print("SESSION stop_after_failed_attempt", flush=True)
-                            break
-                        events["finish"] = False
-                        events["rerecord"] = False
-                        home_result = automatic_reset_to_session_home(
-                            args=args,
-                            robot=robot,
-                            leader=leader,
-                            events=events,
-                            session_home=session_home,
+                        print(
+                            "SESSION manual_cycle_failed_take_complete "
+                            "automatic_return=false start_next_run_manually=true",
+                            flush=True,
                         )
-                        if events["stop"]:
-                            print("SESSION stop_requested_during_reset", flush=True)
-                            break
-                        if home_result is not None:
-                            mark_attempt_home_return(directory, home_result)
-                        continue
+                        break
 
-                    keep_decision = read_control_decision(
+                    read_control_decision(
                         args,
                         "finish_and_stop" if published_action == "finish_and_stop" else "finish",
                     )
-                    stop_after_save = keep_decision.get("action") == "finish_and_stop"
                     minimum_samples = max(2, int(args.dataset_fps * 1.0))
                     if samples < minimum_samples:
                         finalize_attempt_archive(
@@ -2137,12 +2108,29 @@ def main() -> int:
                         "training_included=true",
                         flush=True,
                     )
-                    if stop_after_save:
-                        print("SESSION finish_and_stop_after_durable_save", flush=True)
-                        break
-                    if events["stop"]:
-                        print("SESSION stop_after_kept_attempt", flush=True)
-                        break
+                    stale_cameras = {
+                        key: value
+                        for key, value in camera_freshness.items()
+                        if int(value.get("stale_samples_accepted", 0)) > 0
+                    }
+                    if stale_cameras:
+                        summary = ",".join(
+                            f"{key}:{value.get('stale_samples_accepted', 0)}samples/"
+                            f"max{value.get('max_age_ms_seen', 0)}ms"
+                            for key, value in sorted(stale_cameras.items())
+                        )
+                        print(
+                            "WARNING manual_camera_staleness_was_accepted "
+                            f"id={metadata['attempt_id']} cameras={summary} "
+                            "operator_review_required=true",
+                            flush=True,
+                        )
+                    print(
+                        "SESSION manual_cycle_saved_and_ending automatic_return=false "
+                        "start_next_run_manually=true",
+                        flush=True,
+                    )
+                    break
                 except KeyboardInterrupt:
                     if metadata.get("disposition") == "recording":
                         finalize_attempt_archive(
@@ -2208,23 +2196,6 @@ def main() -> int:
                     if dataset.episode_buffer and dataset.episode_buffer.get("size", 0) > 0:
                         release_unsaved_attempt_after_archive(dataset, directory, metadata)
                     raise
-
-                events["finish"] = False
-                home_result = automatic_reset_to_session_home(
-                    args=args,
-                    robot=robot,
-                    leader=leader,
-                    events=events,
-                    session_home=session_home,
-                )
-                if events["stop"]:
-                    print("SESSION stop_requested_during_reset", flush=True)
-                    break
-                if home_result is not None:
-                    mark_attempt_home_return(directory, home_result)
-                if completed_this_run >= args.episodes:
-                    break
-
         print(
             f"SESSION complete added_episodes={completed_this_run} total_episodes={dataset.num_episodes}",
             flush=True,

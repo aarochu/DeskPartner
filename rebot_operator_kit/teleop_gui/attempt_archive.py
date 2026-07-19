@@ -151,11 +151,19 @@ def attempt_inventory(archive_root: Path, dataset: str = "") -> list[dict[str, A
     roots = [archive_root / dataset] if dataset else list(archive_root.glob("*"))
     attempts: list[dict[str, Any]] = []
     for dataset_root in roots:
-        if not dataset_root.is_dir() or not DATASET_RE.fullmatch(dataset_root.name):
+        if (
+            dataset_root.is_symlink()
+            or not dataset_root.is_dir()
+            or not DATASET_RE.fullmatch(dataset_root.name)
+        ):
             continue
         for metadata_path in dataset_root.glob("*/metadata.json"):
             directory = metadata_path.parent
-            if not ATTEMPT_ID_RE.fullmatch(directory.name):
+            if (
+                directory.is_symlink()
+                or metadata_path.is_symlink()
+                or not ATTEMPT_ID_RE.fullmatch(directory.name)
+            ):
                 continue
             try:
                 metadata = json.loads(metadata_path.read_text())
@@ -190,8 +198,12 @@ def find_attempt(archive_root: Path, attempt_id: str) -> tuple[Path, dict[str, A
     if len(matches) != 1:
         raise FileNotFoundError("Attempt was not found")
     metadata_path = matches[0]
+    directory = metadata_path.parent
+    dataset_root = directory.parent
+    if dataset_root.is_symlink() or directory.is_symlink() or metadata_path.is_symlink():
+        raise FileNotFoundError("Attempt archive symlinks are not allowed")
     root = archive_root.resolve()
-    resolved = metadata_path.resolve()
+    resolved = metadata_path.resolve(strict=True)
     try:
         resolved.relative_to(root)
     except ValueError as exc:
@@ -202,7 +214,7 @@ def find_attempt(archive_root: Path, attempt_id: str) -> tuple[Path, dict[str, A
         raise ValueError("Attempt metadata is unreadable") from exc
     if not isinstance(metadata, dict):
         raise ValueError("Attempt metadata is invalid")
-    return resolved.parent, metadata
+    return directory, metadata
 
 
 def update_failure_label(
@@ -359,9 +371,12 @@ def artifact_path(archive_root: Path, attempt_id: str, artifact: str) -> Path:
     if metadata.get("archive_complete") is not True:
         raise FileNotFoundError("Attempt archive is not committed and verified")
     path = directory / filenames[artifact]
+    if directory.is_symlink() or path.is_symlink():
+        raise FileNotFoundError(f"{artifact.title()} artifact symlinks are not allowed")
     try:
         resolved = path.resolve(strict=True)
-        resolved.relative_to(directory.resolve())
+        if resolved.parent != directory.resolve(strict=True):
+            raise FileNotFoundError(f"{artifact.title()} artifact leaves its attempt archive")
     except (OSError, ValueError) as exc:
         raise FileNotFoundError(f"{artifact.title()} artifact is not safely available") from exc
     if not resolved.is_file():

@@ -31,7 +31,10 @@ import webbrowser
 
 from serial.tools import list_ports
 
+from rerun_library import attempt_detail_payload, catalog_payload, share_selection_preview
+
 from training_workspace import (
+    ATTEMPT_ROOT,
     TrainingConfigError,
     TrainingManager,
     attempt_archive_inventory,
@@ -738,7 +741,13 @@ class ReBotHandler(BaseHTTPRequestHandler):
                 chunk = handle.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Browsers routinely cancel range requests when a video is
+                    # deselected or the page is reloaded. The file and server
+                    # are healthy; stop streaming this request quietly.
+                    break
                 remaining -= len(chunk)
 
     def _camera_snapshot(self, label: str, fallback_index: int) -> Path:
@@ -792,14 +801,22 @@ class ReBotHandler(BaseHTTPRequestHandler):
             self._send_file(STATIC_ROOT / "index.html", "text/html; charset=utf-8")
         elif parsed.path in {"/training", "/training.html"}:
             self._send_file(STATIC_ROOT / "training.html", "text/html; charset=utf-8")
+        elif parsed.path in {"/rerun", "/rerun.html"}:
+            self._send_file(STATIC_ROOT / "rerun.html", "text/html; charset=utf-8")
         elif parsed.path == "/styles.css":
             self._send_file(STATIC_ROOT / "styles.css", "text/css; charset=utf-8")
         elif parsed.path == "/training.css":
             self._send_file(STATIC_ROOT / "training.css", "text/css; charset=utf-8")
+        elif parsed.path == "/rerun.css":
+            self._send_file(STATIC_ROOT / "rerun.css", "text/css; charset=utf-8")
         elif parsed.path == "/app.js":
             self._send_file(STATIC_ROOT / "app.js", "text/javascript; charset=utf-8")
         elif parsed.path == "/training.js":
             self._send_file(STATIC_ROOT / "training.js", "text/javascript; charset=utf-8")
+        elif parsed.path == "/rerun.js":
+            self._send_file(STATIC_ROOT / "rerun.js", "text/javascript; charset=utf-8")
+        elif parsed.path == "/rerun-flowchart.png":
+            self._send_file(STATIC_ROOT / "rerun-flowchart.png", "image/png")
         elif parsed.path == "/camera/front.png":
             self._send_file(self._camera_snapshot("front", 0), "image/png")
         elif parsed.path == "/camera/side.png":
@@ -839,6 +856,36 @@ class ReBotHandler(BaseHTTPRequestHandler):
                 self._send_json(attempt_archive_inventory(dataset_name))
             except TrainingConfigError as exc:
                 self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        elif parsed.path == "/api/rerun/catalog":
+            query = parse_qs(parsed.query)
+            try:
+                offset = int(query.get("offset", ["0"])[0])
+                limit = int(query.get("limit", ["50"])[0])
+                self._send_json(
+                    catalog_payload(
+                        ATTEMPT_ROOT,
+                        dataset=query.get("dataset", [""])[0],
+                        tag=query.get("tag", [""])[0],
+                        search=query.get("q", [""])[0],
+                        offset=offset,
+                        limit=limit,
+                    )
+                )
+            except (ValueError, TypeError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        elif parsed.path == "/api/rerun/attempt":
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(
+                    attempt_detail_payload(
+                        ATTEMPT_ROOT,
+                        query.get("attempt_id", [""])[0],
+                    )
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
         elif parsed.path == "/api/training/attempt/video":
             query = parse_qs(parsed.query)
             attempt_id = query.get("attempt_id", [""])[0]
@@ -922,6 +969,12 @@ class ReBotHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/training/attempt/review":
                 payload = self._read_json()
                 self._send_json(self.server.training_manager.review_attempt(payload))
+            elif self.path == "/api/rerun/share-preview":
+                payload = self._read_json()
+                try:
+                    self._send_json(share_selection_preview(ATTEMPT_ROOT, payload))
+                except (ValueError, FileNotFoundError) as exc:
+                    raise ConfigError(str(exc)) from exc
             elif self.path == "/api/training/validate":
                 payload = self._read_json()
                 self._send_json(

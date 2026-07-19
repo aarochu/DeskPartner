@@ -22,12 +22,11 @@ recording; the collector explicitly selects those calibration directories with
 interactive recalibration disabled. Dataset resume, validation, and command
 generation require authenticated profile and collection-contract digests.
 
-During collection, the episode timer never auto-accepts a take. Use **Finish &
-keep episode** for a clean success and automatic continuation. Use **Finish,
-keep & end session** when the current take is good but collection should end
-after its durable save. **Stop & discard current take** requires confirmation,
-archives the active take, and excludes it from LeRobot. For a bad take, select a
-reason and use **Mark failed & re-record**. Successes stay unlabeled and enter
+During collection, the episode timer never auto-accepts a take. Manual-cycle
+mode makes each **Start new run** launch exactly one physical take. Use **Save
+run** for a clean success; it fresh-load verifies the durable episode and ends
+the process. **Discard run** requires confirmation, archives the active take,
+and excludes it from LeRobot. Successes stay unlabeled and enter
 LeRobot; failures are labeled and excluded. Every attempt is independently archived with two MP4s, a
 synchronized `.rrd`, and an editable JSON sidecar under
 `training-runs/attempts/<dataset>/<attempt-id>/`. The training page can replay
@@ -38,14 +37,21 @@ the remaining episodes, and preserves the original dataset revision plus both
 videos and the Rerun archive. Aborted and system-error attempts can also receive
 a review reason without changing their recorded system outcome.
 
-The follower's current seven-joint pose and the passive leader's corresponding
-pose are captured once, when collection connects. After every kept or failed
-attempt—including the final kept attempt—the follower automatically returns to
-that session-home pose at a capped 120 deg/s. The operator returns the passive
-leader and task objects manually. Recording cannot resume until both arms stay
-within the captured pose tolerances and the configured reset timer completes.
-Finish-and-end disconnects only after the good take is durable. Stop/discard or
-abort disconnects without initiating extra return motion.
+The separate **Run Library** at `/rerun` adapts the Rerun bounty catalog loop
+to the hardened attempt archive. It provides dataset/tag/search filters,
+paginated compact rows, synchronized overhead/wrist video, selected-run timing
+and joint details, safe review links, and immutable share-scope preview. **Open
+Rerun visualization** launches only the native viewer for the selected `.rrd`;
+the page never imports or invokes physical trajectory replay. Raw archives are
+retained even when an episode is excluded from LeRobot.
+
+The follower and leader start poses are recorded as audit metadata only. Save,
+failure, discard, and collector error all end the current process without
+commanding either arm back to that pose. The operator manually returns both
+arms and task objects, then presses Play for the next run. Existing datasets
+are detected and resumed automatically; a prior fault never latches the Start
+control. Camera-age data remains visible in attempt metadata but never stops a
+take while a buffered image exists.
 
 ## Manual operation
 

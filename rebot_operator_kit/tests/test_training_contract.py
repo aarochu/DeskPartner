@@ -88,7 +88,8 @@ class TrainingDefaultsTest(unittest.TestCase):
             training_html,
         )
         self.assertIn('value="rebot-can-sort-stage1-v1-smoke"', training_html)
-        self.assertIn('id="episodes-input" type="number" value="10"', training_html)
+        self.assertIn('id="episodes-input" type="number" value="1"', training_html)
+        self.assertIn("Manual mode always records exactly one take", training_html)
 
     def test_resume_schema_accepts_loaded_video_info_and_lerobot_defaults(self) -> None:
         learning = {
@@ -154,8 +155,14 @@ class TrainingDefaultsTest(unittest.TestCase):
             controlled_record.make_dataset(args, robot, Mock(), Mock())
 
         training_js = (GUI_ROOT / "static" / "training.js").read_text()
-        self.assertIn("Save accepted. Writing this episode to Rerun and LeRobot now.", training_js)
-        self.assertIn("Do not press Stop; wait until the next attempt is ready.", training_js)
+        self.assertIn(
+            "Save accepted. This run is being written to Rerun and LeRobot",
+            training_js,
+        )
+        self.assertIn(
+            "it will disconnect without automatic return after the durable save",
+            training_js,
+        )
         self.assertIn("Mark failed & exclude from LeRobot", training_js)
         self.assertIn('/api/training/attempt/review', training_js)
 
@@ -349,7 +356,9 @@ class SessionHomeReturnTest(unittest.TestCase):
         robot = SimpleNamespace(cameras={"front": camera})
         observation = controlled_record.read_latest_camera_observation(robot)
         self.assertIs(observation["front"], frame)
-        camera.read_latest.assert_called_once_with(max_age_ms=500)
+        camera.read_latest.assert_called_once_with(
+            max_age_ms=controlled_record.CAMERA_FALLBACK_READ_MAX_AGE_MS
+        )
         camera.async_read.assert_not_called()
 
     def test_256_8ms_camera_jitter_is_accepted_and_reported(self) -> None:
@@ -365,9 +374,13 @@ class SessionHomeReturnTest(unittest.TestCase):
                 SimpleNamespace(cameras={"side": camera}), telemetry
             )
         self.assertIs(observation["side"], frame)
-        self.assertEqual(telemetry["side"]["status"], "transient_jitter_accepted")
+        self.assertEqual(
+            telemetry["side"]["status"], "stale_frame_accepted_manual_mode"
+        )
         self.assertAlmostEqual(telemetry["side"]["last_age_ms"], 256.8)
-        camera.read_latest.assert_called_once_with(max_age_ms=500)
+        camera.read_latest.assert_called_once_with(
+            max_age_ms=controlled_record.CAMERA_FALLBACK_READ_MAX_AGE_MS
+        )
         camera.async_read.assert_not_called()
 
     def test_real_wrist_camera_jitter_burst_recovers_without_killing_take(self) -> None:
@@ -390,17 +403,18 @@ class SessionHomeReturnTest(unittest.TestCase):
                 )
             self.assertIs(observation["side"], frame)
 
-        self.assertEqual(telemetry["side"]["status"], "transient_jitter_accepted")
-        self.assertEqual(telemetry["side"]["consecutive_jitter_samples"], 3)
+        self.assertEqual(
+            telemetry["side"]["status"], "stale_frame_accepted_manual_mode"
+        )
+        self.assertEqual(telemetry["side"]["stale_samples_accepted"], 3)
 
         camera.latest_timestamp = 1.0
         with patch.object(controlled_record.time, "perf_counter", return_value=1.005):
             controlled_record.read_latest_camera_observation(robot, telemetry)
         self.assertEqual(telemetry["side"]["status"], "fresh")
-        self.assertEqual(telemetry["side"]["consecutive_jitter_samples"], 0)
         camera.async_read.assert_not_called()
 
-    def test_persistent_camera_staleness_fails_without_blocking_motor_loop(self) -> None:
+    def test_persistent_camera_staleness_is_logged_but_does_not_stop_manual_run(self) -> None:
         frame = np.zeros((2, 3, 3), dtype=np.uint8)
         camera = SimpleNamespace(
             latest_timestamp=0.0,
@@ -410,13 +424,33 @@ class SessionHomeReturnTest(unittest.TestCase):
         telemetry: dict[str, object] = {}
         robot = SimpleNamespace(cameras={"side": camera})
         with patch.object(controlled_record.time, "perf_counter", return_value=0.300):
-            for _ in range(controlled_record.CAMERA_MAX_CONSECUTIVE_JITTER_SAMPLES):
+            for _ in range(20):
                 controlled_record.read_latest_camera_observation(robot, telemetry)
-            with self.assertRaisesRegex(TimeoutError, "9 consecutive samples"):
-                controlled_record.read_latest_camera_observation(robot, telemetry)
-        self.assertEqual(telemetry["side"]["status"], "sustained_stale")
-        self.assertEqual(camera.read_latest.call_count, 9)
+        self.assertEqual(
+            telemetry["side"]["status"], "stale_frame_accepted_manual_mode"
+        )
+        self.assertEqual(telemetry["side"]["stale_samples_accepted"], 20)
+        self.assertEqual(camera.read_latest.call_count, 20)
         camera.async_read.assert_not_called()
+
+    def test_camera_that_never_produced_a_frame_remains_a_functional_error(self) -> None:
+        camera = SimpleNamespace(
+            frame_lock=threading.Lock(),
+            latest_frame=None,
+            latest_timestamp=None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "has not produced an image"):
+            controlled_record.read_latest_camera_observation(
+                SimpleNamespace(cameras={"side": camera}), {}
+            )
+
+    def test_manual_runtime_has_no_automatic_home_return_call(self) -> None:
+        import inspect
+
+        self.assertNotIn(
+            "automatic_reset_to_session_home(",
+            inspect.getsource(controlled_record.main),
+        )
 
     def test_capture_inverts_driver_directions_and_reset_returns_home(self) -> None:
         robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
@@ -635,6 +669,31 @@ class SessionHomeReturnTest(unittest.TestCase):
                     17,
                 )
 
+    def test_pause_and_play_are_polled_without_finishing_the_take(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            events = {
+                "finish": False,
+                "rerecord": False,
+                "stop": False,
+                "paused": False,
+            }
+            control_file.write_text(json.dumps({"action": "pause", "sequence": 1}))
+            sequence = controlled_record.consume_published_decision(
+                control_file, events, None
+            )
+            self.assertEqual(sequence, 1)
+            self.assertTrue(events["paused"])
+            self.assertFalse(events["finish"])
+
+            control_file.write_text(json.dumps({"action": "play", "sequence": 2}))
+            sequence = controlled_record.consume_published_decision(
+                control_file, events, sequence
+            )
+            self.assertEqual(sequence, 2)
+            self.assertFalse(events["paused"])
+            self.assertFalse(events["finish"])
+
 
 class ZeroFrameQuarantineTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -714,6 +773,45 @@ class ZeroFrameQuarantineTest(unittest.TestCase):
         self.assertIsNone(destination)
         self.assertTrue(root.is_dir())
         self.assertTrue(manifest.is_file())
+
+    def test_manual_cycle_resume_requires_positive_durable_counts(self) -> None:
+        base = {"episodes": 10, "resume": False}
+
+        missing = workspace.manual_cycle_config(base, self.data_root / "missing")
+        self.assertEqual(missing["episodes"], 1)
+        self.assertFalse(missing["resume"])
+        self.assertTrue(missing["manual_cycle"])
+
+        empty = self.data_root / "empty"
+        empty.mkdir()
+        self.assertFalse(workspace.manual_cycle_config(base, empty)["resume"])
+
+        metadata_only = self.data_root / "metadata-only"
+        (metadata_only / "meta").mkdir(parents=True)
+        (metadata_only / "meta" / "note.json").write_text("{}")
+        self.assertFalse(workspace.manual_cycle_config(base, metadata_only)["resume"])
+
+        zero = self.write_info("zero-durable", 0, 0)
+        self.assertFalse(workspace.manual_cycle_config(base, zero)["resume"])
+
+        durable = self.write_info("durable", 1, 30)
+        self.assertTrue(workspace.manual_cycle_config(base, durable)["resume"])
+
+    def test_manual_cycle_preserves_ambiguous_or_corrupt_dataset(self) -> None:
+        base = {"episodes": 10, "resume": False}
+        ambiguous = self.data_root / "ambiguous"
+        ambiguous.mkdir()
+        (ambiguous / "orphan.mp4").write_bytes(b"not a dataset")
+        with self.assertRaisesRegex(RuntimeError, "preserved for review"):
+            workspace.manual_cycle_config(base, ambiguous)
+        self.assertTrue((ambiguous / "orphan.mp4").is_file())
+
+        malformed = self.data_root / "malformed"
+        (malformed / "meta").mkdir(parents=True)
+        (malformed / "meta" / "info.json").write_text("not-json")
+        with self.assertRaisesRegex(RuntimeError, "preserved for review"):
+            workspace.manual_cycle_config(base, malformed)
+        self.assertTrue((malformed / "meta" / "info.json").is_file())
 
     def test_failed_zero_durable_retry_moves_only_manifest(self) -> None:
         name = "keep-one-retry"
@@ -921,6 +1019,33 @@ class AttemptArchiveTest(unittest.TestCase):
             attempt_archive.validate_failure_label("other", "lighting trial"),
             ("other", "lighting trial"),
         )
+
+    def test_direct_attempt_artifacts_reject_all_symlink_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive_root = Path(temporary) / "attempts"
+            dataset_root = archive_root / "symlink-test"
+            attempt_id = attempt_archive.new_attempt_id()
+            directory = dataset_root / attempt_id
+            directory.mkdir(parents=True)
+            metadata = {
+                "attempt_id": attempt_id,
+                "dataset": "symlink-test",
+                "archive_complete": True,
+            }
+            attempt_archive.atomic_write_json(directory / "metadata.json", metadata)
+            real_rrd = directory / "real.rrd"
+            real_rrd.write_bytes(b"rrd")
+            os.symlink(real_rrd, directory / "attempt.rrd")
+            with self.assertRaisesRegex(FileNotFoundError, "symlinks"):
+                attempt_archive.artifact_path(archive_root, attempt_id, "rerun")
+
+            (directory / "attempt.rrd").unlink()
+            (directory / "metadata.json").unlink()
+            real_metadata = directory / "real-metadata.json"
+            real_metadata.write_text(json.dumps(metadata))
+            os.symlink(real_metadata, directory / "metadata.json")
+            with self.assertRaisesRegex(FileNotFoundError, "symlinks"):
+                attempt_archive.find_attempt(archive_root, attempt_id)
 
     def test_archive_failure_moves_raw_frames_before_buffer_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1324,10 +1449,67 @@ class AttemptArchiveTest(unittest.TestCase):
                 "awaiting_decision",
                 "saving_rerun",
                 "saving_lerobot",
-                "returning_home",
+                "saved_ending",
             ],
         )
         self.assertIsNone(manager._record_phase)
+        self.assertEqual(manager.status()["state"], "READY")
+        self.assertIsNone(manager.status()["fault"])
+
+    def test_failed_manual_record_returns_ready_with_visible_nonblocking_error(self) -> None:
+        class FakeProcess:
+            pid = 31338
+            stdout: list[str] = []
+
+            @staticmethod
+            def wait() -> int:
+                return 1
+
+            @staticmethod
+            def poll() -> int:
+                return 1
+
+        process = FakeProcess()
+        manager = workspace.TrainingManager()
+        manager._kind = "record"
+        manager._process = process
+        manager._reader_thread = threading.current_thread()
+        with (
+            patch.object(workspace, "_update_run_manifest"),
+            patch.object(workspace, "_quarantine_zero_frame_attempt", return_value=None),
+            patch.object(
+                workspace,
+                "_quarantine_zero_durable_retry_manifest",
+                return_value=None,
+            ),
+        ):
+            manager._read_process(process, "record", None, {"dataset": "manual-test"})
+        status = manager.status()
+        self.assertEqual(status["state"], "READY")
+        self.assertFalse(status["running"])
+        self.assertIn("retry is allowed", status["fault"])
+
+    def test_pause_control_uses_file_only_and_does_not_latch_save(self) -> None:
+        class FakeProcess:
+            pid = 424241
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control_file = Path(temporary) / "control.json"
+            manager = workspace.TrainingManager()
+            manager._kind = "record"
+            manager._process = FakeProcess()
+            manager._record_control_file = control_file
+            manager._record_decision_pending = False
+            with patch.object(workspace.os, "kill") as send_signal:
+                manager.record_control({"action": "pause"})
+                self.assertFalse(manager._record_decision_pending)
+                manager.record_control({"action": "play"})
+            send_signal.assert_not_called()
+            self.assertEqual(json.loads(control_file.read_text())["action"], "play")
 
     def test_record_control_writes_label_before_signalling(self) -> None:
         class FakeProcess:
@@ -1416,9 +1598,14 @@ class AttemptArchiveTest(unittest.TestCase):
     def test_record_controls_make_keep_end_and_discard_unambiguous(self) -> None:
         html = (GUI_ROOT / "static" / "training.html").read_text()
         javascript = (GUI_ROOT / "static" / "training.js").read_text()
-        self.assertIn("Finish, keep & end session", html)
-        self.assertIn("Stop & discard current take", html)
+        self.assertIn("Start new run", html)
+        self.assertIn("Save run", html)
+        self.assertIn("Discard run", html)
+        self.assertIn("Log every run is ON", html)
+        self.assertIn('href="/rerun">Run Library</a>', html)
+        self.assertIn('id="pause-record-button"', html)
         self.assertIn('{ action: "finish_and_stop" }', javascript)
+        self.assertIn('action === "pause"', javascript)
         self.assertIn("window.confirm", javascript)
 
     def test_shutdown_waits_for_record_archive_and_escalates_recovery_safely(self) -> None:

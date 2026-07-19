@@ -443,6 +443,28 @@ def collection_contract(config: dict[str, Any]) -> dict[str, Any]:
     return {key: config[key] for key in COLLECTION_CONTRACT_KEYS}
 
 
+def manual_cycle_config(config: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Force one explicit physical take and infer append mode from disk."""
+
+    counts = _zero_frame_dataset_counts(root)
+    if counts is None:
+        raise RuntimeError(
+            "Dataset folder is nonempty but is not a valid durable LeRobot dataset or a "
+            "safely retryable zero-frame initialization. It was preserved for review."
+        )
+    episodes, frames = counts
+    if (episodes == 0) != (frames == 0):
+        raise RuntimeError(
+            "Dataset metadata has inconsistent durable episode/frame counts; it was "
+            "preserved for review"
+        )
+    result = dict(config)
+    result["episodes"] = 1
+    result["resume"] = episodes > 0 and frames > 0
+    result["manual_cycle"] = True
+    return result
+
+
 def collection_contract_lock(config: dict[str, Any]) -> dict[str, Any]:
     snapshot = collection_contract(config)
     return {"digest": _canonical_digest(snapshot), "snapshot": snapshot}
@@ -1089,7 +1111,6 @@ def preflight(devices: dict[str, Any]) -> dict[str, Any]:
         and calibrations.get("follower")
         and calibrations.get("leader")
         and profile_status.get("passed")
-        and report.get("passed")
         and all(components[name] for name in ("python", "record", "controlled_record", "validator"))
         and free_bytes >= 5 * 1024**3
     )
@@ -1883,13 +1904,15 @@ class TrainingManager:
                     elif line.startswith("ATTEMPT save_phase") and "phase=lerobot" in line:
                         self._record_phase = "saving_lerobot"
                     elif line.startswith("ATTEMPT lerobot_durable"):
-                        self._record_phase = "returning_home"
+                        self._record_phase = "saved_ending"
                         durable_episodes_this_run += 1
                         total_match = re.search(r"\btotal_episodes=(\d+)\b", line)
                         if total_match:
                             durable_dataset_episodes = int(total_match.group(1))
-                    elif line.startswith("RESET auto_home"):
-                        self._record_phase = "returning_home"
+                    elif line.startswith("GUI_EVENT pause_manual_run"):
+                        self._record_phase = "paused"
+                    elif line.startswith("GUI_EVENT resume_manual_run"):
+                        self._record_phase = "recording"
                 if line.startswith("ATTEMPT lerobot_durable"):
                     try:
                         _update_run_manifest(
@@ -1969,7 +1992,16 @@ class TrainingManager:
                 self._record_control_file = None
                 self._record_decision_pending = False
                 self._record_phase = None
-            if exit_code == 0:
+            if kind == "record":
+                # A failed manual take is an archived outcome, not a latched
+                # workspace state. Keep the details in the log/attempt archive
+                # and return the controls to retry-ready immediately.
+                self._state = "READY"
+                self._fault = None if exit_code == 0 else (
+                    f"Previous run exited with code {exit_code}; retry is allowed and "
+                    "any archived raw attempt remains available for review"
+                )
+            elif exit_code == 0:
                 self._state = "COMPLETE"
                 self._fault = None
             else:
@@ -2052,8 +2084,6 @@ class TrainingManager:
                 reasons.append(devices.get("error", "arms unavailable"))
             elif not devices.get("ports_free"):
                 reasons.append("arm serial ports are busy; stop teleop first")
-            if not current_preflight["camera_report"].get("passed"):
-                reasons.append("dual-camera check has not passed")
             if not current_preflight["training_profile"].get("passed"):
                 reasons.append(
                     current_preflight["training_profile"].get("error")
@@ -2062,12 +2092,14 @@ class TrainingManager:
             if not reasons:
                 reasons.append("preflight is incomplete")
             raise RuntimeError("; ".join(reasons))
-        if not camera_report_matches(config, current_preflight["camera_report"]):
-            raise RuntimeError(
-                "Camera check does not match the selected indices, FPS, and actual frame sizes"
-            )
-
         root = DATA_ROOT / config["dataset"]
+        # Manual-cycle mode always records one take and decides Resume from the
+        # durable dataset itself. The operator never has to manage a batch
+        # counter or remember a Resume checkbox between physical runs.
+        if root.exists() and not root.is_dir():
+            raise RuntimeError(f"Dataset path is not a directory: {root}")
+        config = manual_cycle_config(config, root)
+        populated = config["resume"]
         if not config["resume"]:
             quarantined = _quarantine_zero_frame_attempt(
                 config["dataset"],
@@ -2079,8 +2111,6 @@ class TrainingManager:
                     "Earlier zero-frame attempt quarantined; retry namespace is clean: "
                     f"{quarantined}",
                 )
-        if root.exists() and not root.is_dir():
-            raise RuntimeError(f"Dataset path is not a directory: {root}")
         populated = root.exists() and any(root.iterdir())
         if populated and not config["resume"]:
             raise RuntimeError(
@@ -2463,6 +2493,8 @@ class TrainingManager:
             "finish_and_stop": signal.SIGUSR1,
             "rerecord": signal.SIGUSR2,
             "stop": signal.SIGHUP,
+            "pause": None,
+            "play": None,
         }
         if action not in signals:
             raise TrainingConfigError("Unknown recording action")
@@ -2492,7 +2524,9 @@ class TrainingManager:
             if self._record_decision_pending and action != "stop":
                 raise RuntimeError("The previous decision is still being archived")
             was_pending = self._record_decision_pending
-            self._record_decision_pending = True
+            terminal_action = action in {"finish", "finish_and_stop", "rerecord", "stop"}
+            if terminal_action:
+                self._record_decision_pending = True
         try:
             # Stop never overwrites a finish/failure decision that the collector
             # may not have consumed yet.  With no pending decision, publish Stop
@@ -2500,7 +2534,8 @@ class TrainingManager:
             # is delayed.
             if action != "stop" or not was_pending:
                 atomic_write_json(control_file, decision)
-            os.kill(process.pid, signals[action])
+            if signals[action] is not None:
+                os.kill(process.pid, signals[action])
         except Exception as exc:
             with self._lock:
                 if self._process is process:

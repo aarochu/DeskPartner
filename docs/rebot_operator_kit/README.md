@@ -134,10 +134,9 @@ is in `teleop_gui/README.md`.
    any temporary edits.
 3. Stop manual teleop so the collector has exclusive access to both serial
    ports.
-4. Confirm the Logitech overhead mount and Innomaker claw mount are locked,
-   arrange the actual task, and click
-   **Run 6-second camera check**. Inspect both saved images; recording remains
-   blocked until the automated gate and the human framing check both pass.
+4. Confirm the Logitech overhead mount and Innomaker claw mount are locked and
+   inspect both views. **Run 6-second camera check** is advisory in manual-cycle
+   mode and does not latch or block the Play control.
 5. Record the first 10 clean Stage-1 can episodes from the training page. This uses
    the high-rate collector that saves the follower-space action actually sent
    to the motors; do not use the older `04_record_smoke.command` for new data.
@@ -156,23 +155,20 @@ is in `teleop_gui/README.md`.
 - Pick exactly one can per episode, even if extra cans are visible. After every
   take, scatter the target can to a new random reachable position; cover
   corners, edges, and center rather than repeating a comfortable placement.
-- Before starting collection, place both arms in the stable pose that should be
-  this session's home. The collector captures their current poses on connect.
-- After every kept or failed episode, the follower automatically returns to its
-  captured pose at a capped 120 deg/s. Return the passive leader by hand and
-  reset the can while keeping the taped zone fixed; the next attempt remains
-  blocked until both arms align and the reset timer has completed. The session
-  stays connected while waiting, with no alignment timeout; use Stop & finalize
-  if you intend to end it. Reset motion is not recorded.
+- Before each run, place both arms in your stable start pose. The collector
+  records those poses for audit metadata only and never commands a return.
+- Click **Start new run**, complete one can move, then **Save run**. Save,
+  discard, or collector error ends the process. Return
+  both arms and reset the can yourself, then press Play again. Existing data is
+  resumed automatically and there is no automatic next attempt or reset timer.
 - Move smoothly and decisively. Delete jerky-but-successful takes as well as
   misses. Avoid repeated corrections, collisions, hesitations, and covering
   the object with your hand or body.
 - End only after the object is visibly released inside the destination, then
-  restore the scene during the automatic-return/reset period.
+  wait for the durable save/disconnect and restore the scene manually.
 - For a failed, collided, obstructed, or heavily corrected take, choose a
-  failure reason and click **Mark failed & re-record**. Failed takes are
-  archived for review but never added to the training dataset; successful
-  takes remain unlabeled.
+  **Discard run**. Failed takes are archived for review but never added to the
+  training dataset; add or refine the failure label later in **Run Library**.
 - Every take has separate `overhead.mp4`, `wrist.mp4`, `attempt.rrd`, and
   `metadata.json` files under `training-runs/attempts/<dataset>/<attempt-id>/`.
   Use **Review every attempt** in the GUI to replay or relabel failures.

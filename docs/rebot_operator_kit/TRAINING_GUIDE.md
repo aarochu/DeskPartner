@@ -87,14 +87,13 @@ The collector uses two independent clocks:
   from that control tick. Training FPS remains stable even if the motor loop
   runs faster.
 
-Camera sampling is nonblocking and has a bounded freshness policy. Frames up
-to 250 ms old are normally fresh. To tolerate brief macOS scheduling or USB
-jitter, at most two consecutive samples may use a frame up to 500 ms old; a
-third consecutive over-250 ms sample, any frame over 500 ms old, a stopped read
-thread, or a disconnected camera stops the take and excludes it from training.
-Every attempt records per-camera freshness counts and maximum observed age in
-its metadata. This tolerance never waits for a camera and therefore cannot
-reduce the motor-loop rate to camera FPS.
+Camera sampling is nonblocking and manual-cycle mode does not enforce a frame-
+age cutoff. It reuses the latest available frame and records age/staleness
+telemetry for later review, but camera scheduling jitter or a stopped producer
+thread does not stop arm control when a buffered image exists. A camera that
+has never produced any image remains a functional collection error because a
+two-camera LeRobot sample cannot be constructed without it. Inspect both views
+yourself and exclude any take with frozen or unusable video during review.
 
 Do not use DeskPartner's old P4 batch recorder for new data. It does not append
 episodes correctly and would save the wrong action coordinate frame for this
@@ -183,37 +182,32 @@ the raw seventh joint during recording.
 5. Leave the task instruction unchanged.
 6. Use dataset name `rebot-can-sort-stage1-v1-smoke`.
 7. Use these initial settings:
-   - Episodes: `10`
+   - Runs per Start: `1` (manual-cycle mode always enforces one)
    - Episode time: `1000 s` upper guard; finish each take manually
-   - Reset time: `20 s`
+   - Reset time: retained only in the locked historical contract; no automatic reset runs
    - Control: `240 Hz`
    - Dataset: `30 FPS`
    - Motor velocity: `2000 °/s` on all seven joints
    - Step cap: `33.6 °/tick`
    - Gripper force: `0.05`
-8. Put both arms in the exact stable pose you want to use as the home position
-   for this session, and confirm the follower is clear to move. The collector
-   captures both current poses when it connects after you click Start.
-9. Check the readiness confirmation and click **Start collection** once.
+8. Put both arms in the stable pose you want for this take and confirm the
+   follower is clear to move. The collector records the start pose for audit
+   metadata only; it never commands a return to that pose.
+9. Click **Start new run**.
 10. Wait until both arms connect. Then move the leader smoothly and decisively.
 11. After one smooth pick and a clean, visible release in the taped zone, click
-    **Finish & keep episode**. The browser immediately confirms that Rerun and
-    LeRobot saving has started; do not press Stop while saving. Wait until the
-    next attempt is ready.
-12. After every kept or failed take, the follower automatically returns to the
-    captured session-home pose at a capped 120 deg/s. Manually put the passive
-    leader back in its own captured pose, then scatter the can to a new random
-    reachable position. Cover corners, edges, and center across the dataset.
-    The next attempt stays blocked until both arms are aligned and the reset
-    timer has completed; reset frames are not saved. The collector waits without
-    an alignment timeout, so taking longer to return the passive leader never
-    disconnects the session. To save the current good take and end intentionally,
-    use **Finish, keep & end session**. Use **Stop & discard current take** only
-    when the active take must be excluded.
+    **Save run**. The browser immediately confirms that Rerun and
+    LeRobot saving has started. The process disconnects only after the episode
+    is durable, and it does not move either arm after save.
+12. Return both arms to the start pose yourself, scatter the can to a new random
+    reachable position, then click **Start new run** again. Each click
+    launches one fresh process and automatically appends when the dataset
+    already exists. There is no automatic return, alignment gate, reset timer,
+    next attempt, or automatic continuation.
 13. For a miss, collision, occlusion, dropped object, wrong destination, large
     correction, awkward hesitation, or any jerky-but-successful motion, choose
-    a failure reason and click **Mark failed & re-record**. The take is excluded
-    from training, but its videos and Rerun recording are preserved.
+    **Discard run**. The take is excluded from training, its videos and Rerun
+    recording are preserved, and the process ends. Label it later in Run Library.
 14. The 1000-second episode time is only an upper guard. Finish each take
     manually as soon as the task is complete. At the limit, recording
     pauses motion and recording, then waits until you
@@ -229,13 +223,11 @@ the raw seventh joint during recording.
     previous validation report, and keeps a recoverable copy of the prior
     dataset revision. The attempt's MP4s, Rerun recording, and review history
     are never removed.
-16. After the final clean episode, click **Finish, keep & end session**. The
-    collector saves and fresh-load verifies that episode before disconnecting.
-    If a new unwanted episode has already begun, use the confirmed **Stop &
-    discard current take** action; that partial take is archived as `aborted`
-    and excluded while all earlier saved episodes remain. Discard/abort
-    disconnects without initiating an automatic return; support the follower
-    when stopping.
+16. Every saved run already ends its own process. **Discard run** archives
+    an unwanted partial take as `aborted` and excludes it while all earlier
+    saved episodes remain. After any save, discard, failure, or collector error,
+    the page returns to retry-ready and never initiates an automatic return;
+    support the follower when it disconnects.
 17. Select the smoke dataset and click **Validate selected dataset** with a
     minimum of `10` episodes. Continue only after the log prints `PASS`, then
     hand this checkpoint to the conversion/training owner immediately.
