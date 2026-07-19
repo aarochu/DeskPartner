@@ -416,7 +416,9 @@ def _validate_in_process(dataset_root: Path, repo_id: str, expected_digest: str)
     expected_names = tuple(_mapping(schema.get("action"), "data_schema.action").get("names", ()))
     expected_cameras = tuple(schema.get("cameras", ()))
     if len(expected_names) != 7 or expected_cameras != ("front", "side"):
-        raise CurateError("embedded schema is invalid")
+        raise CurateError(
+            f"embedded schema is invalid: names={expected_names!r}, cameras={expected_cameras!r}"
+        )
     for key in _VECTOR_KEYS:
         if _normalized_names(dataset, key) != expected_names:
             raise CurateError(f"derivative {key} names are invalid")

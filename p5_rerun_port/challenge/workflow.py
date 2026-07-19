@@ -17,24 +17,49 @@ import re
 from typing import Any
 
 
+def _code_sha256() -> str:
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    cli = root.parent / "query_challenge_cli.py"
+    if cli.is_file():
+        digest.update(cli.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(cli.read_bytes())
+    return digest.hexdigest()
+
+
 def _digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
 def _cache_path(context: Any) -> Path:
-    key = hashlib.sha256(context.config_path.read_bytes()).hexdigest()[:16]
+    key = _digest(
+        {
+            "config": hashlib.sha256(context.config_path.read_bytes()).hexdigest(),
+            "code": _code_sha256(),
+        }
+    )[:16]
     return context.artifacts_root / ".workflow" / key / "state.pkl"
 
 
 def _read_cache(context: Any) -> dict[str, Any]:
     path = _cache_path(context)
+    expected = {
+        "config_sha256": hashlib.sha256(context.config_path.read_bytes()).hexdigest(),
+        "query_code_commit": _code_sha256(),
+    }
     if not path.exists():
-        return {"config_sha256": hashlib.sha256(context.config_path.read_bytes()).hexdigest()}
+        return expected
     with path.open("rb") as stream:
         value = pickle.load(stream)  # local cache under the caller-selected artifacts root
-    if value.get("config_sha256") != hashlib.sha256(context.config_path.read_bytes()).hexdigest():
-        return {"config_sha256": hashlib.sha256(context.config_path.read_bytes()).hexdigest()}
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        return expected
     return value
 
 
@@ -53,6 +78,7 @@ def _stage_input(cache: dict[str, Any], prerequisite: str | None) -> str:
     return _digest(
         {
             "config_sha256": cache["config_sha256"],
+            "query_code_commit": cache["query_code_commit"],
             "prerequisite": None if prerequisite is None else cache.get(f"{prerequisite}_digest"),
         }
     )
@@ -76,6 +102,10 @@ def run_inventory_stage(context: Any, state: Any) -> Any:
         staging = _cache_path(context).parent
         source_lock = write_source_lock(
             staging / "source-lock.json", config, inventory, config_path=context.config_path
+        )
+        source_lock["query_code_commit"] = cache["query_code_commit"]
+        (staging / "source-lock.json").write_text(
+            json.dumps(source_lock, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         cache.update(
             config=config,
@@ -203,11 +233,11 @@ def run_prepare_stage(context: Any, state: Any) -> Any:
         )
         run_dir = write_run_artifacts(context.artifacts_root, payloads).resolve()
         manifest_path = run_dir / "selection-manifest.json"
-        derivative_root = (run_dir / "derivative").resolve()
+        derivative_root = (context.artifacts_root / "_derivatives").resolve()
         dataset_root = build_derivative(manifest_path, cache["config"], derivative_root)
         expected_digest = manifest["selection_payload_digest"]
         validation = validate_derivative_fresh(dataset_root, cache["config"].destination_repo, expected_digest)
-        validation_path = run_dir / "derivative-validation.json"
+        validation_path = Path(dataset_root).parent / "derivative-validation.json"
         validation_path.write_text(json.dumps(validation, indent=2, sort_keys=True) + "\n")
         cache.update(
             prepare_input_digest=input_digest,
@@ -218,6 +248,19 @@ def run_prepare_stage(context: Any, state: Any) -> Any:
             derivative_root=Path(dataset_root),
         )
         _write_cache(context, cache)
+    else:
+        from .artifacts import verify_run_artifacts
+        from .curate import validate_derivative_fresh
+
+        manifest = json.loads(Path(cache["selection_manifest"]).read_text(encoding="utf-8"))
+        verify_run_artifacts(
+            Path(cache["run_dir"]), manifest.get("selection_payload_digest")
+        )
+        validate_derivative_fresh(
+            Path(cache["derivative_root"]),
+            cache["config"].destination_repo,
+            manifest["selection_payload_digest"],
+        )
     return state.with_updates(
         run_id=Path(cache["run_dir"]).name,
         report_html=Path(cache["report_html"]),
