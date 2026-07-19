@@ -1268,16 +1268,10 @@ def make_dataset(
             raise RuntimeError(
                 f"Resume FPS mismatch: dataset={dataset.fps}, requested={args.dataset_fps}"
             )
-        # Shapes are tuples before JSON serialization and lists after loading an
-        # existing dataset. Compare the semantic schema, not the container type.
-        def canonical_schema(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {key: canonical_schema(item) for key, item in sorted(value.items())}
-            if isinstance(value, (list, tuple)):
-                return [canonical_schema(item) for item in value]
-            return value
-
-        if canonical_schema(dataset.features) != canonical_schema(features):
+        expected_features = {**features, **DEFAULT_FEATURES}
+        if semantic_feature_schema(dataset.features) != semantic_feature_schema(
+            expected_features
+        ):
             raise RuntimeError("Resume feature schema does not match the connected ReBot/cameras")
         dataset.start_image_writer(num_processes=0, num_threads=8)
         return dataset
@@ -1293,6 +1287,33 @@ def make_dataset(
         batch_encoding_size=1,
         vcodec="h264",
     )
+
+
+def semantic_feature_schema(features: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Normalize the stable schema fields used to authorize dataset resume.
+
+    A fresh dataset declaration omits LeRobot-owned index fields and encoded
+    video metadata.  A loaded dataset contains both.  Resume must compare the
+    complete learning plus LeRobot-owned dtype/shape/name contract while
+    ignoring derived codec details such as pix_fmt and has_audio.
+    """
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in sorted(value.items())}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        return value
+
+    return {
+        key: canonical(
+            {
+                field: feature.get(field)
+                for field in ("dtype", "shape", "names")
+            }
+        )
+        for key, feature in sorted(features.items())
+    }
 
 
 def build_training_frame(

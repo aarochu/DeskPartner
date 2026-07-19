@@ -90,6 +90,69 @@ class TrainingDefaultsTest(unittest.TestCase):
         self.assertIn('value="rebot-can-sort-stage1-v1-smoke"', training_html)
         self.assertIn('id="episodes-input" type="number" value="10"', training_html)
 
+    def test_resume_schema_accepts_loaded_video_info_and_lerobot_defaults(self) -> None:
+        learning = {
+            "action": {"dtype": "float32", "shape": (7,), "names": ["joint"] * 7},
+            "observation.images.front": {
+                "dtype": "video",
+                "shape": (480, 640, 3),
+                "names": ["height", "width", "channels"],
+            },
+        }
+        loaded = json.loads(
+            json.dumps(
+                {
+                    **learning,
+                    **controlled_record.DEFAULT_FEATURES,
+                }
+            )
+        )
+        loaded["observation.images.front"]["info"] = {
+            "video.codec": "h264",
+            "video.pix_fmt": "yuv420p",
+        }
+        expected = {**learning, **controlled_record.DEFAULT_FEATURES}
+        self.assertEqual(
+            controlled_record.semantic_feature_schema(loaded),
+            controlled_record.semantic_feature_schema(expected),
+        )
+
+        dataset = SimpleNamespace(
+            fps=30,
+            features=loaded,
+            start_image_writer=Mock(),
+        )
+        args = SimpleNamespace(
+            resume=True,
+            repo_id="local/resume-test",
+            dataset_root=Path("/tmp/resume-test"),
+            dataset_fps=30,
+        )
+        robot = SimpleNamespace(action_features={}, observation_features={})
+        with (
+            patch.object(controlled_record, "combine_feature_dicts", return_value=learning),
+            patch.object(controlled_record, "aggregate_pipeline_dataset_features", return_value={}),
+            patch.object(controlled_record, "create_initial_features", return_value={}),
+            patch.object(controlled_record, "LeRobotDataset", return_value=dataset),
+        ):
+            resumed = controlled_record.make_dataset(args, robot, Mock(), Mock())
+        self.assertIs(resumed, dataset)
+        dataset.start_image_writer.assert_called_once_with(num_processes=0, num_threads=8)
+
+        loaded["observation.images.front"]["shape"] = [720, 1280, 3]
+        self.assertNotEqual(
+            controlled_record.semantic_feature_schema(loaded),
+            controlled_record.semantic_feature_schema(expected),
+        )
+        with (
+            patch.object(controlled_record, "combine_feature_dicts", return_value=learning),
+            patch.object(controlled_record, "aggregate_pipeline_dataset_features", return_value={}),
+            patch.object(controlled_record, "create_initial_features", return_value={}),
+            patch.object(controlled_record, "LeRobotDataset", return_value=dataset),
+            self.assertRaisesRegex(RuntimeError, "Resume feature schema"),
+        ):
+            controlled_record.make_dataset(args, robot, Mock(), Mock())
+
         training_js = (GUI_ROOT / "static" / "training.js").read_text()
         self.assertIn("Save accepted. Writing this episode to Rerun and LeRobot now.", training_js)
         self.assertIn("Do not press Stop; wait until the next attempt is ready.", training_js)
