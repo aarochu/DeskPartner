@@ -29,7 +29,7 @@
 **Last updated:** 2026-07-18 — Query API CLI added (`rr.server.Server` + dataframe reader); dry-run green; live arm still TODO.
 
 **Pipeline flowchart:** see [`p5_rerun_port/README.md`](./p5_rerun_port/README.md#how-it-connects-flowchart) (GUI track vs Rerun bounty loop vs training).  
-**Query API docs:** [`p5_rerun_port/QUERY_API.md`](./p5_rerun_port/QUERY_API.md)
+**Query API docs:** [`p5_rerun_port/QUERY_API.md`](./p5_rerun_port/QUERY_API.md) — terminal CLI after recording (not inside the Rerun Viewer UI).
 
 ### Other Rerun prizes (status)
 
