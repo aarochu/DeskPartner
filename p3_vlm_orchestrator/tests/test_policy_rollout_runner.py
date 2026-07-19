@@ -176,6 +176,11 @@ class FailingAuditFile:
         if self.operation == "write" and self.failure_pending:
             self.failure_pending = False
             raise OSError("simulated audit write failure")
+        if self.operation == "terminal_write" and self.failure_pending:
+            row = json.loads(text)
+            if row.get("event") == "terminal":
+                self.failure_pending = False
+                raise OSError("simulated terminal audit write failure")
         self.pending.append(text)
         return len(text)
 
@@ -260,6 +265,31 @@ class RolloutRunnerTest(unittest.TestCase):
 
     def read_log(self) -> list[dict[str, object]]:
         return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+
+    def assert_full_fallback_schema(
+        self,
+        row: dict[str, object],
+        *,
+        event: str,
+    ) -> None:
+        self.assertEqual(set(row), LOG_FIELDS | {"failed_event"})
+        self.assertEqual(row["event"], event)
+        self.assertTrue(str(row["timestamp_utc"]).endswith("Z"))
+        for field in (
+            "monotonic_s",
+            "task",
+            "current_state_deg",
+            "predicted_first_action_deg",
+            "safety_result",
+            "send_result_deg",
+            "inference_latency_s",
+            "primary_fault_reason",
+            "cleanup_fault_reason",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(row[field])
+        self.assertIsNotNone(row["fault_reason"])
+        self.assertIsNotNone(row["audit_fault_reason"])
 
     def test_shadow_mode_never_sends_an_action(self) -> None:
         robot = FakeRobot()
@@ -561,8 +591,34 @@ class RolloutRunnerTest(unittest.TestCase):
                 self.assertEqual(robot.sent_actions, [])
                 self.assertEqual(robot.disconnect_count, 1)
                 rows = audit_file.rows()
-                self.assertIn("fault_fallback", [row["event"] for row in rows])
+                fallback_row = next(
+                    row for row in rows if row["event"] == "fault_fallback"
+                )
+                self.assert_full_fallback_schema(
+                    fallback_row,
+                    event="fault_fallback",
+                )
                 self.assertEqual(rows[-1]["event"], "terminal")
+
+    def test_terminal_fallback_retains_the_full_safe_schema(self) -> None:
+        audit_file = FailingAuditFile("terminal_write")
+        robot = FakeRobot()
+        runner = self.make_runner(policy=HoldPositionPolicy(), robot=robot)
+
+        with patch.object(Path, "open", return_value=audit_file):
+            summary = runner.run(max_cycles=1)
+
+        self.assertEqual(summary.terminal_reason, "fault")
+        fallback_row = next(
+            row
+            for row in audit_file.rows()
+            if row["event"] == "terminal_fallback"
+        )
+        self.assert_full_fallback_schema(
+            fallback_row,
+            event="terminal_fallback",
+        )
+        self.assertEqual(fallback_row["terminal_reason"], "fault")
 
     def test_disconnect_fault_is_separate_and_terminal_is_after_cleanup(self) -> None:
         robot = FakeRobot(

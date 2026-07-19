@@ -484,6 +484,7 @@ class RolloutRunner:
         try:
             row = {
                 "timestamp_utc": self._utc_timestamp(),
+                "monotonic_s": None,
                 "event": (
                     "terminal_fallback"
                     if failed_event == "terminal"
@@ -491,10 +492,19 @@ class RolloutRunner:
                 ),
                 "mode": self.mode,
                 "cycle": context.cycle,
+                "task": None,
+                "current_state_deg": None,
+                "predicted_first_action_deg": None,
+                "safety_result": None,
+                "send_result_deg": None,
+                "inference_latency_s": None,
                 "actions_attempted": actions_attempted,
                 "actions_confirmed": actions_confirmed,
                 "failed_event": failed_event,
                 "fault_reason": fault_reason,
+                "primary_fault_reason": None,
+                "cleanup_fault_reason": None,
+                "audit_fault_reason": fault_reason,
                 "terminal_reason": (
                     "fault" if failed_event == "terminal" else None
                 ),
