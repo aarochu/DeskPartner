@@ -23,7 +23,10 @@ elif [[ "$MODE" == "hub" ]]; then
     export KIT_ROOT
     source "$KIT_ROOT/env.sh"
   fi
-  HF_BIN="${VENV:+$VENV/bin/hf}"
+  HF_BIN="${REBOT_HF_BIN:-${KIT_STATE_ROOT:-$KIT_ROOT/.state}/hf-cli/bin/hf}"
+  if [[ ! -x "$HF_BIN" ]]; then
+    HF_BIN="${VENV:+$VENV/bin/hf}"
+  fi
   if [[ ! -x "$HF_BIN" ]]; then
     HF_BIN="$(command -v hf || true)"
   fi
@@ -32,7 +35,7 @@ elif [[ "$MODE" == "hub" ]]; then
     exit 1
   }
   "$HF_BIN" auth whoami >/dev/null || {
-    print -u2 -- "Private dataset login required. Run: $HF_BIN auth login"
+    print -u2 -- "Private dataset OAuth login required. Run: $KIT_ROOT/10_hf_oauth_login.command"
     exit 1
   }
   mkdir -p "$DATASET_ROOT"

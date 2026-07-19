@@ -342,10 +342,13 @@ For repeatable team-wide sharing through a private Hugging Face dataset:
   <owner-or-org>/rebot-can-sort-stage1-v1-smoke
 ```
 
-The first run requires `hf auth login`. Later runs are resumable and reuse
-already uploaded content. Give teammates the immutable revision printed by the
-command and the handoff in `TEAMMATE_DATA_RECEIVER_PROMPT.md`; do not tell them
-to train from an unspecified moving `main` revision.
+The first run requires `./10_hf_oauth_login.command`. It installs a current
+Hugging Face CLI in ignored local state and uses browser/device OAuth without
+changing the pinned robotics runtime or asking you to paste a token. Later
+runs reuse already uploaded content. Give teammates the immutable revision
+printed by the command and the handoff in
+`TEAMMATE_DATA_RECEIVER_PROMPT.md`; do not tell them to train from an
+unspecified moving `main` revision.
 
 The Hub repository slug must match the dataset's locked local slug. The
 append-only smoke stream therefore stays `rebot-can-sort-stage1-v1-smoke`.

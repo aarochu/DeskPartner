@@ -18,7 +18,10 @@ DESTINATION="$2"
 DATASET_NAME="${3:-rebot-can-sort-stage1-v1-smoke}"
 DATASET_ROOT="$KIT_DATA_ROOT/$DATASET_NAME"
 MINIMUM_EPISODES="${REBOT_SHARE_MINIMUM_EPISODES:-1}"
-HF_BIN="$VENV/bin/hf"
+HF_BIN="${REBOT_HF_BIN:-$KIT_STATE_ROOT/hf-cli/bin/hf}"
+if [[ ! -x "$HF_BIN" ]]; then
+  HF_BIN="$VENV/bin/hf"
+fi
 
 [[ -d "$DATASET_ROOT" ]] || { print -u2 -- "Dataset not found: $DATASET_ROOT"; exit 1; }
 
@@ -88,12 +91,12 @@ fi
 
 [[ -x "$HF_BIN" ]] || { print -u2 -- "Hugging Face CLI not found: $HF_BIN"; exit 1; }
 "$HF_BIN" auth whoami >/dev/null || {
-  print -u2 -- "Hugging Face login required. Run: $HF_BIN auth login"
+  print -u2 -- "Hugging Face OAuth login required. Run: $KIT_ROOT/10_hf_oauth_login.command"
   exit 1
 }
 "$HF_BIN" repo create "$DESTINATION" --repo-type dataset --private --exist-ok
-HF_XET_HIGH_PERFORMANCE=1 "$HF_BIN" upload-large-folder \
-  "$DESTINATION" "$SNAPSHOT_ROOT" --repo-type dataset --private
+HF_XET_HIGH_PERFORMANCE=1 "$HF_BIN" upload \
+  "$DESTINATION" "$SNAPSHOT_ROOT" . --repo-type dataset --private
 
 VERIFY_ROOT="$KIT_STATE_ROOT/share-verification/$DATASET_NAME"
 mkdir -p "$VERIFY_ROOT"

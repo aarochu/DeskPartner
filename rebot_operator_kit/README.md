@@ -24,6 +24,11 @@ copy-on-write snapshot rather than the active recording directory. See
 `TEAMMATE_DATA_RECEIVER_PROMPT.md` for the ready-to-send receiving-agent
 handoff.
 
+Run `10_hf_oauth_login.command` once on each sharing machine. It installs the
+current Hugging Face CLI under ignored `.state/`, opens the browser/device OAuth
+flow, and keeps the pinned robot runtime unchanged. No access token should be
+pasted into chat or committed to Git.
+
 ## Confirmed on this Mac
 
 | Item | Current mapping | Status |

@@ -32,7 +32,13 @@ Do the following:
    Never request or copy our robot calibration secrets unless your machine
    actually controls the same physical arm; receiving/training does not need
    serial-port ownership.
-3. Log into Hugging Face with your own authorized account using `hf auth login`.
+3. Install/use the isolated current CLI and log into Hugging Face through
+   browser/device OAuth:
+
+   ```bash
+   ./10_hf_oauth_login.command
+   ```
+
    Never paste a token into chat, Git, a script, or a committed config file.
 4. Download the exact dataset revision I provide, not merely whatever `main`
    points to:
