@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile_id": "rebot-b601-dm-follower1-native7d-v4",
   "profile_version": 4,
-  "description": "Verified high-response collection and native seven-action MolmoAct2 training contract for this ReBot leader/follower pair with Logitech overhead and Innomaker wrist views.",
+  "description": "Verified high-response Stage-1 single-can collection and native seven-action MolmoAct2 training contract for this ReBot leader/follower pair with Logitech overhead and Innomaker wrist views.",
   "calibration": {
     "semantics": "The JSON files preserve each arm's motor-zero reference. Runtime soft limits and leader-to-follower sign/scale mapping are locked separately below.",
     "follower": {
@@ -99,9 +99,9 @@
     ]
   },
   "collection_defaults": {
-    "task": "Pick up the crumpled paper ball and place it in the trash bin",
-    "dataset": "rebot-paper-trash-v1-smoke",
-    "episodes": 5,
+    "task": "Pick up one can and place it in the taped sorting zone",
+    "dataset": "rebot-can-sort-stage1-v1-smoke",
+    "episodes": 10,
     "episode_time_s": 30,
     "reset_time_s": 20,
     "control_hz": 240,

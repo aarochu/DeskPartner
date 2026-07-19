@@ -14,6 +14,8 @@ let latestLog = 0;
 let selectedDataset = "";
 let pollCount = 0;
 let actionPending = false;
+let noticeTimer = null;
+let previousRecordPhase = null;
 
 const fields = {
   task: "task-input", dataset: "dataset-input", episodes: "episodes-input",
@@ -38,10 +40,19 @@ async function api(path, options = {}) {
 
 function showNotice(message, kind = "info", timeout = 0) {
   const notice = $("notice");
+  if (noticeTimer !== null) {
+    window.clearTimeout(noticeTimer);
+    noticeTimer = null;
+  }
   $("notice-text").textContent = message;
   notice.dataset.kind = kind;
   notice.classList.remove("hidden");
-  if (timeout) window.setTimeout(() => notice.classList.add("hidden"), timeout);
+  if (timeout) {
+    noticeTimer = window.setTimeout(() => {
+      notice.classList.add("hidden");
+      noticeTimer = null;
+    }, timeout);
+  }
 }
 
 function number(id) { return Number($(id).value); }
@@ -163,6 +174,9 @@ function renderPreflight(preflight) {
   renderCamera("front", report.cameras?.front, report.minimum_fps);
   renderCamera("side", report.cameras?.side, report.minimum_fps);
   $("data-root-footer").textContent = preflight.paths?.data || "—";
+  if (latestStatus?.running) {
+    return;
+  }
   if (!preflight.training_profile?.passed) {
     showNotice(preflight.training_profile?.error || "The calibration/training profile is not verified.", "error", 0);
   } else if (!report.passed) {
@@ -178,11 +192,22 @@ function renderPreflight(preflight) {
 }
 
 function renderStatus(status) {
+  const oldPhase = previousRecordPhase;
   latestStatus = status;
+  previousRecordPhase = status.record_phase || null;
   if (status.control_token) controlToken = status.control_token;
   $("job-pill").dataset.state = status.state || "READY";
   $("job-state").textContent = status.state || "READY";
-  $("job-kind").textContent = status.kind ? status.kind.replaceAll("_", " ") : "Idle";
+  const phaseLabels = {
+    starting: "Connecting arms",
+    recording: "Recording episode",
+    awaiting_decision: "Waiting for keep / fail",
+    saving_rerun: "Saving Rerun replay",
+    saving_lerobot: "Checkpointing LeRobot",
+    returning_home: "Returning to session home",
+  };
+  $("job-kind").textContent = phaseLabels[status.record_phase]
+    || (status.kind ? status.kind.replaceAll("_", " ") : "Idle");
   $("job-runtime").textContent = formatDuration(status.runtime_s);
   updateButtons();
   if (status.fault) {
@@ -194,6 +219,16 @@ function renderStatus(status) {
       previousJob ? "info" : "error",
       0,
     );
+  } else if (previousRecordPhase !== oldPhase) {
+    if (previousRecordPhase === "saving_rerun") {
+      showNotice("Keep accepted. Saving the two replay videos and Rerun episode now—do not press Stop.", "info", 0);
+    } else if (previousRecordPhase === "saving_lerobot") {
+      showNotice("Replay saved. Writing and fresh-loading the LeRobot checkpoint now—do not press Stop.", "info", 0);
+    } else if (previousRecordPhase === "returning_home") {
+      showNotice("Episode is durable in LeRobot. The arm is returning to the captured session-home pose.", "success", 0);
+    } else if (previousRecordPhase === "recording" && oldPhase === "returning_home") {
+      showNotice("Next episode is ready and recording. Move one can to a new reachable position.", "success", 5000);
+    }
   }
 }
 
@@ -463,6 +498,11 @@ function bind() {
   $("finish-button").addEventListener("click", () => runAction("Episode control failed", async () => {
     await post("/api/training/record/control", { action: "finish" });
     clearFailureDraft();
+    showNotice(
+      "Save accepted. Writing this episode to Rerun and LeRobot now. Do not press Stop; wait until the next attempt is ready.",
+      "info",
+      0,
+    );
   }));
   $("rerecord-button").addEventListener("click", () => runAction("Episode control failed", async () => {
     const failureLabel = $("failure-label-input").value;

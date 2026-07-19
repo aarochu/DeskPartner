@@ -42,8 +42,12 @@ export KIT_STATE_ROOT="$KIT_ROOT/.state"
 export KIT_DATA_ROOT="$KIT_ROOT/data"
 export KIT_MODEL_ROOT="$KIT_ROOT/models"
 export KIT_CAMERA_ROOT="$KIT_ROOT/camera-check"
+export HF_HOME="$KIT_STATE_ROOT/huggingface"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 
-mkdir -p "$KIT_STATE_ROOT" "$KIT_DATA_ROOT" "$KIT_MODEL_ROOT" "$KIT_CAMERA_ROOT"
+mkdir -p "$KIT_STATE_ROOT" "$KIT_DATA_ROOT" "$KIT_MODEL_ROOT" "$KIT_CAMERA_ROOT" \
+  "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE"
 
 detect_ports() {
   local assignments
