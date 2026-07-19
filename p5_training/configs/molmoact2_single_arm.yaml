@@ -2,7 +2,7 @@
 # Docs: https://huggingface.co/docs/lerobot/main/en/molmoact2
 # Consumed by p5_training/modal_finetune.py -> build_train_argv().
 
-exp_name: deskpartner_molmoact2
+exp_name: rebot_52ep_molmoact2
 
 # Warm-start checkpoint:
 #   allenai/MolmoAct2                     -> generic base, fresh processor from our
@@ -15,7 +15,7 @@ base_checkpoint: allenai/MolmoAct2
 # Dataset — private HF repo, pulled on Modal via the 'huggingface' secret.
 # Keep the revision pinned so every run is reproducible.
 dataset_repo_id: Cornerf/rebot-can-sort-stage1-v1-smoke
-dataset_revision: f8b45083eafc107179bb5849803301eb77245685
+dataset_revision: 74d1f300786d58b4f6f55e1798cbb1a1a48f5409  # 52 episodes / 36,729 frames
 
 finetune:
   mode: action_expert_only    # action_expert_only | lora   (NEVER full)
@@ -30,7 +30,7 @@ policy:
   num_flow_timesteps: 8
 
 train:
-  steps: 4000                 # ~150 demos; raise once we see the loss curve
+  steps: 6000                 # 52 demos; raise once we see the loss curve
   batch_size: 16              # fits A100-40GB for action-expert-only
   num_workers: 4
   save_freq: 1000
