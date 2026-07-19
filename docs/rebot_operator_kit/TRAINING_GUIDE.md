@@ -196,7 +196,9 @@ the raw seventh joint during recording.
     leader back in its own captured pose, then scatter the can to a new random
     reachable position. Cover corners, edges, and center across the dataset.
     The next attempt stays blocked until both arms are aligned and the reset
-    timer has completed; reset frames are not saved.
+    timer has completed; reset frames are not saved. The collector waits without
+    an alignment timeout, so taking longer to return the passive leader never
+    disconnects the session. Use **Stop & finalize** to end intentionally.
 13. For a miss, collision, occlusion, dropped object, wrong destination, large
     correction, awkward hesitation, or any jerky-but-successful motion, choose
     a failure reason and click **Mark failed & re-record**. The take is excluded

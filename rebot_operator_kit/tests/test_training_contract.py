@@ -298,6 +298,85 @@ class SessionHomeReturnTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(robot.send_count, 0)
 
+    def test_home_reset_waits_beyond_old_timeout_for_leader_alignment(self) -> None:
+        robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
+        leader_home = {name: 0.0 for name in self.FEATURES}
+        leader = self.FakeLeader(leader_home)
+        home = controlled_record.capture_session_home(robot, leader)
+        leader.positions = {name: 10.0 for name in self.FEATURES}
+        reads = 0
+
+        def delayed_leader_action() -> dict[str, float]:
+            nonlocal reads
+            reads += 1
+            if reads > 70:
+                return dict(leader_home)
+            return dict(leader.positions)
+
+        leader.get_action = delayed_leader_action
+
+        class Clock:
+            now = 0.0
+
+            def __call__(self) -> float:
+                self.now += 1.0
+                return self.now
+
+        with (
+            patch.object(controlled_record.time, "perf_counter", side_effect=Clock()),
+            patch.object(controlled_record, "precise_sleep"),
+            patch.object(controlled_record, "HOME_SETTLE_TIME_S", 0.0),
+        ):
+            result = controlled_record.automatic_reset_to_session_home(
+                args=SimpleNamespace(control_hz=1, max_step=8.4, reset_time_s=0.0),
+                robot=robot,
+                leader=leader,
+                events={"stop": False},
+                session_home=home,
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertGreater(result["elapsed_s"], 50.0)
+        self.assertGreater(reads, 70)
+
+    def test_stop_interrupts_indefinite_leader_wait_after_old_timeout(self) -> None:
+        robot = self.FakeRobot(self.FEATURES, self.DIRECTIONS)
+        leader = self.FakeLeader({name: 0.0 for name in self.FEATURES})
+        home = controlled_record.capture_session_home(robot, leader)
+        leader.positions = {name: 10.0 for name in self.FEATURES}
+        events = {"stop": False}
+        reads = 0
+
+        def waiting_leader_action() -> dict[str, float]:
+            nonlocal reads
+            reads += 1
+            if reads > 70:
+                events["stop"] = True
+            return dict(leader.positions)
+
+        leader.get_action = waiting_leader_action
+
+        class Clock:
+            now = 0.0
+
+            def __call__(self) -> float:
+                self.now += 1.0
+                return self.now
+
+        with (
+            patch.object(controlled_record.time, "perf_counter", side_effect=Clock()),
+            patch.object(controlled_record, "precise_sleep"),
+        ):
+            result = controlled_record.automatic_reset_to_session_home(
+                args=SimpleNamespace(control_hz=1, max_step=8.4, reset_time_s=0.0),
+                robot=robot,
+                leader=leader,
+                events=events,
+                session_home=home,
+            )
+        self.assertIsNone(result)
+        self.assertGreater(reads, 70)
+
     def test_completed_home_return_is_persisted_in_attempt_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -470,6 +549,43 @@ class ZeroFrameQuarantineTest(unittest.TestCase):
         self.assertIsNone(destination)
         self.assertTrue(root.is_dir())
         self.assertTrue(manifest.is_file())
+
+
+class PartialRunManifestTest(unittest.TestCase):
+    def test_durable_partial_run_remains_profile_compatible(self) -> None:
+        profile = {"profile_id": "test-profile"}
+        contract = {"dataset": "test-dataset"}
+        profile_digest = workspace._canonical_digest(profile)
+        contract_digest = workspace._canonical_digest(contract)
+
+        def compatibility(durable_episodes: int) -> dict[str, object]:
+            manifest = {
+                "training_profile": {"snapshot": profile, "digest": profile_digest},
+                "collection_contract": {"snapshot": contract, "digest": contract_digest},
+                "lifecycle": {
+                    "state": "PARTIAL_COMPLETE",
+                    "exit_code": 1,
+                    "durable_episodes_this_run": durable_episodes,
+                },
+            }
+            with patch.object(
+                workspace,
+                "_collection_manifests",
+                return_value={"records": [manifest], "errors": [], "candidate_count": 1},
+            ):
+                return workspace._manifest_profile_compatibility(
+                    "test-dataset",
+                    profile_digest,
+                    contract_digest,
+                )
+
+        accepted = compatibility(1)
+        self.assertTrue(accepted["compatible"])
+        self.assertEqual(accepted["invalid_manifest_count"], 0)
+
+        rejected = compatibility(0)
+        self.assertFalse(rejected["compatible"])
+        self.assertEqual(rejected["invalid_manifest_count"], 1)
 
 
 class AttemptArchiveTest(unittest.TestCase):

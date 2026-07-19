@@ -160,8 +160,10 @@ is in `teleop_gui/README.md`.
   this session's home. The collector captures their current poses on connect.
 - After every kept or failed episode, the follower automatically returns to its
   captured pose at a capped 120 deg/s. Return the passive leader by hand and
-  reset the can while keeping the taped zone fixed; the next attempt is blocked
-  and the reset timer has completed. Reset motion is not recorded.
+  reset the can while keeping the taped zone fixed; the next attempt remains
+  blocked until both arms align and the reset timer has completed. The session
+  stays connected while waiting, with no alignment timeout; use Stop & finalize
+  if you intend to end it. Reset motion is not recorded.
 - Move smoothly and decisively. Delete jerky-but-successful takes as well as
   misses. Avoid repeated corrections, collisions, hesitations, and covering
   the object with your hand or body.

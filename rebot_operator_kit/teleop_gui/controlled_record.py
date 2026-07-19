@@ -1325,7 +1325,6 @@ HOME_FOLLOWER_TOLERANCE_DEG = 2.0
 HOME_GRIPPER_TOLERANCE_DEG = 5.0
 HOME_LEADER_MIN_TOLERANCE_DEG = 1.0
 HOME_SETTLE_TIME_S = 0.25
-HOME_ALIGNMENT_GRACE_S = 30.0
 
 
 def _joint_positions(
@@ -1425,10 +1424,6 @@ def automatic_reset_to_session_home(
     next_control = started
     stable_since: float | None = None
     last_status = started - 1.0
-    hard_deadline_s = max(
-        float(args.reset_time_s) + HOME_ALIGNMENT_GRACE_S,
-        HOME_ALIGNMENT_GRACE_S,
-    )
     loops = 0
 
     print(
@@ -1489,12 +1484,6 @@ def automatic_reset_to_session_home(
             )
             return result
 
-        if elapsed >= hard_deadline_s:
-            raise RuntimeError(
-                "Automatic reset did not reach the captured session pose; "
-                "collection stopped before another attempt could start"
-            )
-
         if now - last_status >= 1.0:
             follower_delta = max(
                 abs(observation[name] - follower_target[name]) for name in feature_names
@@ -1513,7 +1502,8 @@ def automatic_reset_to_session_home(
                 f"RESET auto_home elapsed={elapsed:.1f}s "
                 f"follower_delta={follower_delta:.1f}deg "
                 f"leader_delta={leader_delta:.1f}deg "
-                f"waiting_for={'+'.join(waiting_for) or 'settle'}",
+                f"waiting_for={'+'.join(waiting_for) or 'settle'} "
+                f"waiting_for_operator={str(not leader_aligned).lower()}",
                 flush=True,
             )
             last_status = now

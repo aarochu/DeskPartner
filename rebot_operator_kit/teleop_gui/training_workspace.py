@@ -737,7 +737,16 @@ def _manifest_profile_compatibility(
         lifecycle_exit = lifecycle.get("exit_code") if isinstance(lifecycle, dict) else None
         state = str(lifecycle.get("state", "")) if isinstance(lifecycle, dict) else ""
         lifecycle_states.add(state)
-        if state != "COMPLETE" or lifecycle_exit != 0:
+        durable_partial = (
+            state == "PARTIAL_COMPLETE"
+            and isinstance(lifecycle_exit, int)
+            and not isinstance(lifecycle_exit, bool)
+            and lifecycle_exit != 0
+            and isinstance(lifecycle.get("durable_episodes_this_run"), int)
+            and not isinstance(lifecycle.get("durable_episodes_this_run"), bool)
+            and lifecycle["durable_episodes_this_run"] > 0
+        ) if isinstance(lifecycle, dict) else False
+        if not ((state == "COMPLETE" and lifecycle_exit == 0) or durable_partial):
             invalid += 1
     compatible = bool(
         result["candidate_count"]
@@ -1770,6 +1779,8 @@ class TrainingManager:
         config: dict[str, Any] | None,
     ) -> None:
         assert process.stdout is not None
+        durable_episodes_this_run = 0
+        durable_dataset_episodes = 0
         for raw in process.stdout:
             line = raw.rstrip("\r\n")
             if not line:
@@ -1788,8 +1799,21 @@ class TrainingManager:
                         self._record_phase = "saving_lerobot"
                     elif line.startswith("ATTEMPT lerobot_durable"):
                         self._record_phase = "returning_home"
+                        durable_episodes_this_run += 1
+                        total_match = re.search(r"\btotal_episodes=(\d+)\b", line)
+                        if total_match:
+                            durable_dataset_episodes = int(total_match.group(1))
                     elif line.startswith("RESET auto_home"):
                         self._record_phase = "returning_home"
+                if line.startswith("ATTEMPT lerobot_durable"):
+                    try:
+                        _update_run_manifest(
+                            manifest_path,
+                            durable_episodes_this_run=durable_episodes_this_run,
+                            durable_dataset_episodes=durable_dataset_episodes,
+                        )
+                    except RuntimeError as exc:
+                        self._append_log("ERROR", str(exc))
             level = "INFO"
             if line.startswith("ATTEMPT archived_failed"):
                 level = "INFO"
@@ -1799,13 +1823,22 @@ class TrainingManager:
                 level = "WARN"
             self._append_log(level, line)
         exit_code = process.wait()
+        lifecycle_state = (
+            "COMPLETE"
+            if exit_code == 0
+            else "PARTIAL_COMPLETE"
+            if durable_episodes_this_run > 0
+            else "FAILED"
+        )
         try:
             _update_run_manifest(
                 manifest_path,
-                state="COMPLETE" if exit_code == 0 else "FAILED",
+                state=lifecycle_state,
                 finished_at=datetime.now().isoformat(timespec="seconds"),
                 exit_code=exit_code,
                 error=None if exit_code == 0 else f"{kind} exited with code {exit_code}",
+                durable_episodes_this_run=durable_episodes_this_run,
+                durable_dataset_episodes=durable_dataset_episodes,
             )
         except RuntimeError as exc:
             self._append_log("ERROR", str(exc))
