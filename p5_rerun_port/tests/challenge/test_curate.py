@@ -9,8 +9,11 @@ import numpy as np
 import pytest
 
 from p5_rerun_port.challenge import curate
+from p5_rerun_port.challenge.artifacts import build_selection_manifest
 from p5_rerun_port.challenge.config import ChallengeConfig
 from p5_rerun_port.challenge.curate import CurateError, build_derivative, validate_derivative_fresh
+from p5_rerun_port.challenge.models import EpisodeIdentity, InventoryRow
+from p5_rerun_port.challenge.quality import EpisodeVerdict, ThresholdSnapshot
 
 
 CONFIG = Path("config/rerun_query_challenge.yaml")
@@ -27,9 +30,12 @@ def _item(source, episode_index: int, frame_count: int = 2) -> dict:
         "identity": identity,
         "role": source.role,
         "task_key": source.task_key,
-        "repo_id": source.repo_id,
-        "revision": source.revision,
-        "source_key": str(episode_index),
+        "source": {
+            "repo_id": source.repo_id,
+            "revision": source.revision,
+            "source_key": str(episode_index),
+            "path": "data/chunk-000/file-000.parquet",
+        },
         "source_path": "data/chunk-000/file-000.parquet",
         "episode_index": episode_index,
         "attempt_id": None,
@@ -65,8 +71,8 @@ def _manifest(config: ChallengeConfig) -> dict:
         "threshold_snapshot_digest": "thresholds",
         "destination_repo": config.destination_repo,
         "data_schema": {
-            "action": list(config.joint_names),
-            "state": list(config.joint_names),
+            "action": {"dtype": "float32", "shape": [7], "names": list(config.joint_names)},
+            "state": {"dtype": "float32", "shape": [7], "names": list(config.joint_names)},
             "cameras": list(config.camera_keys),
         },
         "source_counts": {"total": 2, "success": 2, "failure": 0},
@@ -86,6 +92,37 @@ def _write_manifest(tmp_path: Path, manifest: dict) -> Path:
     path = tmp_path / "selection-manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
     return path
+
+
+def test_artifact_manifest_is_accepted_by_curator_contract(
+    tmp_path: Path, config: ChallengeConfig
+) -> None:
+    sources = [source for source in config.sources if source.role == "success"]
+    rows = tuple(
+        InventoryRow(
+            EpisodeIdentity(source.repo_id, source.revision, "0"),
+            "success",
+            source.task_key,
+            "data/chunk-000/file-000.parquet",
+            0,
+            None,
+            2,
+            "2026-07-19T00:00:00Z",
+        )
+        for source in sources
+    )
+    snapshot = ThresholdSnapshot((), tuple(row.identity.canonical for row in rows), (), "thresholds")
+    verdicts = tuple(
+        EpisodeVerdict(row.identity.canonical, "PASS", (), f"metrics-{index}", "thresholds", f"verdict-{index}")
+        for index, row in enumerate(rows)
+    )
+    source_lock = _manifest(config)["source_lock"]
+    manifest = build_selection_manifest(rows, verdicts, snapshot, source_lock, "2026-07-19T00:00:00Z")
+
+    loaded, selections = curate._load_manifest(_write_manifest(tmp_path, manifest), config)
+
+    assert loaded["selection_payload_digest"] == manifest["selection_payload_digest"]
+    assert [selection.identity for selection in selections] == sorted(manifest["selected_identities"])
 
 
 def _make_source(root: Path, repo_id: str, config: ChallengeConfig, seed: int) -> None:
@@ -165,8 +202,8 @@ def test_builds_two_source_derivative_and_fresh_loads_every_frame(
         lambda manifest: manifest["items"][0].update(role="failure"),
         lambda manifest: manifest["items"][0].update(verdict="REVIEW"),
         lambda manifest: manifest["selected_identities"].append(manifest["selected_identities"][0]),
-        lambda manifest: manifest["items"][0].update(revision="0" * 40),
-        lambda manifest: manifest["data_schema"].update(action=["gripper"] * 7),
+        lambda manifest: manifest["items"][0]["source"].update(revision="0" * 40),
+        lambda manifest: manifest["data_schema"]["action"].update(names=["gripper"] * 7),
     ],
 )
 def test_manifest_tampering_fails_before_any_source_is_opened(

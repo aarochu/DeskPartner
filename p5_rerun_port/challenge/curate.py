@@ -89,7 +89,11 @@ def _load_manifest(path: Path, config: ChallengeConfig) -> tuple[dict[str, Any],
     if tuple(source_lock.get("camera_keys", ())) != config.camera_keys:
         raise CurateError("source-lock camera order does not match the challenge contract")
     schema = _mapping(manifest.get("data_schema"), "data_schema")
-    expected_vector = list(config.joint_names)
+    expected_vector = {
+        "dtype": "float32",
+        "shape": [len(config.joint_names)],
+        "names": list(config.joint_names),
+    }
     if schema.get("action") != expected_vector or schema.get("state") != expected_vector:
         raise CurateError("manifest action/state schema does not match the challenge contract")
     if schema.get("cameras") != list(config.camera_keys):
@@ -146,14 +150,15 @@ def _load_manifest(path: Path, config: ChallengeConfig) -> tuple[dict[str, Any],
     config_locks = {(s.repo_id, s.revision): s for s in config.sources}
     for identity in sorted(raw_selected):
         item = items_by_identity[identity]
-        repo_id = _string(item.get("repo_id"), f"items[{identity}].repo_id")
-        revision = _string(item.get("revision"), f"items[{identity}].revision")
+        source_item = _mapping(item.get("source"), f"items[{identity}].source")
+        repo_id = _string(source_item.get("repo_id"), f"items[{identity}].source.repo_id")
+        revision = _string(source_item.get("revision"), f"items[{identity}].source.revision")
         role = _string(item.get("role"), f"items[{identity}].role")
         task_key = _string(item.get("task_key"), f"items[{identity}].task_key")
         verdict = _string(item.get("verdict"), f"items[{identity}].verdict")
         episode_index = _integer(item.get("episode_index"), f"items[{identity}].episode_index")
         frame_count = _integer(item.get("frame_count"), f"items[{identity}].frame_count", minimum=1)
-        source_key = _string(item.get("source_key"), f"items[{identity}].source_key")
+        source_key = _string(source_item.get("source_key"), f"items[{identity}].source.source_key")
         expected_identity = f"{repo_id}@{revision}:{source_key}"
         if identity != expected_identity:
             raise CurateError(f"selected identity does not authenticate its source episode: {identity}")
@@ -408,7 +413,7 @@ def _validate_in_process(dataset_root: Path, repo_id: str, expected_digest: str)
     dataset = _dataset_class()(repo_id=repo_id, root=dataset_root, video_backend="pyav")
     if dataset.repo_id != repo_id or getattr(dataset, "fps", None) != 30:
         raise CurateError("derivative repository identity or FPS is invalid")
-    expected_names = tuple(schema.get("action", ()))
+    expected_names = tuple(_mapping(schema.get("action"), "data_schema.action").get("names", ()))
     expected_cameras = tuple(schema.get("cameras", ()))
     if len(expected_names) != 7 or expected_cameras != ("front", "side"):
         raise CurateError("embedded schema is invalid")
