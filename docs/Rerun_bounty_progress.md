@@ -26,6 +26,8 @@
 
 **Last updated:** 2026-07-18 — dry-run loop green on Windows; docs consolidated under `docs/`; awaiting venue hardware validation.
 
+**Pipeline flowchart:** see [`p5_rerun_port/README.md`](./p5_rerun_port/README.md#how-it-connects-flowchart) (GUI track vs Rerun bounty loop vs training).
+
 ---
 
 ## What “done” looks like
