@@ -1,44 +1,29 @@
 /* ReBot Run Library — universal, timeless.
-   Light-first for legibility at any age; honors prefers-color-scheme: dark.
+   One bright paper theme for legibility at any age, in any OS theme.
    Plain words, sentence case, big targets, visible focus. No gradients, no glass. */
 
 :root {
   --bg: #faf9f6;            /* warm paper */
   --panel: #ffffff;
-  --panel-2: #f4f3ee;
-  --line: #ddd9cf;
-  --text: #1d1d1a;
-  --muted: #5c5b54;
-  --accent: #17694b;        /* one calm green */
+  --panel-2: #f3f2ec;
+  --line: #c9c4b4;
+  --text: #171714;
+  --muted: #45443e;
+  --accent: #0e7a4f;        /* one calm green, a notch brighter */
   --accent-ink: #ffffff;
-  --accent-soft: #e2f1e9;
-  --bad: #a92c25;
-  --bad-soft: #f7e5e3;
-  --warn: #7a5d00;
-  --warn-soft: #f6eed4;
+  --accent-soft: #d9f0e4;
+  --bad: #b02a22;
+  --bad-soft: #fbe3e0;
+  --warn: #6f5400;
+  --warn-soft: #f8edcb;
   --radius: 10px;
   font-family: -apple-system, "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, sans-serif;
   font-size: 16px;
   color: var(--text);
   background: var(--bg);
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #161815;
-    --panel: #1e211d;
-    --panel-2: #232722;
-    --line: #363b34;
-    --text: #f0efe9;
-    --muted: #a8aaa0;
-    --accent: #7bcfa3;
-    --accent-ink: #0d2419;
-    --accent-soft: #24342b;
-    --bad: #f1948c;
-    --bad-soft: #3a2523;
-    --warn: #e2c164;
-    --warn-soft: #38321e;
-  }
-}
+/* One bright, high-visibility theme for everyone — the page stays light
+   regardless of OS dark mode, so labels and chips are always easy to read. */
 
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; background: var(--bg); line-height: 1.5; }
