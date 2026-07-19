@@ -387,6 +387,11 @@ def write_source_lock(
     payload: dict[str, Any] = {
         "schema_version": 1,
         "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "robot_type": config.robot_type,
+        "fps": config.fps,
+        "joint_names": list(config.joint_names),
+        "camera_keys": list(config.camera_keys),
+        "destination_repo": config.destination_repo,
         "sources": sources,
         "expected_counts": expected_counts,
         "observed_counts": observed_counts,
