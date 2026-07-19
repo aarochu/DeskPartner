@@ -2,7 +2,8 @@
 
 Port of the [so100-hackathon](https://github.com/mission-robotics-ai/so100-hackathon) loop onto **reBot B601-DM + leader 102** for the non-SO-101 Rerun bounty.
 
-**Progress tracker:** [`../Rerun_bounty_progress.md`](../Rerun_bounty_progress.md)
+**Progress tracker:** [`../Rerun_bounty_progress.md`](../Rerun_bounty_progress.md)  
+**Code package:** [`../../p5_rerun_port/`](../../p5_rerun_port/)
 
 ```text
 log_rebot → record_episode (.rrd) → query_dataset → export_lerobot → replay_episode

@@ -5,7 +5,7 @@
 
 **Reference repo:** https://github.com/mission-robotics-ai/so100-hackathon  
 **Team gameplan:** `saturday_gameplan.md` (Person 5 = integration + bounty)  
-**Code:** [`p5_rerun_port/`](./p5_rerun_port/README.md) on branch `feat/rebot-rerun-port`
+**Code:** [`p5_rerun_port/`](../p5_rerun_port/) · docs: [`p5_rerun_port/`](./p5_rerun_port/) · branch `feat/rebot-rerun-port`
 
 ---
 
@@ -24,7 +24,7 @@
 | Demo video + 60s pitch | TODO | |
 | Off-site sync (RRDs / checkpoints) | TODO | |
 
-**Last updated:** 2026-07-18 — dry-run loop green on Windows; awaiting venue hardware validation.
+**Last updated:** 2026-07-18 — dry-run loop green on Windows; docs consolidated under `docs/`; awaiting venue hardware validation.
 
 ---
 
