@@ -57,6 +57,7 @@ from lerobot.processor import make_default_processors
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
+import arm3d
 from attempt_archive import (
     atomic_write_json,
     attempt_path,
@@ -551,6 +552,11 @@ def begin_attempt(
         rr.TextDocument(json.dumps(metadata, indent=2, ensure_ascii=False)),
         static=True,
     )
+    # Live 3D arm view: curated layout + static scene, so the viewer that pops
+    # up on record shows a moving robot next to the cameras — not raw lanes.
+    # Both fail soft and are also baked into the saved .rrd for later review.
+    arm3d.send_simple_blueprint(recording)
+    arm3d.log_scene(recording)
     return directory, metadata, recording
 
 
@@ -586,6 +592,8 @@ def log_attempt_sample(
                 recording.log(entity, rr.Image(array).compress(jpeg_quality=85))
             elif array.ndim == 1:
                 recording.log(entity, rr.Scalars(array.astype(float, copy=False)))
+    # Pose the 3D skeleton from this frame's joints (fail-soft visual aid).
+    arm3d.log_pose(recording, observation)
 
 
 class AttemptRerunWriter:
