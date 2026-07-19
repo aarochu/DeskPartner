@@ -63,7 +63,7 @@ function setVideo(video, artifact, rawFramesPreserved = false) {
   shell.classList.toggle("missing", !artifact?.available);
   const message = shell.querySelector(".media-unavailable");
   if (message) message.textContent = rawFramesPreserved
-    ? "MP4 unavailable · raw frames preserved"
+    ? "Video file missing — the raw frames are safe"
     : "Video unavailable";
 }
 
@@ -73,7 +73,12 @@ function activeAttempt() {
 }
 
 function updateResultCount() {
-  $("result-count").textContent = `${state.attempts.length} shown · ${state.matching} matching · ${state.total} total · ${state.selectedIds.size} selected`;
+  const shown = state.attempts.length;
+  const base = state.matching === state.total
+    ? `Showing ${shown} of ${state.total} run${state.total === 1 ? "" : "s"}`
+    : `Showing ${shown} of ${state.matching} matches (${state.total} total)`;
+  const selected = state.selectedIds.size ? ` · ${state.selectedIds.size} selected` : "";
+  $("result-count").textContent = base + selected;
 }
 
 async function loadDetail(attemptId) {
@@ -108,18 +113,18 @@ function renderDetail() {
   run.replaceChildren();
   addDefinition(run, "Dataset", attempt.dataset);
   addDefinition(run, "Outcome", String(attempt.disposition || "unknown").replaceAll("_", " "));
-  addDefinition(run, "LeRobot", attempt.training_included ? `Episode ${attempt.training_episode_index}` : "Excluded");
+  addDefinition(run, "Training set", attempt.training_included ? `In · episode ${attempt.training_episode_index}` : "Not included");
   addDefinition(run, "Created", attempt.created_at);
   addDefinition(run, "Failure", attempt.failure_label || "—");
-  addDefinition(run, "RRD", formatBytes(attempt.artifacts?.rerun?.bytes));
+  addDefinition(run, "Rerun file", formatBytes(attempt.artifacts?.rerun?.bytes));
 
   const timing = $("timing-summary");
   timing.replaceChildren();
   addDefinition(timing, "Frames", String(attempt.frames || 0));
   addDefinition(timing, "Duration", `${Number(attempt.duration_s || 0).toFixed(1)} s`);
   addDefinition(timing, "Dataset rate", attempt.timing?.dataset_fps ? `${attempt.timing.dataset_fps} FPS` : "—");
-  addDefinition(timing, "Motor loop", Number(attempt.timing?.actual_control_hz || 0) > 0 ? `${attempt.timing.actual_control_hz} Hz` : "unavailable");
-  addDefinition(timing, "Requested", attempt.timing?.requested_control_hz ? `${attempt.timing.requested_control_hz} Hz` : "—");
+  addDefinition(timing, "Motor rate", Number(attempt.timing?.actual_control_hz || 0) > 0 ? `${attempt.timing.actual_control_hz} Hz` : "unavailable");
+  addDefinition(timing, "Requested rate", attempt.timing?.requested_control_hz ? `${attempt.timing.requested_control_hz} Hz` : "—");
 
   const cameras = $("camera-summary");
   cameras.replaceChildren();
@@ -153,7 +158,7 @@ function renderAttempts() {
   if (!state.attempts.length) {
     const empty = document.createElement("p");
     empty.className = "empty-list";
-    empty.textContent = "No runs match these filters. Recorded attempts will appear here without starting the robot.";
+    empty.textContent = "No runs to show yet. When you record an attempt, it appears here on its own — the robot never moves from this page.";
     list.append(empty);
     state.activeId = null;
     renderDetail();
@@ -183,7 +188,7 @@ function renderAttempts() {
     id.textContent = attempt.attempt_id;
     tag.className = tagClass(attempt.tag);
     tag.textContent = attempt.tag;
-    meta.textContent = `${attempt.frames || 0} frames · ${Number(attempt.duration_s || 0).toFixed(1)}s · ${attempt.training_included ? `EP ${attempt.training_episode_index}` : "excluded"}`;
+    meta.textContent = `${Number(attempt.duration_s || 0).toFixed(1)} s · ${attempt.frames || 0} frames · ${attempt.training_included ? "in training set" : "not in training"}`;
     copy.append(id, tag, meta);
     const open = document.createElement("button");
     open.type = "button";
@@ -233,7 +238,7 @@ async function loadCatalog({ append = false } = {}) {
     state.matching = Number(payload.visible ?? state.attempts.length);
     state.total = Number(payload.total ?? state.matching);
     setOptions($("dataset-filter"), payload.datasets || [], "All datasets");
-    setOptions($("tag-filter"), payload.tags || [], "All tags");
+    setOptions($("tag-filter"), payload.tags || [], "All labels");
     updateResultCount();
     $("load-more-button").classList.toggle("hidden", !state.hasMore);
     renderAttempts();
@@ -310,8 +315,8 @@ function bindSynchronizedVideos() {
       ? Math.abs((front.currentTime || 0) - (side.currentTime || 0))
       : null;
     $("video-drift").textContent = drift == null
-      ? "Camera drift: unavailable"
-      : `Camera drift: ${(drift * 1000).toFixed(0)} ms`;
+      ? "Camera sync: unavailable"
+      : `Cameras in sync within ${(drift * 1000).toFixed(0)} ms`;
   }, 500);
 }
 

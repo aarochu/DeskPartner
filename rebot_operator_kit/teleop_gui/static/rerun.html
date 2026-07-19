@@ -3,37 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>ReBot Rerun Library</title>
+  <meta name="color-scheme" content="light dark">
+  <title>ReBot Run Library</title>
   <link rel="stylesheet" href="/rerun.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/training" aria-label="Back to collection">
-      <span class="brand-mark">↳</span>
-      <span><strong>ReBot</strong><small>RERUN LIBRARY</small></span>
+    <a class="brand" href="/training" aria-label="Back to recording page">
+      <span class="brand-mark" aria-hidden="true">↳</span>
+      <span><strong>ReBot</strong><small>Run Library</small></span>
     </a>
-    <nav aria-label="Operator pages">
+    <nav aria-label="Pages">
       <a href="/training">Record</a>
-      <a class="active" href="/rerun" aria-current="page">Rerun</a>
+      <a class="active" href="/rerun" aria-current="page">Library</a>
     </nav>
-    <span class="safe-pill">VISUALIZATION ONLY</span>
+    <span class="safe-pill">View only — never moves the robot</span>
   </header>
 
   <main>
     <section class="hero">
       <div>
-        <p class="eyebrow">REVIEW · LABEL · SHARE</p>
         <h1>Every run, easy to find.</h1>
-        <p>Review both cameras and the Rerun timeline. Opening a run never commands the robot.</p>
+        <p>Pick a run on the left to watch both cameras, check the details, and decide what happens next.</p>
       </div>
       <button id="refresh-button" class="button secondary" type="button">Refresh</button>
     </section>
 
-    <section class="filters" aria-label="Attempt filters">
+    <section class="filters" aria-label="Find a run">
+      <label class="search">Search<input id="search-filter" type="search" maxlength="200" placeholder="Search by run, task, or label…"></label>
       <label>Dataset<select id="dataset-filter"><option value="">All datasets</option></select></label>
-      <label>Tag<select id="tag-filter"><option value="">All tags</option></select></label>
-      <label class="search">Search<input id="search-filter" type="search" maxlength="200" placeholder="Run ID, task, label…"></label>
+      <label>Label<select id="tag-filter"><option value="">All labels</option></select></label>
       <p id="result-count" aria-live="polite">Loading runs…</p>
     </section>
 
@@ -46,14 +45,18 @@
           <span><button id="select-all-button" class="text-button" type="button">Select shown</button><button id="clear-selection-button" class="text-button" type="button">Clear</button></span>
         </div>
         <div id="attempt-list" class="attempt-list" aria-live="polite"></div>
-        <button id="load-more-button" class="button secondary load-more hidden" type="button">Load older runs</button>
+        <button id="load-more-button" class="button secondary load-more hidden" type="button">Show older runs</button>
       </aside>
 
       <article id="detail-pane" class="detail-pane" aria-live="polite">
         <div id="empty-detail" class="empty-detail">
-          <span>◎</span>
-          <h2>Select a run</h2>
-          <p>Camera playback, timing, joints, review status, and Rerun visualization appear here.</p>
+          <h2>How this page works</h2>
+          <ol class="how-to">
+            <li><strong>Pick a run</strong> from the list on the left.</li>
+            <li><strong>Watch</strong> both cameras play together, or open the full Rerun view.</li>
+            <li><strong>Decide</strong> — label it, keep it for training, or share it.</li>
+          </ol>
+          <p>Watching a run is always safe. This page never moves the robot.</p>
         </div>
         <div id="attempt-detail" class="hidden">
           <div class="detail-header">
@@ -62,36 +65,36 @@
               <h2 id="detail-id"></h2>
               <p id="detail-task" class="muted"></p>
             </div>
-            <label class="select-run"><input id="selection-checkbox" type="checkbox"> Include in share selection</label>
+            <label class="select-run"><input id="selection-checkbox" type="checkbox"> Add to share list</label>
           </div>
 
           <div class="video-grid">
-            <figure><div class="video-shell"><video id="front-video" controls playsinline preload="metadata"></video><span class="media-unavailable">Video unavailable</span></div><figcaption>Front · Logitech overhead</figcaption></figure>
-            <figure><div class="video-shell"><video id="side-video" controls playsinline preload="metadata"></video><span class="media-unavailable">Video unavailable</span></div><figcaption>Side · Innomaker wrist</figcaption></figure>
+            <figure><div class="video-shell"><video id="front-video" controls playsinline preload="metadata"></video><span class="media-unavailable">Video unavailable</span></div><figcaption>Overhead camera</figcaption></figure>
+            <figure><div class="video-shell"><video id="side-video" controls playsinline preload="metadata"></video><span class="media-unavailable">Video unavailable</span></div><figcaption>Wrist camera</figcaption></figure>
           </div>
-          <p id="video-drift" class="video-drift">Camera drift: unavailable</p>
+          <p id="video-drift" class="video-drift">Camera sync: unavailable</p>
 
           <div class="actions">
-            <button id="open-rerun-button" class="button primary" type="button">Open Rerun visualization</button>
-            <a id="review-button" class="button secondary" href="/training">Review / relabel</a>
-            <button id="share-button" class="button secondary" type="button">Preview verified share</button>
+            <button id="open-rerun-button" class="button primary" type="button">Open full view (Rerun)</button>
+            <a id="review-button" class="button secondary" href="/training">Review &amp; label</a>
+            <button id="share-button" class="button secondary" type="button">Preview share</button>
           </div>
-          <p class="motion-warning">Rerun visualization is read-only. Physical trajectory replay is not available from this page.</p>
+          <p class="motion-warning">Watching a run is always safe — this page never commands the arm.</p>
 
           <div class="summary-grid">
             <section><h3>Run</h3><dl id="run-summary"></dl></section>
             <section><h3>Timing</h3><dl id="timing-summary"></dl></section>
             <section><h3>Cameras</h3><dl id="camera-summary"></dl></section>
-            <section><h3>Seven-joint contract</h3><div id="joint-summary" class="joint-list"></div></section>
+            <section><h3>Joint start positions</h3><div id="joint-summary" class="joint-list"></div></section>
           </div>
         </div>
       </article>
     </section>
 
     <details class="flowchart">
-      <summary>How recording becomes Rerun + LeRobot data</summary>
-      <img src="/rerun-flowchart.png" alt="ReBot Rerun and LeRobot data-flow diagram">
-      <p>This page opens recorded data in Rerun. It never commands robot motion. Raw archives are retained; removing a run from training is handled through explicit review.</p>
+      <summary>How a recording becomes training data</summary>
+      <img src="/rerun-flowchart.png" alt="Diagram: recordings flow into Rerun for review and into LeRobot for training">
+      <p>This page opens recorded data for viewing. It never commands robot motion. Original recordings are always kept; removing a run from training happens only through explicit review.</p>
     </details>
   </main>
   <script src="/rerun.js" defer></script>
