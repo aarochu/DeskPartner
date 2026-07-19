@@ -13,6 +13,7 @@ Vendor trees under `rebot_setup/vendor/` keep their upstream READMEs in place (n
 | [REBOT_ARM_COMMANDS.md](./REBOT_ARM_COMMANDS.md) | Common arm / teleop commands |
 | [Rerun_bounty_progress.md](./Rerun_bounty_progress.md) | Non-SO-101 Rerun bounty progress |
 | [p5_rerun_port/](./p5_rerun_port/#how-it-connects-flowchart) | Rerun bounty pipeline + flowchart |
+| [p5_rerun_port/QUERY_API.md](./p5_rerun_port/QUERY_API.md) | Rerun Query API refine step |
 | [rebot_setup/](./rebot_setup/) | Portable SDK + LeRobot machine setup |
 | [../README.md](../README.md) | Operator bring-up (root) |
 
