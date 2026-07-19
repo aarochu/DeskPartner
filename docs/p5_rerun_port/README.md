@@ -13,6 +13,11 @@ Leaves `p4_data_collection` (native LeRobot record) and `rebot_operator_kit` unt
 
 **Query API (post-record):** step-by-step in [`QUERY_API.md`](./QUERY_API.md) — terminal CLI `python -m p5_rerun_port.query_api_cli` (not inside the Rerun Viewer; Viewer is optional for watching `.rrd` files).
 
+**Viewer workflow:** interactive logging/recording activates a purpose-built
+Blueprint that keeps both synchronized cameras, the 3D reBot URDF,
+goal-versus-position traces, and the time panel visible together. `--no-viewer`
+remains fully headless and creates no Viewer or gRPC sink.
+
 ## How it connects (flowchart)
 
 ![reBot pipeline: shared setup, GUI track, Rerun bounty loop, training](../assets/rebot_rerun_pipeline_flowchart.png)
@@ -101,7 +106,8 @@ python -m p5_rerun_port.export_lerobot --dataset cans --tag "Good episode" --fal
 python -m p5_rerun_port.replay_episode --dataset cans --episode episode_01 --fake --speed 0.5 --no-viewer
 ```
 
-Open any `.rrd` in the Rerun viewer: `rerun recordings/cans/episode_01.rrd`
+Interactive record commands open the purpose-built operator Blueprint. To
+inspect a saved artifact later: `rerun recordings/cans/episode_01.rrd`.
 
 ## Venue (live arm)
 

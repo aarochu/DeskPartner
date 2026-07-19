@@ -73,7 +73,18 @@ def _venv_site_packages() -> Path:
 
 
 SITE_PACKAGES = _venv_site_packages()
-RERUN_NATIVE_BIN = SITE_PACKAGES / "rerun_sdk" / "rerun_cli" / "rerun"
+_RERUN_CLI_ROOT = SITE_PACKAGES / "rerun_sdk" / "rerun_cli"
+RERUN_NATIVE_BIN = next(
+    (
+        candidate
+        for candidate in (
+            _RERUN_CLI_ROOT / "rerun",
+            _RERUN_CLI_ROOT / "Rerun.app" / "Contents" / "MacOS" / "Rerun",
+        )
+        if candidate.is_file()
+    ),
+    _RERUN_CLI_ROOT / "rerun",
+)
 
 DATASET_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,47}$")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,95}$")

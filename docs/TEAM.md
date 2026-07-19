@@ -60,7 +60,13 @@
 
 **Two model routes — start with the easy one:**
 
-- **SmolVLA (do first — ready now, no cloud):** uses the vendored LeRobot at `rebot_setup/vendor/rebot_lerobot/lerobot/`. Install once: `pip install -e ".[smolvla]"` from that folder. Train: `lerobot-train --policy.type=smolvla --dataset.repo_id=<repo_id> --output_dir=outputs/smolvla_test --steps=200`. Expect auth/format errors on the first run — fixing them early is the whole point of starting at episode 10.
+- **SmolVLA (do first — ready now, no cloud):** warm-start
+  `lerobot/smolvla_base` in the repository's vendored LeRobot Python 3.11
+  environment; do not train from scratch with `--policy.type=smolvla` on this
+  small dataset. Use the tested install, camera rename/padding, PyAV, and MPS
+  commands in [`SMOLVLA_TRAINING.md`](../SMOLVLA_TRAINING.md). Expect
+  auth/format errors on the first real-data run — fixing them early is the
+  point of starting at episode 10.
 - **MolmoAct (bigger, more setup):** `python -m p5_training.build_dataset_mixture --dataset-root <path>` → `python -m p5_training.modal_finetune --mixture ...`. Runs on **Modal** (needs `pip install modal` + `modal token new` + credits). ⚠️ Runs a **placeholder trainer** until the real `train_cmd` + base checkpoint are set in `p5_training/configs/molmoact2_single_arm.yaml` — those come from the organizers.
 
 **Retrain** checkpoints as data hits 50 / 100 / 150. Log which model looks better.

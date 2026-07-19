@@ -21,6 +21,7 @@
 | Slice D2 — **Rerun Query API** | done (dry-run) | `query_api_cli`: Server + `reader()` + goal-vs-position; see `QUERY_API.md` |
 | Slice E — `export_lerobot` | done (dry-run) | `robot_type=seeed_b601_dm_follower`, 7 joints, front/side |
 | Slice F — `replay_episode` | done (dry-run) | Fake replay OK; live follower TODO on venue |
+| Viewer Blueprint | done (synthetic) | Interactive recordings center both cameras, 3D reBot URDF, goal/position traces, and the time panel |
 | Live arm e2e (no `--fake`) | TODO | Venue: log → record → export → replay |
 | Demo video + 60s pitch | TODO | |
 | Off-site sync (RRDs / checkpoints) | TODO | |
@@ -36,7 +37,7 @@
 |-------|--------|
 | $1k non-SO-101 port | Code + dry-run; live e2e TODO |
 | $2k Query API | Implemented: `query_api_cli` + docs (dry-run on fake `.rrd`) |
-| $2k interesting Viewer | Not implemented (no custom blueprints/views yet) |
+| $2k interesting Viewer | Purpose-built operator Blueprint implemented and synthetic `.rrd` verified; live Viewer rehearsal TODO |
 
 ---
 

@@ -40,6 +40,14 @@ DEFAULT_CATALOG = DEFAULT_RECORDINGS_DIR / "catalog.json"
 
 # Prefer SDK URDF; fall back to env override.
 DEFAULT_URDF_CANDIDATES = (
+    REPO_ROOT
+    / "rebot_setup"
+    / "vendor"
+    / "reBotArm_control_py"
+    / "urdf"
+    / "reBot-DevArm_fixend_description"
+    / "urdf"
+    / "reBot-DevArm_fixend.urdf",
     Path.home() / "reBotArm_control_py" / "urdf" / "00-arm-rs_asm-v3" / "urdf" / "00-arm-rs_asm-v3.urdf",
     Path(r"C:\Users\aaron\reBotArm_control_py\urdf\00-arm-rs_asm-v3\urdf\00-arm-rs_asm-v3.urdf"),
 )

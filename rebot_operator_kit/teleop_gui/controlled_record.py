@@ -352,7 +352,18 @@ def write_profile_sidecar(
 
 
 RERUN_VIEWER_PORT = 9876
-RERUN_NATIVE_BIN = Path(rr.__file__).resolve().parents[1] / "rerun_cli" / "rerun"
+_RERUN_CLI_ROOT = Path(rr.__file__).resolve().parents[1] / "rerun_cli"
+RERUN_NATIVE_BIN = next(
+    (
+        candidate
+        for candidate in (
+            _RERUN_CLI_ROOT / "rerun",
+            _RERUN_CLI_ROOT / "Rerun.app" / "Contents" / "MacOS" / "Rerun",
+        )
+        if candidate.is_file()
+    ),
+    _RERUN_CLI_ROOT / "rerun",
+)
 
 
 def read_control_decision(args: argparse.Namespace, expected_action: str) -> dict[str, Any]:
