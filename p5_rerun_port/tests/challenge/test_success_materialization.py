@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -171,11 +172,13 @@ def test_materializes_three_query_readable_frames_with_static_provenance(
         }.issubset(set(schema["entities"]))
 
         dynamic = {}
+        segment_ids: set[str] = set()
         for entity in ("/follower/goal", "/follower/position", "/camera/cam0", "/camera/cam1"):
             frame = reader_to_pandas(dataset, index="frame", contents=[entity])
             assert frame["frame"].tolist() == [0, 1, 2]
             assert frame["time"].dt.total_seconds().to_numpy() == pytest.approx([0, 1 / 30, 2 / 30])
             assert len(set(frame["rerun_segment_id"])) == 1
+            segment_ids.update(frame["rerun_segment_id"])
             dynamic[entity] = frame
 
         goal_col = _component_column(dynamic["/follower/goal"], "Scalars:scalars")
@@ -210,12 +213,40 @@ def test_materializes_three_query_readable_frames_with_static_provenance(
             column = _component_column(frame, "TextDocument:text")
             assert len(frame) == 1
             assert _text_value(frame[column].iloc[0]) == expected
+            segment_ids.update(frame["rerun_segment_id"])
+        assert len(segment_ids) == 1
+
+
+@pytest.mark.parametrize("mismatch", ["repo_id", "revision", "role", "task_key"])
+def test_authenticates_inventory_row_against_one_exact_success_source_before_loading(
+    mismatch: str,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    if mismatch == "repo_id":
+        row = replace(row, identity=replace(row.identity, repo_id="Cornerf/unconfigured"))
+    elif mismatch == "revision":
+        row = replace(row, identity=replace(row.identity, revision="0" * 40))
+    elif mismatch == "role":
+        row = replace(row, role="failure")
+    else:
+        row = replace(row, task_key="two_can")
+
+    artifact = materialize_success(row, config, tmp_path / "untrusted.rrd")
+
+    assert artifact.status == "rejected"
+    assert artifact.reason_codes == ("SOURCE_LOCK_MISMATCH",)
+    assert FakeLeRobotDataset.calls == []
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [
         ("action", np.arange(6), "INVALID_ACTION"),
+        ("action", np.arange(7).reshape(1, 7), "INVALID_ACTION"),
+        ("observation.state", np.arange(7).reshape(7, 1), "INVALID_STATE"),
         ("action", [0, 1, 2, 3, 4, 5, np.nan], "INVALID_ACTION"),
         ("observation.state", [0, 1, 2, 3, 4, 5, np.inf], "INVALID_STATE"),
     ],
@@ -271,9 +302,43 @@ def test_rejects_mismatched_episode_frame_or_timestamp(
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [
+        ("episode_index", True, "EPISODE_INDEX_MISMATCH"),
+        ("episode_index", "3", "EPISODE_INDEX_MISMATCH"),
+        ("episode_index", 3.0, "EPISODE_INDEX_MISMATCH"),
+        ("frame_index", False, "FRAME_INDEX_NONCONTIGUOUS"),
+        ("frame_index", "0", "FRAME_INDEX_NONCONTIGUOUS"),
+        ("frame_index", 0.0, "FRAME_INDEX_NONCONTIGUOUS"),
+    ],
+)
+def test_rejects_non_integral_episode_and_frame_scalar_types(
+    field: str,
+    value: Any,
+    reason: str,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    FakeLeRobotDataset.samples[0][field] = value
+
+    artifact = materialize_success(row, config, tmp_path / "typed-index.rrd")
+
+    assert artifact.status == "rejected"
+    assert artifact.frame_count == 0
+    assert artifact.reason_codes == (reason,)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
         ("observation.images.front", np.zeros((2, 4, 1), dtype=np.float32), "INVALID_FRONT_IMAGE"),
         ("observation.images.side", np.full((6, 5, 3), np.nan), "INVALID_SIDE_IMAGE"),
         ("observation.images.side", np.zeros((6, 5, 4), dtype=np.uint8), "INVALID_SIDE_IMAGE"),
+        ("observation.images.side", np.zeros((6, 5, 3), dtype=bool), "INVALID_SIDE_IMAGE"),
+        ("observation.images.side", np.zeros((6, 5, 3), dtype=np.int16), "INVALID_SIDE_IMAGE"),
+        ("observation.images.side", np.zeros((6, 5, 3), dtype=np.uint16), "INVALID_SIDE_IMAGE"),
+        ("observation.images.side", np.full((6, 5, 3), -0.01), "INVALID_SIDE_IMAGE"),
+        ("observation.images.side", np.full((6, 5, 3), 1.01), "INVALID_SIDE_IMAGE"),
     ],
 )
 def test_rejects_malformed_images(
@@ -292,6 +357,18 @@ def test_rejects_malformed_images(
     assert artifact.frame_count == 0
     assert artifact.reason_codes == (reason,)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_hwc_rgb_wins_over_ambiguous_chw_shape() -> None:
+    image = np.zeros((3, 4, 3), dtype=np.float32)
+    image[:, :, 1] = 0.5
+    image[:, :, 2] = 1.0
+
+    normalized = canonical._rgb_u8(image)
+
+    assert normalized.shape == (3, 4, 3)
+    assert normalized.dtype == np.uint8
+    assert normalized[0, 0].tolist() == [0, 128, 255]
 
 
 def test_rejects_feature_order_and_declared_frame_count(
@@ -330,3 +407,111 @@ def test_verify_failure_preserves_existing_destination_and_removes_temporary_fil
     assert artifact.reason_codes == ("RRD_VERIFY_FAILED",)
     assert output.read_bytes() == original
     assert list(tmp_path.iterdir()) == [output]
+
+
+def _raise(error: Exception):
+    raise error
+
+
+@pytest.mark.parametrize(
+    ("stage", "reason"),
+    [
+        ("construction", "WRITER_INIT_FAILED"),
+        ("static", "WRITER_INIT_FAILED"),
+        ("add", "MATERIALIZATION_FAILED"),
+        ("finish", "MATERIALIZATION_FAILED"),
+        ("disconnect", "RRD_DISCONNECT_FAILED"),
+        ("verify", "RRD_VERIFY_FAILED"),
+        ("hash", "RRD_HASH_FAILED"),
+        ("replace", "RRD_PUBLISH_FAILED"),
+    ],
+)
+def test_writer_stage_failures_reject_cleanly_and_preserve_existing_destination(
+    stage: str,
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+    config: ChallengeConfig,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "existing.rrd"
+    original = b"previous verified artifact"
+    output.write_bytes(original)
+
+    if stage == "construction":
+        monkeypatch.setattr(
+            canonical.CanonicalEpisodeWriter,
+            "__init__",
+            lambda *args, **kwargs: _raise(RuntimeError("construction failed")),
+        )
+    elif stage == "static":
+        monkeypatch.setattr(
+            canonical.CanonicalEpisodeWriter,
+            "_log_static_documents",
+            lambda *args, **kwargs: _raise(RuntimeError("static logging failed")),
+        )
+    elif stage == "add":
+        monkeypatch.setattr(
+            canonical.CanonicalEpisodeWriter,
+            "add",
+            lambda *args, **kwargs: _raise(RuntimeError("dynamic logging failed")),
+        )
+    elif stage == "finish":
+        monkeypatch.setattr(
+            canonical.CanonicalEpisodeWriter,
+            "finish",
+            lambda *args, **kwargs: _raise(RuntimeError("finish failed")),
+        )
+    elif stage == "disconnect":
+        monkeypatch.setattr(
+            canonical,
+            "_disconnect_recording",
+            lambda recording: _raise(RuntimeError("disconnect failed")),
+        )
+    elif stage == "verify":
+        monkeypatch.setattr(
+            canonical,
+            "_verify_rrd",
+            lambda path: _raise(RuntimeError("verify failed")),
+        )
+    elif stage == "hash":
+        monkeypatch.setattr(canonical, "_verify_rrd", lambda path: True)
+        monkeypatch.setattr(
+            canonical,
+            "_sha256",
+            lambda path: _raise(OSError("hash failed")),
+        )
+    else:
+        monkeypatch.setattr(canonical, "_verify_rrd", lambda path: True)
+        monkeypatch.setattr(
+            canonical.os,
+            "replace",
+            lambda *args: _raise(OSError("replace failed")),
+        )
+
+    artifact = materialize_success(row, config, output)
+
+    assert artifact.status == "rejected"
+    assert artifact.rrd_path is None
+    assert artifact.sha256 is None
+    assert artifact.reason_codes == (reason,)
+    assert output.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_abort_unlinks_temporary_file_even_when_disconnect_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    row: InventoryRow,
+    tmp_path: Path,
+) -> None:
+    writer = canonical.CanonicalEpisodeWriter(tmp_path / "episode.rrd", row.identity, TASK, 30)
+    temporary = writer._temporary_path
+    monkeypatch.setattr(
+        canonical,
+        "_disconnect_recording",
+        lambda recording: _raise(RuntimeError("disconnect failed")),
+    )
+
+    writer.abort()
+
+    assert not temporary.exists()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+from numbers import Integral
 import os
 from pathlib import Path
 import re
@@ -113,6 +114,10 @@ def _verify_rrd(path: Path) -> bool:
     return result.returncode == 0
 
 
+def _disconnect_recording(recording: Any) -> None:
+    recording.disconnect()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -139,25 +144,47 @@ def _scalar(value: Any) -> int | float:
 
 
 def _vector7(value: Any) -> np.ndarray:
-    array = np.asarray(_numpy(value), dtype=np.float64).reshape(-1)
-    if array.shape != (7,) or not np.isfinite(array).all():
+    raw = _numpy(value)
+    if (
+        raw.shape != (7,)
+        or not np.issubdtype(raw.dtype, np.number)
+        or raw.dtype == np.bool_
+    ):
+        raise ValueError("expected finite (7,) vector")
+    array = np.asarray(raw, dtype=np.float64)
+    if not np.isfinite(array).all():
         raise ValueError("expected finite (7,) vector")
     return array
 
 
 def _rgb_u8(image: Any) -> np.ndarray:
     array = _numpy(image)
-    if array.ndim == 3 and array.shape[0] in (1, 3, 4):
+    if array.ndim != 3:
+        raise ValueError(f"expected HWC or CHW RGB, got {array.shape}")
+    if array.shape[-1] == 3:
+        pass
+    elif array.shape[0] == 3:
         array = np.moveaxis(array, 0, -1)
-    if array.ndim != 3 or array.shape[-1] != 3:
+    else:
         raise ValueError(f"expected HWC RGB, got {array.shape}")
     if np.issubdtype(array.dtype, np.floating):
         if not np.isfinite(array).all():
             raise ValueError("non-finite image")
-        array = np.rint(array * 255.0).clip(0, 255).astype(np.uint8)
+        if np.any(array < 0.0) or np.any(array > 1.0):
+            raise ValueError("floating RGB image must stay within [0, 1]")
+        array = np.rint(array * 255.0).astype(np.uint8)
+    elif array.dtype == np.uint8:
+        array = array.astype(np.uint8, copy=False)
     else:
-        array = array.clip(0, 255).astype(np.uint8, copy=False)
+        raise ValueError(f"expected float or uint8 RGB image, got {array.dtype}")
     return np.ascontiguousarray(array)
+
+
+def _integral_scalar(value: Any) -> int:
+    scalar = _scalar(value)
+    if isinstance(scalar, (bool, np.bool_)) or not isinstance(scalar, Integral):
+        raise ValueError(f"expected integral scalar, got {type(scalar).__name__}")
+    return int(scalar)
 
 
 def _rejected(identity: EpisodeIdentity, frame_count: int, reason_code: str) -> CanonicalArtifact:
@@ -181,22 +208,29 @@ class CanonicalEpisodeWriter:
         self.fps = fps
         self.frame_count = 0
         self._closed = False
+        self._recording: Any | None = None
         self._temporary_path = _temporary_sibling(self.path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            rr = _rerun_module()
+            self._recording = rr.RecordingStream(
+                _APPLICATION_ID,
+                recording_id=_recording_id(identity),
+            )
+            self._recording.set_sinks(rr.FileSink(str(self._temporary_path)))
+            self._log_static_documents(rr)
+        except Exception:
+            self.abort()
+            raise
 
-        rr = _rerun_module()
-        self._recording = rr.RecordingStream(
-            _APPLICATION_ID,
-            recording_id=_recording_id(identity),
-        )
-        self._recording.set_sinks(rr.FileSink(str(self._temporary_path)))
+    def _log_static_documents(self, rr: Any) -> None:
         static_documents = {
-            "/episode/source": identity.canonical,
-            "/episode/repo_id": identity.repo_id,
-            "/episode/revision": identity.revision,
-            "/episode/source_index": identity.source_key,
-            "/episode/task": task,
-            "/episode/fps": str(fps),
+            "/episode/source": self.identity.canonical,
+            "/episode/repo_id": self.identity.repo_id,
+            "/episode/revision": self.identity.revision,
+            "/episode/source_index": self.identity.source_key,
+            "/episode/task": self.task,
+            "/episode/fps": str(self.fps),
             "/episode/joint_names": ",".join(_JOINT_NAMES),
         }
         for entity, text in static_documents.items():
@@ -233,22 +267,50 @@ class CanonicalEpisodeWriter:
         self.frame_count += 1
 
     def abort(self) -> None:
-        if not self._closed:
-            self._recording.disconnect()
+        try:
+            if not self._closed and self._recording is not None:
+                _disconnect_recording(self._recording)
+        except Exception:
+            pass
+        finally:
             self._closed = True
-        self._temporary_path.unlink(missing_ok=True)
+            self._cleanup_temporary()
+
+    def _cleanup_temporary(self) -> None:
+        try:
+            self._temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def finish(self) -> CanonicalArtifact:
         if self._closed:
             raise RuntimeError("canonical writer is already closed")
-        self._recording.disconnect()
+        try:
+            _disconnect_recording(self._recording)
+        except Exception:
+            self._closed = True
+            self._cleanup_temporary()
+            return _rejected(self.identity, self.frame_count, "RRD_DISCONNECT_FAILED")
         self._closed = True
-        if not _verify_rrd(self._temporary_path):
-            self._temporary_path.unlink(missing_ok=True)
+
+        try:
+            verified = _verify_rrd(self._temporary_path)
+        except Exception:
+            verified = False
+        if not verified:
+            self._cleanup_temporary()
             return _rejected(self.identity, self.frame_count, "RRD_VERIFY_FAILED")
 
-        sha256 = _sha256(self._temporary_path)
-        os.replace(self._temporary_path, self.path)
+        try:
+            sha256 = _sha256(self._temporary_path)
+        except Exception:
+            self._cleanup_temporary()
+            return _rejected(self.identity, self.frame_count, "RRD_HASH_FAILED")
+        try:
+            os.replace(self._temporary_path, self.path)
+        except Exception:
+            self._cleanup_temporary()
+            return _rejected(self.identity, self.frame_count, "RRD_PUBLISH_FAILED")
         return CanonicalArtifact(
             identity=self.identity.canonical,
             status="ready",
@@ -276,6 +338,19 @@ def _validate_feature_names(dataset: Any, config: ChallengeConfig) -> None:
         )
 
 
+def _row_matches_source_lock(row: InventoryRow, config: ChallengeConfig) -> bool:
+    matches = [source for source in config.sources if source.repo_id == row.identity.repo_id]
+    if len(matches) != 1:
+        return False
+    source = matches[0]
+    return (
+        row.role == "success"
+        and source.role == "success"
+        and row.identity.revision == source.revision
+        and row.task_key == source.task_key
+    )
+
+
 def materialize_success(
     row: InventoryRow,
     config: ChallengeConfig,
@@ -283,15 +358,19 @@ def materialize_success(
 ) -> CanonicalArtifact:
     """Convert one authoritative success row into a verified canonical RRD."""
 
-    if row.role != "success":
-        return _rejected(row.identity, 0, "SOURCE_ROLE_MISMATCH")
-    if row.episode_index is None:
+    if not _row_matches_source_lock(row, config):
+        return _rejected(row.identity, 0, "SOURCE_LOCK_MISMATCH")
+    if (
+        row.episode_index is None
+        or isinstance(row.episode_index, bool)
+        or not isinstance(row.episode_index, Integral)
+    ):
         return _rejected(row.identity, 0, "MISSING_EPISODE_INDEX")
     if row.identity.source_key != str(row.episode_index):
         return _rejected(row.identity, 0, "SOURCE_IDENTITY_MISMATCH")
 
-    dataset_class = _lerobot_dataset_class()
     try:
+        dataset_class = _lerobot_dataset_class()
         dataset = dataset_class(
             repo_id=row.identity.repo_id,
             root=_episode_cache_root(row.identity),
@@ -316,19 +395,22 @@ def materialize_success(
         return _rejected(row.identity, 0, "SOURCE_READ_FAILED")
 
     expected_task = _TASKS[row.task_key]
-    writer = CanonicalEpisodeWriter(Path(output), row.identity, expected_task, config.fps)
+    try:
+        writer = CanonicalEpisodeWriter(Path(output), row.identity, expected_task, config.fps)
+    except Exception:
+        return _rejected(row.identity, 0, "WRITER_INIT_FAILED")
     try:
         for local_row in range(len(dataset)):
             sample = dataset[local_row]
             try:
-                episode_index = int(_scalar(sample["episode_index"]))
+                episode_index = _integral_scalar(sample["episode_index"])
             except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise _CanonicalReject("EPISODE_INDEX_MISMATCH", "invalid sample episode_index") from error
             if episode_index != row.episode_index:
                 raise _CanonicalReject("EPISODE_INDEX_MISMATCH", "sample episode_index differs from inventory")
 
             try:
-                frame = int(_scalar(sample["frame_index"]))
+                frame = _integral_scalar(sample["frame_index"])
             except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise _CanonicalReject("FRAME_INDEX_NONCONTIGUOUS", "invalid sample frame_index") from error
             if frame != local_row:
@@ -362,6 +444,7 @@ def materialize_success(
                 raise _CanonicalReject("INVALID_SIDE_IMAGE", "side image is not finite RGB") from error
 
             writer.add(frame, timestamp_s, action, state, front_rgb, side_rgb)
+        return writer.finish()
     except _CanonicalReject as error:
         processed = writer.frame_count
         writer.abort()
@@ -370,5 +453,3 @@ def materialize_success(
         processed = writer.frame_count
         writer.abort()
         return _rejected(row.identity, processed, "MATERIALIZATION_FAILED")
-
-    return writer.finish()
