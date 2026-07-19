@@ -210,12 +210,43 @@ class CompareResult:
 
 
 @dataclass(frozen=True)
+class EpisodeSegmentIdentity:
+    """Catalog episode identity bound to the recording segment it must query."""
+
+    episode: str
+    segment_id: str
+
+
+def episode_segment_identity(record: EpisodeRecord) -> EpisodeSegmentIdentity:
+    """Build the segment identity emitted by ``takes.begin_recording`` for a record."""
+    episode = sanitize_name(record.episode)
+    rrd_stem = Path(record.rrd_path).stem
+    if not record.episode.strip() or episode != rrd_stem:
+        raise SystemExit(
+            "FAIL: catalog episode does not match its recording path: "
+            f"{record.episode!r} != {rrd_stem!r}"
+        )
+    return EpisodeSegmentIdentity(
+        episode=episode,
+        segment_id=f"{sanitize_name(record.dataset)}-{rrd_stem}",
+    )
+
+
+@dataclass(frozen=True)
 class AlignedVectorRows:
     """Goal/state vectors paired from the same Query API dataframe rows."""
 
     segment_ids: tuple[str, ...]
     goal: np.ndarray
     state: np.ndarray
+
+
+def _valid_segment_id(value: Any) -> str | None:
+    """Return a non-blank Rerun segment identifier, never a stringified null."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 def _finite_vector(value: Any) -> np.ndarray | None:
@@ -249,7 +280,8 @@ def aligned_vector_rows(df, *, goal_column: str, state_column: str) -> AlignedVe
         index=False, name=None
     )
     for segment_id, goal_value, state_value in rows:
-        if segment_id is None:
+        segment = _valid_segment_id(segment_id)
+        if segment is None:
             continue
         goal = _finite_vector(goal_value)
         state = _finite_vector(state_value)
@@ -259,7 +291,7 @@ def aligned_vector_rows(df, *, goal_column: str, state_column: str) -> AlignedVe
             expected_shape = goal.shape
         if goal.shape != expected_shape:
             continue
-        segments.append(str(segment_id))
+        segments.append(segment)
         goals.append(goal)
         states.append(state)
 
@@ -276,6 +308,7 @@ def compare_goal_vs_position(
     *,
     episode: str | None = None,
     timeline: str | None = None,
+    verified_identity: EpisodeSegmentIdentity | None = None,
 ) -> CompareResult:
     """Align follower/goal vs follower/position via Query API and score tracking error."""
     index = pick_timeline(dataset_entry, timeline)
@@ -308,14 +341,22 @@ def compare_goal_vs_position(
     mean_abs = np.nanmean(err, axis=0)
     max_abs = np.nanmax(err, axis=0)
     rms = float(np.sqrt(np.nanmean(err**2)))
-    observed_segment_ids = {
-        str(segment_id)
-        for segment_id in df["rerun_segment_id"]
-        if segment_id is not None
-    }
-    requested_episode_has_one_segment = len(observed_segment_ids) == 1
+    expected_segment_id = (
+        _valid_segment_id(verified_identity.segment_id)
+        if verified_identity is not None
+        else None
+    )
+    observed_segment_ids = [_valid_segment_id(value) for value in df["rerun_segment_id"]]
+    requested_episode_is_proven = (
+        episode is not None
+        and verified_identity is not None
+        and episode == verified_identity.episode
+        and expected_segment_id is not None
+        and all(segment_id is not None for segment_id in observed_segment_ids)
+        and set(observed_segment_ids) == {expected_segment_id}
+    )
     return CompareResult(
-        episode=episode if episode and requested_episode_has_one_segment else "all",
+        episode=episode if requested_episode_is_proven else "all",
         n_rows=len(aligned.goal),
         mean_abs_error=mean_abs,
         max_abs_error=max_abs,

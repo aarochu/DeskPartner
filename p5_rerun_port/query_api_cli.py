@@ -18,6 +18,7 @@ from p5_rerun_port.constants import DEFAULT_CATALOG, DEFAULT_RECORDINGS_DIR, FOL
 from p5_rerun_port.query_dataset import _print_table
 from p5_rerun_port.rerun_query import (
     compare_goal_vs_position,
+    episode_segment_identity,
     episodes_for_query,
     find_scalar_columns,
     list_schema,
@@ -108,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
     if (args.episode or args.tag) and not rows:
         raise SystemExit("FAIL: no catalog episodes match the requested --episode/--tag filter")
     rrd_paths = rrd_paths_for_records(rows)
+    verified_identity = (
+        episode_segment_identity(rows[0]) if args.episode and len(rows) == 1 else None
+    )
     print("=== catalog (local metadata) ===")
     _print_table(rows)
     report_lines.append("## Catalog episodes")
@@ -154,7 +158,10 @@ def main(argv: list[str] | None = None) -> int:
             args.dataset, recordings_dir=args.recordings_dir, rrd_paths=rrd_paths
         ) as ds:
             result = compare_goal_vs_position(
-                ds, episode=args.episode, timeline=args.timeline
+                ds,
+                episode=args.episode,
+                timeline=args.timeline,
+                verified_identity=verified_identity,
             )
         for line in result.summary_lines():
             print(line)

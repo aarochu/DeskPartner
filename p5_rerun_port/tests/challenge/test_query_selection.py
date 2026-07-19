@@ -5,9 +5,11 @@ import pytest
 
 from p5_rerun_port.catalog import EpisodeRecord
 from p5_rerun_port.rerun_query import (
+    EpisodeSegmentIdentity,
     aligned_vector_rows,
     compare_goal_vs_position,
     dataset_rrd_paths,
+    episode_segment_identity,
     rrd_paths_for_records,
 )
 
@@ -26,6 +28,17 @@ def test_rrd_paths_for_records_uses_only_selected_episode(tmp_path: Path) -> Non
     selected.write_bytes(b"rrd")
     record = EpisodeRecord(dataset="cans", episode="episode_02", rrd_path=str(selected))
     assert rrd_paths_for_records([record]) == [selected.resolve()]
+
+
+def test_episode_segment_identity_rejects_stale_catalog_path(tmp_path: Path) -> None:
+    record = EpisodeRecord(
+        dataset="cans",
+        episode="episode_02",
+        rrd_path=str(tmp_path / "episode_99.rrd"),
+    )
+
+    with pytest.raises(SystemExit, match="does not match"):
+        episode_segment_identity(record)
 
 
 def test_alignment_never_pairs_rows_from_different_segments() -> None:
@@ -61,6 +74,77 @@ def test_compare_does_not_label_requested_episode_across_segments(
 
     assert result.episode == "all"
     assert result.n_rows == 2
+
+
+def test_compare_does_not_label_requested_episode_for_one_mismatched_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import p5_rerun_port.rerun_query as rerun_query
+
+    df = pd.DataFrame({
+        "rerun_segment_id": ["cans-episode_99"],
+        "/follower/goal:Scalars:scalars": [[1.0] * 7],
+        "/follower/position:Scalars:scalars": [[0.0] * 7],
+    })
+    monkeypatch.setattr(rerun_query, "pick_timeline", lambda *args: "time")
+    monkeypatch.setattr(rerun_query, "reader_to_pandas", lambda *args, **kwargs: df)
+
+    class Dataset:
+        def filter_contents(self, contents):
+            return self
+
+    result = compare_goal_vs_position(
+        Dataset(),
+        episode="episode_02",
+        verified_identity=EpisodeSegmentIdentity(
+            episode="episode_02", segment_id="cans-episode_02"
+        ),
+    )
+
+    assert result.episode == "all"
+    assert result.n_rows == 1
+
+
+@pytest.mark.parametrize("invalid_segment", [float("nan"), pd.NA, "", "   "])
+def test_alignment_rejects_invalid_segment_identifiers(invalid_segment: object) -> None:
+    df = pd.DataFrame({
+        "rerun_segment_id": ["cans-episode_02", invalid_segment],
+        "/follower/goal:Scalars:scalars": [[1.0] * 7, [2.0] * 7],
+        "/follower/position:Scalars:scalars": [[0.0] * 7, [1.0] * 7],
+    })
+
+    result = aligned_vector_rows(df, goal_column=df.columns[1], state_column=df.columns[2])
+
+    assert result.segment_ids == ("cans-episode_02",)
+    assert result.goal.shape == result.state.shape == (1, 7)
+
+
+def test_invalid_segment_identifier_prevents_episode_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import p5_rerun_port.rerun_query as rerun_query
+
+    df = pd.DataFrame({
+        "rerun_segment_id": ["cans-episode_02", pd.NA],
+        "/follower/goal:Scalars:scalars": [[1.0] * 7, [2.0] * 7],
+        "/follower/position:Scalars:scalars": [[0.0] * 7, [1.0] * 7],
+    })
+    monkeypatch.setattr(rerun_query, "pick_timeline", lambda *args: "time")
+    monkeypatch.setattr(rerun_query, "reader_to_pandas", lambda *args, **kwargs: df)
+
+    class Dataset:
+        def filter_contents(self, contents):
+            return self
+
+    result = compare_goal_vs_position(
+        Dataset(),
+        episode="episode_02",
+        verified_identity=EpisodeSegmentIdentity(
+            episode="episode_02", segment_id="cans-episode_02"
+        ),
+    )
+
+    assert result.episode == "all"
 
 
 def test_cli_schema_uses_only_paths_from_selected_catalog_rows(
