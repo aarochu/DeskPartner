@@ -2,10 +2,10 @@
 
 Overhead camera + VLM planner + reBot B601-DM arm that tidies a desk zone into trash / pen cup / tray, closed-loop until clean.
 
-**Ground truth / SOW:** [`GROUND_TRUTH.md`](./GROUND_TRUTH.md)  
+**Ground truth / SOW:** [`docs/GROUND_TRUTH.md`](./docs/GROUND_TRUTH.md)  
 **GitHub:** https://github.com/aarochu/DeskPartner  
 **Hardware deck:** [ReBot Arm Workshop](https://docs.google.com/presentation/d/1LXgehBvwPy5EhWO7aaYQffvmlN4eS1zFmJWYoDcTm-c/edit)  
-**Config:** single-arm follower+leader · Track B = **MolmoAct 2** fine-tune (overhead + 45° cams locked)
+**Config:** single-arm follower+leader · Track B = **MolmoAct 2** fine-tune (Logitech overhead + Innomaker wrist cams locked)
 
 ---
 
@@ -13,8 +13,8 @@ Overhead camera + VLM planner + reBot B601-DM arm that tidies a desk zone into t
 
 ```
 DeskPartner/
-├── GROUND_TRUTH.md          # SOW — source of truth for scope & contracts
 ├── README.md                # this file — operate the system
+├── docs/                    # SOW, team, track guides, bounty progress
 ├── config/                  # arm, cameras, workspace, destinations
 ├── shared/                  # handoff types & fake fixtures for parallel work
 ├── scripts/                 # host setup helpers
@@ -24,10 +24,11 @@ DeskPartner/
 ├── p4_data_collection/      # Track B — teleop demos (LeRobot, single-arm only)
 ├── p5_training/             # Track B — MolmoAct 2 LoRA + bake-off
 ├── p5_rerun_port/           # Rerun bounty — log/record/query/export/replay on reBot
-└── Rerun_bounty_progress.md # Person 5 bounty progress + SO→reBot map
+└── rebot_operator_kit/      # macOS GUI: teleop, two-camera collection, review, validation
 ```
 
-**Rerun non-SO-101 port (Person 5):** [`p5_rerun_port/README.md`](./p5_rerun_port/README.md) · progress: [`Rerun_bounty_progress.md`](./Rerun_bounty_progress.md)
+**Docs index:** [`docs/README.md`](./docs/README.md)  
+**Rerun non-SO-101 port:** [`docs/p5_rerun_port/`](./docs/p5_rerun_port/) · progress: [`docs/Rerun_bounty_progress.md`](./docs/Rerun_bounty_progress.md)
 
 ---
 
@@ -39,7 +40,7 @@ DeskPartner/
 | Python | 3.10+ |
 | Follower | reBot B601-DM on `/dev/ttyACM0` (`can_adapter=damiao`) |
 | Leader | reBot 102 on `/dev/ttyUSB0` |
-| Camera | Color innomaker overhead (OV2719 / 1080p wide). **Not** OV9281. Direct USB, no hub. |
+| Cameras | Logitech BRIO overhead at index 0 + Innomaker wrist/claw at index 1. Built-in Mac webcam is not recorded. |
 | Package managers | `uv` (SDK) + `pip` (LeRobot path) |
 
 ---
@@ -172,15 +173,20 @@ Rehearse the switch once so it is boring.
 
 ### Recalibration (camera bumped)
 
-See [`p2_vision_calibration/RECALIBRATION.md`](./p2_vision_calibration/RECALIBRATION.md) — target **≤ 10 minutes**.
+See [`docs/p2_vision_calibration/RECALIBRATION.md`](./docs/p2_vision_calibration/RECALIBRATION.md) — target **≤ 10 minutes**.
 
 ---
 
 ## Track B — data & training (bonus)
 
+For the tested macOS workflow, start with
+[`docs/rebot_operator_kit/README.md`](./docs/rebot_operator_kit/README.md), run
+`rebot_setup/setup.sh` on a new machine, then double-click
+`rebot_operator_kit/07_teleop_gui.command`.
+
 **MolmoAct 2 · single-arm:** fine-tune a foundation VLA (LoRA or action-expert-only — not full FT). Station is normally bimanual; we record **one arm only**.
 
-**Cameras:** overhead + 45° side. Lock both before episode 1 — MolmoAct 2 trains on whatever views are in the dataset. Prefer angles where the gripper does not occlude the object at grasp.
+**Cameras:** Logitech overhead (`front`, index 0) + Innomaker wrist/claw (`side`, index 1). Lock both before episode 1 — MolmoAct 2 trains on whatever views are in the dataset. Keep the wrist lens and gripper contact point unobstructed.
 
 Teleop preview (dual cam):
 
@@ -188,7 +194,7 @@ Teleop preview (dual cam):
 # see p4_data_collection/scripts/teleop.sh
 ```
 
-If joint directions feel inverted, apply the deck's `joint_directions` tuning (see `p4_data_collection/README.md`).
+If joint directions feel inverted, apply the deck's `joint_directions` tuning (see `docs/p4_data_collection/README.md`).
 
 **Friday night trap:** after the throwaway episode, run `python -m p4_data_collection.verify_episode_format` (must PASS — no phantom second-arm channels). Do not wait until Saturday.
 
@@ -202,7 +208,7 @@ python -m p4_data_collection.batch_record --num 50          # Saturday midday
 Fine-tune on Modal (P5) — confirm newt vs Ai2 MolmoAct 2 scripts with organizers:
 
 ```bash
-# see p5_training/README.md, GO_NO_GO.md, configs/molmoact2_single_arm.yaml
+# see docs/p5_training/, configs/molmoact2_single_arm.yaml
 python -m p5_training.bakeoff --trials 10 --checkpoint PATH   # Sunday: VERDICT line
 ```
 
@@ -248,15 +254,17 @@ Track B never blocks A. If Friday teleop is rough and you are four people: **cut
 
 ## Person folders
 
-| Folder | Role |
-|--------|------|
-| [`p1_arm_motion/`](./p1_arm_motion/) | Arm, motion, destinations, gravity-comp |
-| [`p2_vision_calibration/`](./p2_vision_calibration/) | Camera, ArUco, CV, calibration |
-| [`p3_vlm_orchestrator/`](./p3_vlm_orchestrator/) | VLM + closed-loop harness |
-| [`p4_data_collection/`](./p4_data_collection/) | Teleop + LeRobot episodes |
-| [`p5_training/`](./p5_training/) | MolmoAct 2 LoRA + bake-off |
+| Code | Docs | Role |
+|------|------|------|
+| [`p1_arm_motion/`](./p1_arm_motion/) | [`docs/p1_arm_motion/`](./docs/p1_arm_motion/) | Arm, motion, destinations, gravity-comp |
+| [`p2_vision_calibration/`](./p2_vision_calibration/) | [`docs/p2_vision_calibration/`](./docs/p2_vision_calibration/) | Camera, ArUco, CV, calibration |
+| [`p3_vlm_orchestrator/`](./p3_vlm_orchestrator/) | [`docs/p3_vlm_orchestrator/`](./docs/p3_vlm_orchestrator/) | VLM + closed-loop harness |
+| [`p4_data_collection/`](./p4_data_collection/) | [`docs/p4_data_collection/`](./docs/p4_data_collection/) | Teleop + LeRobot episodes |
+| [`p5_training/`](./p5_training/) | [`docs/p5_training/`](./docs/p5_training/) | MolmoAct 2 LoRA + bake-off |
+| [`p5_rerun_port/`](./p5_rerun_port/) | [`docs/p5_rerun_port/`](./docs/p5_rerun_port/) | Rerun bounty port |
+| [`rebot_operator_kit/`](./rebot_operator_kit/) | [`docs/rebot_operator_kit/`](./docs/rebot_operator_kit/) | macOS operator GUI |
 
-Read each folder's `README.md` then `STRUCTURE.md` before coding.
+Read each area's docs under `docs/` before coding.
 
 ---
 

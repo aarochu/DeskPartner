@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#08110f">
+    <title>ReBot Teleop Control</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <p class="eyebrow">Local operator console</p>
+            <h1>ReBot Teleop</h1>
+          </div>
+        </div>
+
+        <div class="topbar-status">
+          <a class="workspace-link" href="/training">
+            <span>Dataset workflow</span>
+            <strong>Collect &amp; train →</strong>
+          </a>
+          <div class="status-pill" id="state-pill" data-state="READY">
+            <span class="status-dot"></span>
+            <span id="state-label">Connecting</span>
+          </div>
+          <div class="top-metric">
+            <span>Actual loop</span>
+            <strong><span id="top-actual-hz">—</span> Hz</strong>
+          </div>
+          <div class="top-metric">
+            <span>Target</span>
+            <strong><span id="top-target-hz">240</span> Hz</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="command-deck" aria-label="Teleop controls">
+        <div class="command-copy">
+          <p class="eyebrow">Leader → follower</p>
+          <h2 id="command-title">Ready for manual control</h2>
+          <p id="command-subtitle">Choose your numbers, then start. Motion begins as soon as the robot connects.</p>
+        </div>
+        <div class="command-actions">
+          <button class="button button-start" id="start-button" type="button">
+            <span class="button-icon" aria-hidden="true">▶</span>
+            <span><small>Manual control</small>Start teleop</span>
+          </button>
+          <button class="button button-stop" id="stop-button" type="button" disabled>
+            <span class="button-icon stop-square" aria-hidden="true"></span>
+            <span><small>Graceful disconnect</small>Stop teleop</span>
+          </button>
+        </div>
+      </section>
+
+      <div class="notice hidden" id="notice" role="status" aria-live="polite">
+        <span id="notice-message"></span>
+        <button id="notice-close" type="button" aria-label="Dismiss message">×</button>
+      </div>
+
+      <section class="workspace-grid">
+        <article class="panel settings-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Motion profile</p>
+              <h2>Speed controls</h2>
+            </div>
+            <span class="draft-badge" id="draft-badge">Hand-tracking 2000</span>
+          </div>
+
+          <div class="preset-strip" id="preset-strip" aria-label="Motion presets"></div>
+
+          <div class="multiplier-card">
+            <div class="multiplier-heading">
+              <div>
+                <span class="field-title">Baseline speed multiplier</span>
+                <span class="field-help" id="baseline-summary">Hand-tracking 2000 · 240 Hz · 2000°/s · 8.4°/cycle</span>
+              </div>
+              <span class="multiplier-status limited" id="multiplier-status">4× limited</span>
+            </div>
+            <div class="multiplier-controls">
+              <div class="multiplier-chips" aria-label="Quick speed multipliers">
+                <button type="button" class="multiplier-chip" data-multiplier="0.5">0.5×</button>
+                <button type="button" class="multiplier-chip" data-multiplier="1">1×</button>
+                <button type="button" class="multiplier-chip" data-multiplier="1.5">1.5×</button>
+                <button type="button" class="multiplier-chip" data-multiplier="2">2×</button>
+                <button type="button" class="multiplier-chip" data-multiplier="3">3×</button>
+                <button type="button" class="multiplier-chip active" data-multiplier="4">4×</button>
+              </div>
+              <div class="multiplier-custom">
+                <span class="input-shell compact multiplier-input-shell">
+                  <input id="multiplier-input" type="number" min="0.1" max="10" step="0.1" value="4" inputmode="decimal" aria-label="Custom speed multiplier">
+                  <span class="unit">×</span>
+                </span>
+                <button class="button-secondary multiplier-apply" id="apply-multiplier-button" type="button">Apply multiplier</button>
+              </div>
+            </div>
+            <div class="multiplier-footer">
+              <span id="multiplier-preview">4× → 240 Hz · 2000°/s · 33.6°/cycle · achieved 1× LIMITED</span>
+              <button type="button" id="set-baseline-button">Set current as baseline</button>
+            </div>
+          </div>
+
+          <div class="section-divider">
+            <span>Core loop</span>
+            <span id="apply-mode-label">Applies on Start</span>
+          </div>
+
+          <div class="field-grid core-fields">
+            <label class="number-field">
+              <span class="field-title">Command rate</span>
+              <span class="field-help">Leader reads per second</span>
+              <span class="input-shell">
+                <input id="hz-input" name="hz" type="number" min="1" max="240" step="1" value="240" inputmode="decimal">
+                <span class="unit">Hz</span>
+              </span>
+            </label>
+
+            <label class="number-field">
+              <span class="field-title">Step limit</span>
+              <span class="field-help">Maximum change each loop</span>
+              <span class="input-shell">
+                <input id="step-input" name="max_step" type="number" min="0.01" max="45" step="0.1" value="33.6" inputmode="decimal">
+                <span class="unit">°/cycle</span>
+              </span>
+            </label>
+
+            <label class="number-field">
+              <span class="field-title">Gripper force</span>
+              <span class="field-help">Driver torque ratio</span>
+              <span class="input-shell">
+                <input id="force-input" name="gripper_force" type="number" min="0" max="1" step="0.01" value="0.05" inputmode="decimal">
+                <span class="unit">ratio</span>
+              </span>
+            </label>
+
+            <label class="number-field">
+              <span class="field-title">Run duration</span>
+              <span class="field-help">Use 0 for continuous</span>
+              <span class="input-shell">
+                <input id="duration-input" name="duration_s" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric">
+                <span class="unit">sec</span>
+              </span>
+            </label>
+          </div>
+
+          <div class="section-divider motor-divider">
+            <span>Motor velocity</span>
+            <span>Seven-joint order</span>
+          </div>
+
+          <div class="global-control">
+            <label for="global-velocity-input">
+              <span class="field-title">Set every motor</span>
+              <span class="field-help">Copies one velocity to all joints</span>
+            </label>
+            <div class="global-action">
+              <span class="input-shell compact">
+                <input id="global-velocity-input" type="number" min="0.1" max="2000" step="1" value="2000" inputmode="decimal">
+                <span class="unit">°/s</span>
+              </span>
+              <button class="button-secondary" id="apply-all-button" type="button">Apply to all</button>
+            </div>
+          </div>
+
+          <div class="joint-grid" id="joint-grid"></div>
+
+          <div class="speed-readout">
+            <div>
+              <span>Step-limited tracking cap</span>
+              <strong id="tracking-cap">2016 °/s</strong>
+            </div>
+            <div>
+              <span>Motor range</span>
+              <strong id="motor-range">2000–2000 °/s</strong>
+            </div>
+            <div>
+              <span>Effective joint range</span>
+              <strong id="effective-cap">2000–2000 °/s</strong>
+            </div>
+          </div>
+          <p class="formula-note">Effective speed is the lower of motor velocity and Hz × step limit. Motor-bus baud rates remain fixed to the connected hardware.</p>
+        </article>
+
+        <aside class="right-rail">
+          <article class="panel telemetry-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="eyebrow">Live telemetry</p>
+                <h2>Robot state</h2>
+              </div>
+              <span class="mode-chip" id="mode-chip">Hardware</span>
+            </div>
+
+            <div class="hero-gauge">
+              <div class="gauge-ring" id="gauge-ring">
+                <div>
+                  <strong id="gauge-hz">—</strong>
+                  <span>actual Hz</span>
+                </div>
+              </div>
+              <div class="gauge-copy">
+                <span id="gauge-status">Waiting for Start</span>
+                <strong><span id="gauge-target">240</span> Hz requested</strong>
+                <small id="gauge-delta">Measured loop rate appears here</small>
+              </div>
+            </div>
+
+            <div class="metric-grid">
+              <div class="metric-card">
+                <span>Runtime</span>
+                <strong id="runtime-value">00:00:00</strong>
+              </div>
+              <div class="metric-card">
+                <span>Process</span>
+                <strong id="pid-value">—</strong>
+              </div>
+              <div class="metric-card">
+                <span>Clamps</span>
+                <strong id="clamp-value">0</strong>
+              </div>
+              <div class="metric-card">
+                <span>Warnings / errors</span>
+                <strong id="issue-value">0 / 0</strong>
+              </div>
+            </div>
+
+            <div class="device-stack">
+              <div class="device-row">
+                <span class="device-icon follower-icon" aria-hidden="true">F</span>
+                <div>
+                  <strong>Follower arm</strong>
+                  <span id="follower-port">Detecting…</span>
+                </div>
+                <span class="connection-tag" id="follower-state">Checking</span>
+              </div>
+              <div class="device-row">
+                <span class="device-icon leader-icon" aria-hidden="true">L</span>
+                <div>
+                  <strong>Leader arm</strong>
+                  <span id="leader-port">Detecting…</span>
+                </div>
+                <span class="connection-tag" id="leader-state">Checking</span>
+              </div>
+              <div class="device-row small-row">
+                <span class="device-icon port-icon" aria-hidden="true">↔</span>
+                <div>
+                  <strong>Serial ownership</strong>
+                  <span id="port-owner">Checking both ports</span>
+                </div>
+                <span class="connection-tag" id="ports-state">Checking</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel log-panel">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="eyebrow">Runtime output</p>
+                <h2>Event log</h2>
+              </div>
+              <div class="log-actions">
+                <button type="button" id="copy-log-button">Copy</button>
+                <button type="button" id="clear-log-button">Clear</button>
+              </div>
+            </div>
+            <div class="log-window" id="log-window" role="log" aria-live="polite" aria-label="Teleop event log">
+              <div class="log-empty" id="log-empty">Waiting for backend events…</div>
+            </div>
+          </article>
+        </aside>
+      </section>
+
+      <footer>
+        <span>Localhost only · settings are stored on this browser</span>
+        <span>Stop sends a clean interrupt so the follower disconnect routine can run. Support the arm when stopping.</span>
+      </footer>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

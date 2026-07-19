@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61", "setuptools-scm[toml]>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_rebot_arm_102"
+dynamic = ["version"]
+description = "reBot Arm 102 teleoperator integration with LeRobot"
+readme = "README.md"
+authors = [
+  { name = "Jack Shao", email = "jack.shao@seeed.cc" },
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "lerobot>=0.4",
+  "motorbridge-smart-servo",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_teleoperator_rebot_arm_102"]
+exclude = ["*.egg-info"]
+
+[tool.setuptools_scm]
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
+fallback_version = "0.0.0"

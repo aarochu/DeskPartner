@@ -1,0 +1,7 @@
+# reBotArm 全局配置
+# 硬件配置（电机类型、通信参数、PID 等）
+
+# reBotArm global config
+# Hardware config (motor type, comm params, PID, etc.)
+
+hardware_yaml: "rebotarm_dm.yaml"
