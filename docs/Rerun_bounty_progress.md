@@ -3,7 +3,10 @@
 **Prize focus:** $2,000 — Best example using the Rerun Query API
 **Goal:** Use Rerun Query API evidence to prepare a traceable reBot training dataset, while preserving the non-SO-101 end-to-end port.
 
+**Result:** Honorable Mention at the [Embodied Metal Hackathon](https://luma.com/embodied-metal?tk=J10GoD) (Mission Robotics, New Theory, Savant, North Star).
+
 **Reference repo:** https://github.com/mission-robotics-ai/so100-hackathon  
+**Public Rerun stack:** https://github.com/aarochu/rebotb601-rerun-stack  
 **Team gameplan:** `saturday_gameplan.md` (Person 5 = integration + bounty)  
 **Code:** [`p5_rerun_port/`](../p5_rerun_port/) · docs: [`p5_rerun_port/`](./p5_rerun_port/) · branch `feat/rebot-rerun-port`
 

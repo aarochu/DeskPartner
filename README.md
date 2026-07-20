@@ -2,6 +2,8 @@
 
 Overhead camera + VLM planner + reBot B601-DM arm that tidies a desk zone into trash / pen cup / tray, closed-loop until clean.
 
+**Honorable Mention** at the [Embodied Metal Hackathon](https://luma.com/embodied-metal?tk=J10GoD), hosted by Mission Robotics, New Theory, Savant, and North Star.
+
 **Ground truth / SOW:** [`docs/GROUND_TRUTH.md`](./docs/GROUND_TRUTH.md)  
 **GitHub:** https://github.com/aarochu/DeskPartner  
 **Hardware deck:** [ReBot Arm Workshop](https://docs.google.com/presentation/d/1LXgehBvwPy5EhWO7aaYQffvmlN4eS1zFmJWYoDcTm-c/edit)  
